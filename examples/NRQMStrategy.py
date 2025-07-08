@@ -103,7 +103,8 @@ class NRQMStrategy(DefaultStrategy):
             width=width,
             height=height,
             packed=False,
-            sh_degree=params["shN"].shape[1]
+            sh_degree=params["shN"].shape[1],
+            camtoworlds=camtoworld,
         )
         novel_render = torch.clamp(novel_render.permute(0, 3, 1, 2), 0.0, 1.0) # [1, C, H, W]
 

@@ -829,14 +829,20 @@ class Runner:
                 gen_camtoworlds = torch.matmul(gen_camtoworlds, gen_transforms)
 
                 gen_Ks = base_K.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
-                gen_Ks[:, 0, 0] = gen_Ks[:, 0, 0] * (1.0 + intrinsic_deltas[:, 0]) # fx_new = fx_base * (1 + dfx)
-                gen_Ks[:, 1, 1] = gen_Ks[:, 1, 1] * (1.0 + intrinsic_deltas[:, 1]) # fy_new = fy_base * (1 + dfy)
-                gen_Ks[:, 0, 2] = gen_Ks[:, 0, 2] + intrinsic_deltas[:, 2] # cx_new = cx_base + dcx
-                gen_Ks[:, 1, 2] = gen_Ks[:, 1, 2] + intrinsic_deltas[:, 3]
+                fx_new = gen_Ks[:, 0, 0] * (1.0 + intrinsic_deltas[:, 0])
+                fy_new = gen_Ks[:, 1, 1] * (1.0 + intrinsic_deltas[:, 1])
+                cx_new = gen_Ks[:, 0, 2] + intrinsic_deltas[:, 2]
+                cy_new = gen_Ks[:, 1, 2] + intrinsic_deltas[:, 3]
+
+                updated_gen_Ks = gen_Ks.clone() # Start with a copy
+                updated_gen_Ks[:, 0, 0] = fx_new
+                updated_gen_Ks[:, 1, 1] = fy_new
+                updated_gen_Ks[:, 0, 2] = cx_new
+                updated_gen_Ks[:, 1, 2] = cy_new
 
                 gen_renders, _, _ = self.rasterize_splats(
                     camtoworlds=gen_camtoworlds,
-                    Ks=gen_Ks,
+                    Ks=updated_gen_Ks,
                     width=width,
                     height=height,
                     sh_degree=sh_degree_to_use,

@@ -562,12 +562,27 @@ class Runner:
             camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
             **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
-        means = self.splats["means"]  # [N, 3]
+        if kwargs.get("means", None) is not None:
+            means = kwargs.pop("means")
+        else:
+            means = self.splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
-        quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        
+        if kwargs.get("quats", None) is not None:
+            quats = kwargs.pop("quats")
+        else:
+            quats = self.splats["quats"]  # [N, 4]
+            
+        if kwargs.get("scales", None) is not None:
+            scales = torch.exp(kwargs.pop("scales"))
+        else:
+            scales = torch.exp(self.splats["scales"])  # [N, 3]
+        
+        if kwargs.get("opacities", None) is not None:
+            opacities = torch.sigmoid(kwargs.pop("opacities"))
+        else:
+            opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:

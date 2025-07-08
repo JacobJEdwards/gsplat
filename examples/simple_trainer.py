@@ -211,6 +211,10 @@ class Config:
     gen_rot_limit: float = 10.0
     gen_focal_limit: float = 0.1
     gen_pp_limit: int = 20
+    gen_skew_limit: float = 0.01
+
+    generator_anneal_steps: int = 10000
+    generator_min_lr_factor: float = 0.01
 
     use_scene_aware_sampling: bool = False
 
@@ -477,8 +481,8 @@ class Runner:
         self.generator = None
         self.generator_optimizer = None
         if cfg.use_adversarial_views:
-            self.generator = PoseGeneratorModule(output_dim=9+4).to(self.device)
-            self.generator_optimizer = torch.optim.Adam(
+            self.generator = PoseGeneratorModule(output_dim=9+4, input_dim=cfg.generator_noise_dim + 3).to(self.device)
+            self.generator_optimizer = torch.optim.AdamW(
                 self.generator.parameters(), lr=cfg.generator_lr
             )
             if world_size > 1:
@@ -636,10 +640,9 @@ class Runner:
             )
 
         if cfg.use_adversarial_views:
-            schedulers.append(
-                torch.optim.lr_scheduler.ExponentialLR(
-                    self.generator_optimizer, gamma=0.01 ** (1.0 / max_steps)
-                )
+            generator_gamma = cfg.generator_min_lr_factor**(1.0 / cfg.generator_anneal_steps)
+            self.generator_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR( # Removed from main schedulers list
+                self.generator_optimizer, gamma=generator_gamma
             )
 
         trainloader = torch.utils.data.DataLoader(
@@ -759,7 +762,12 @@ class Runner:
             if cfg.use_nrqm:
                 if cfg.use_adversarial_views and (step + 1) % cfg.generator_train_interval != 0:
                     z = torch.randn(cfg.num_adversarial_views, cfg.generator_noise_dim, device=device)
-                    pose_deltas_raw, intrinsic_deltas_raw = self.generator(z)
+                    base_idx = np.random.randint(len(self.trainset))
+                    base_camtoworld = torch.from_numpy(self.parser.camtoworlds[base_idx]).float().to(device)
+                    base_translation = base_camtoworld[:3, 3].unsqueeze(0).repeat(cfg.num_adversarial_views, 1) #
+                    base_K = Ks[0]
+
+                    pose_deltas_raw, intrinsic_deltas_raw = self.generator(z, base_translation)
 
                     trans_deltas = torch.tanh(pose_deltas_raw[:, :3]) * cfg.gen_trans_limit
                     rot_deltas_6d = torch.tanh(pose_deltas_raw[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
@@ -771,26 +779,23 @@ class Runner:
                     gen_transforms[:, :3, 3] = trans_deltas
                     gen_transforms[:, 3, 3] = 1.0
 
-                    base_camtoworld = torch.from_numpy(self.parser.camtoworlds[np.random.randint(len(self.trainset))]).float().to(device)
-                    base_K = Ks[0]
-
                     gen_camtoworlds = base_camtoworld.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
                     gen_camtoworlds = torch.matmul(gen_camtoworlds, gen_transforms)
 
                     gen_Ks = base_K.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
                     focal_deltas = torch.tanh(intrinsic_deltas_raw[:, :2]) * cfg.gen_focal_limit
-                    pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:]) * cfg.gen_pp_limit
-                    intrinsic_deltas = torch.cat([focal_deltas, pp_deltas], dim=-1)
+                    pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:4]) * cfg.gen_pp_limit #
+                    skew_deltas = torch.tanh(intrinsic_deltas_raw[:, 4:5]) * cfg.gen_skew_limit
 
-                    fx_new = gen_Ks[:, 0, 0] * (1.0 + intrinsic_deltas[:, 0])
-                    fy_new = gen_Ks[:, 1, 1] * (1.0 + intrinsic_deltas[:, 1])
-                    cx_new = gen_Ks[:, 0, 2] + intrinsic_deltas[:, 2]
-                    cy_new = gen_Ks[:, 1, 2] + intrinsic_deltas[:, 3]
+                    fx_new = gen_Ks[:, 0, 0] * (1.0 + focal_deltas[:, 0])
+                    fy_new = gen_Ks[:, 1, 1] * (1.0 + focal_deltas[:, 1])
+                    cx_new = gen_Ks[:, 0, 2] + pp_deltas[:, 0]
+                    cy_new = gen_Ks[:, 1, 2] + pp_deltas[:, 1]
+                    skew_new = gen_Ks[:, 0, 1] + skew_deltas[:, 0]
 
-                    new_K_rows = [torch.stack([fx_new, torch.zeros_like(fx_new), cx_new], dim=-1),
-                                  torch.stack([torch.zeros_like(fy_new), fy_new, cy_new], dim=-1), torch.stack(
-                            [torch.zeros_like(gen_Ks[:, 2, 2]), torch.zeros_like(gen_Ks[:, 2, 2]), gen_Ks[:, 2, 2]],
-                            dim=-1)]
+                    new_K_rows = [torch.stack([fx_new, skew_new, cx_new], dim=-1), # Use skew_new
+                                  torch.stack([torch.zeros_like(fy_new), fy_new, cy_new], dim=-1),
+                                  torch.stack([torch.zeros_like(gen_Ks[:, 2, 2]), torch.zeros_like(gen_Ks[:, 2, 2]), gen_Ks[:, 2, 2]], dim=-1)]
                     updated_gen_Ks = torch.stack(new_K_rows, dim=-2)
 
                     gen_renders, _, _ = self.rasterize_splats(
@@ -807,7 +812,7 @@ class Runner:
                     gen_colors_permuted = gen_colors.permute(0, 3, 1, 2)
                     gen_colors_permuted = torch.nan_to_num(gen_colors_permuted, nan=0.0, posinf=1.0, neginf=0.0)
                     gen_colors_permuted = gen_colors_permuted.clamp(min=1e-8, max=1.0 - 1e-8)
-                    
+
                     nrqm_colors = gen_colors
 
                     generator_loss = self.nrqm_model(gen_colors_permuted).mean()
@@ -855,9 +860,14 @@ class Runner:
 
             if cfg.use_adversarial_views and (step + 1) % cfg.generator_train_interval == 0:
                 self.generator_optimizer.zero_grad()
-
+                
                 z = torch.randn(cfg.num_adversarial_views, cfg.generator_noise_dim, device=device)
-                pose_deltas_raw, intrinsic_deltas_raw = self.generator(z)
+                base_idx = np.random.randint(len(self.trainset))
+                base_camtoworld = torch.from_numpy(self.parser.camtoworlds[base_idx]).float().to(device)
+                base_translation = base_camtoworld[:3, 3].unsqueeze(0).repeat(cfg.num_adversarial_views, 1) #
+                base_K = Ks[0]
+
+                pose_deltas_raw, intrinsic_deltas_raw = self.generator(z, base_translation)
 
                 trans_deltas = torch.tanh(pose_deltas_raw[:, :3]) * cfg.gen_trans_limit
                 rot_deltas_6d = torch.tanh(pose_deltas_raw[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
@@ -869,26 +879,23 @@ class Runner:
                 gen_transforms[:, :3, 3] = trans_deltas
                 gen_transforms[:, 3, 3] = 1.0
 
-                base_camtoworld = torch.from_numpy(self.parser.camtoworlds[np.random.randint(len(self.trainset))]).float().to(device)
-                base_K = Ks[0]
-
                 gen_camtoworlds = base_camtoworld.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
                 gen_camtoworlds = torch.matmul(gen_camtoworlds, gen_transforms)
 
                 gen_Ks = base_K.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
                 focal_deltas = torch.tanh(intrinsic_deltas_raw[:, :2]) * cfg.gen_focal_limit
-                pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:]) * cfg.gen_pp_limit
-                intrinsic_deltas = torch.cat([focal_deltas, pp_deltas], dim=-1)
+                pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:4]) * cfg.gen_pp_limit #
+                skew_deltas = torch.tanh(intrinsic_deltas_raw[:, 4:5]) * cfg.gen_skew_limit
 
-                fx_new = gen_Ks[:, 0, 0] * (1.0 + intrinsic_deltas[:, 0])
-                fy_new = gen_Ks[:, 1, 1] * (1.0 + intrinsic_deltas[:, 1])
-                cx_new = gen_Ks[:, 0, 2] + intrinsic_deltas[:, 2]
-                cy_new = gen_Ks[:, 1, 2] + intrinsic_deltas[:, 3]
+                fx_new = gen_Ks[:, 0, 0] * (1.0 + focal_deltas[:, 0])
+                fy_new = gen_Ks[:, 1, 1] * (1.0 + focal_deltas[:, 1])
+                cx_new = gen_Ks[:, 0, 2] + pp_deltas[:, 0]
+                cy_new = gen_Ks[:, 1, 2] + pp_deltas[:, 1]
+                skew_new = gen_Ks[:, 0, 1] + skew_deltas[:, 0]
 
-                new_K_rows = [torch.stack([fx_new, torch.zeros_like(fx_new), cx_new], dim=-1),
-                              torch.stack([torch.zeros_like(fy_new), fy_new, cy_new], dim=-1), torch.stack(
-                        [torch.zeros_like(gen_Ks[:, 2, 2]), torch.zeros_like(gen_Ks[:, 2, 2]), gen_Ks[:, 2, 2]],
-                        dim=-1)]
+                new_K_rows = [torch.stack([fx_new, skew_new, cx_new], dim=-1), # Use skew_new
+                              torch.stack([torch.zeros_like(fy_new), fy_new, cy_new], dim=-1),
+                              torch.stack([torch.zeros_like(gen_Ks[:, 2, 2]), torch.zeros_like(gen_Ks[:, 2, 2]), gen_Ks[:, 2, 2]], dim=-1)]
                 updated_gen_Ks = torch.stack(new_K_rows, dim=-2)
 
                 gen_renders, _, _ = self.rasterize_splats(
@@ -909,6 +916,7 @@ class Runner:
                 generator_loss = -self.nrqm_model(gen_colors_permuted).mean() * cfg.adversarial_loss_lambda
                 generator_loss.backward()
                 self.generator_optimizer.step()
+                self.generator_lr_scheduler.step()
 
                 if world_rank == 0 and cfg.tb_every > 0 and (step + 1) % cfg.tb_every == 0:
                     self.writer.add_scalar("train/generator_loss", generator_loss.item(), step)

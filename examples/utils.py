@@ -302,9 +302,8 @@ def generate_novel_views(
 
 class PoseGeneratorModule(torch.nn.Module):
     def __init__(self, mlp_width: int = 64, mlp_depth: int = 3,
-                 output_dim: int = 9 + 4):
+                 output_dim: int = 9 + 4, input_dim: int = 32 + 3):
         super().__init__()
-        input_dim = 32
 
         layers = [torch.nn.Linear(input_dim, mlp_width), torch.nn.PReLU()]
         for _ in range(mlp_depth - 1):
@@ -316,8 +315,9 @@ class PoseGeneratorModule(torch.nn.Module):
 
         self.register_buffer("identity_rot", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
 
-    def forward(self, z: Tensor) -> tuple[Tensor, Tensor]:
-        raw_output = self.net(z)
+    def forward(self, z: Tensor, base_translation: Tensor) -> tuple[Tensor, Tensor]:
+        h = torch.cat([z, base_translation], dim=-1)
+        raw_output = self.net(h)
         pose_deltas = raw_output[..., :9]
         intrinsic_deltas = raw_output[..., 9:]
 

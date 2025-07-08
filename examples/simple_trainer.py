@@ -604,6 +604,14 @@ class Runner:
 
         # Dump cfg.
         if world_rank == 0:
+            cfg_to_save = copy.deepcopy(cfg)
+
+            if hasattr(cfg_to_save, 'strategy') and hasattr(cfg_to_save.strategy, '__dict__'):
+                strategy_dict = vars(cfg_to_save.strategy)
+                strategy_dict.pop('rasterizer_fn', None)
+                strategy_dict.pop('nrqm_model', None)
+                cfg_to_save.strategy = strategy_dict
+                
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
                 yaml.dump(vars(cfg), f)
 

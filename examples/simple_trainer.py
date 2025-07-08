@@ -868,7 +868,7 @@ class Runner:
                         step,
                     )
 
-                adversarial_gs_loss.backward(retain_graph=True)
+                # adversarial_gs_loss.backward(retain_graph=True)
 
                 self.generator_optimizer.step()
                 loss += adversarial_gs_loss

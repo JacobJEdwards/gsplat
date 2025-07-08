@@ -853,8 +853,6 @@ class Runner:
 
                 adversarial_gs_loss = -gen_nrqm_loss * cfg.adversarial_loss_lambda
 
-                gen_nrqm_loss.backward()
-                self.generator_optimizer.step()
 
                 if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                     self.writer.add_scalar("train/gen_nrqm_loss", gen_nrqm_loss.item(), step)
@@ -864,6 +862,8 @@ class Runner:
                         step,
                     )
 
+                gen_nrqm_loss.backward()
+                self.generator_optimizer.step()
                 loss += adversarial_gs_loss
 
             # regularizations

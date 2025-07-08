@@ -799,14 +799,22 @@ class Runner:
                 z = torch.randn(cfg.num_adversarial_views, cfg.generator_noise_dim, device=device)
                 pose_deltas_raw, intrinsic_deltas_raw = self.generator(z)
 
-                pose_deltas = pose_deltas_raw.clone()
-                pose_deltas[:, :3] = torch.tanh(pose_deltas[:, :3]) * cfg.gen_trans_limit
+                # pose_deltas = pose_deltas_raw.clone()
+                # pose_deltas[:, :3] = torch.tanh(pose_deltas[:, :3]) * cfg.gen_trans_limit
+                #
+                # pose_deltas[:, 3:] = torch.tanh(pose_deltas[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
+                #
+                # intrinsic_deltas = intrinsic_deltas_raw.clone()
+                # intrinsic_deltas[:, :2] = torch.tanh(intrinsic_deltas[:, :2]) * cfg.gen_focal_limit
+                # intrinsic_deltas[:, 2:] = torch.tanh(intrinsic_deltas[:, 2:]) * cfg.gen_pp_limit
+                trans_deltas = torch.tanh(pose_deltas_raw[:, :3]) * cfg.gen_trans_limit
+                rot_deltas = torch.tanh(pose_deltas_raw[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
+                pose_deltas = torch.cat([trans_deltas, rot_deltas], dim=-1)
 
-                pose_deltas[:, 3:] = torch.tanh(pose_deltas[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
 
-                intrinsic_deltas = intrinsic_deltas_raw.clone()
-                intrinsic_deltas[:, :2] = torch.tanh(intrinsic_deltas[:, :2]) * cfg.gen_focal_limit
-                intrinsic_deltas[:, 2:] = torch.tanh(intrinsic_deltas[:, 2:]) * cfg.gen_pp_limit
+                focal_deltas = torch.tanh(intrinsic_deltas_raw[:, :2]) * cfg.gen_focal_limit
+                pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:]) * cfg.gen_pp_limit
+                intrinsic_deltas = torch.cat([focal_deltas, pp_deltas], dim=-1)
 
                 base_camtoworld = torch.from_numpy(self.parser.camtoworlds[np.random.randint(len(self.trainset))]).float().to(device)
                 base_K = Ks[0]
@@ -818,7 +826,6 @@ class Runner:
                 gen_transforms[:, :3, 3] = pose_deltas[:, :3]
 
                 gen_camtoworlds = torch.matmul(gen_camtoworlds, gen_transforms)
-
 
                 gen_Ks = base_K.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
                 gen_Ks[:, 0, 0] = gen_Ks[:, 0, 0] * (1.0 + intrinsic_deltas[:, 0]) # fx_new = fx_base * (1 + dfx)

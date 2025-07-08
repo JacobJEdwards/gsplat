@@ -583,7 +583,6 @@ class Runner:
             opacities = torch.sigmoid(kwargs.pop("opacities"))
         else:
             opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
-
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
             colors = self.app_module(

@@ -200,7 +200,7 @@ class Config:
     novel_view_rotation_pertube: float = 40.0
     nrqm_lambda: float = 1.0
 
-    use_adversarial_views: bool = False
+    use_adversarial_views: bool = True
     generator_lr: float = 1e-4
     generator_train_interval: int = 50
     adversarial_loss_lambda: float = 0.1

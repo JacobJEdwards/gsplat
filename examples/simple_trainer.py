@@ -834,11 +834,12 @@ class Runner:
                 cx_new = gen_Ks[:, 0, 2] + intrinsic_deltas[:, 2]
                 cy_new = gen_Ks[:, 1, 2] + intrinsic_deltas[:, 3]
 
-                updated_gen_Ks = gen_Ks.clone() # Start with a copy
+                updated_gen_Ks = torch.zeros_like(gen_Ks)
                 updated_gen_Ks[:, 0, 0] = fx_new
                 updated_gen_Ks[:, 1, 1] = fy_new
                 updated_gen_Ks[:, 0, 2] = cx_new
                 updated_gen_Ks[:, 1, 2] = cy_new
+                updated_gen_Ks[:, 2, 2] = gen_Ks[:, 2, 2]
 
                 gen_renders, _, _ = self.rasterize_splats(
                     camtoworlds=gen_camtoworlds,

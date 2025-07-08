@@ -807,7 +807,7 @@ class Runner:
                         sh_degree=sh_degree_to_use,
                         near_plane=cfg.near_plane,
                         far_plane=cfg.far_plane,
-                        radial_k1=radial_k1,
+                        # radial_k1=radial_k1,
                     )
 
                     gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)
@@ -909,7 +909,7 @@ class Runner:
                     sh_degree=sh_degree_to_use,
                     near_plane=cfg.near_plane,
                     far_plane=cfg.far_plane,
-                    radial_k1=radial_k1,
+                    # radial_k1=radial_k1,
                 )
 
                 gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)

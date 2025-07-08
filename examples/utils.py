@@ -441,7 +441,9 @@ class AdaptiveNovelViewSampler:
         return torch.tensor(np.concatenate([pos_mean, pos_std, rot_mean]), dtype=torch.float32)
 
     def update_quality_history(self, poses: np.ndarray, qualities: np.ndarray):
-        for pose, quality in zip(poses, qualities):
+        qualities_iterable = np.atleast_1d(qualities)
+        
+        for pose, quality in zip(poses, qualities_iterable):
             self.pose_history.append(pose.copy())
             self.quality_history.append(quality)
 

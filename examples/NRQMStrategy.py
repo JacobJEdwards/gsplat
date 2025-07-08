@@ -99,7 +99,6 @@ class NRQMStrategy(DefaultStrategy):
             scales=params["scales"],
             opacities=params["opacities"],
             colors=torch.cat([params["sh0"], params["shN"]], 1),
-            viewmats=torch.inverse(camtoworld),
             Ks=K,
             width=width,
             height=height,

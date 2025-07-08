@@ -1,9 +1,10 @@
+import math
 import random
 
 import numpy as np
 import torch
 from sklearn.neighbors import NearestNeighbors
-from torch import Tensor
+from torch import Tensor, nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
@@ -352,10 +353,7 @@ class ImprovedPoseGeneratorModule(torch.nn.Module):
         input_dim = noise_dim + condition_dim
 
         # Main generator network with residual connections
-        layers = []
-        layers.append(nn.Linear(input_dim, mlp_width))
-        layers.append(nn.LayerNorm(mlp_width))
-        layers.append(nn.ReLU())
+        layers = [nn.Linear(input_dim, mlp_width), nn.LayerNorm(mlp_width), nn.ReLU()]
 
         # Residual blocks
         for i in range(mlp_depth - 1):
@@ -399,13 +397,7 @@ class ImprovedPoseGeneratorModule(torch.nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, z: torch.Tensor, scene_condition: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            z: Random noise [batch_size, noise_dim]
-            scene_condition: Scene statistics [batch_size, 9] (mean pos, std pos, mean rot euler)
-        """
-        # Encode scene condition
+    def forward(self, z: torch.Tensor, scene_condition: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         condition_encoded = self.condition_encoder(scene_condition)
 
         x = torch.cat([z, condition_encoded], dim=-1)
@@ -496,15 +488,12 @@ class AdaptiveNovelViewSampler:
         )
 
 class HierarchicalPoseGenerator:
-    """Hierarchical pose generation with coarse-to-fine sampling."""
-
     def __init__(self, base_poses: np.ndarray, num_levels: int = 3):
         self.base_poses = base_poses
         self.num_levels = num_levels
         self.level_perturbations = self._compute_level_perturbations()
 
-    def _compute_level_perturbations(self) -> List[Tuple[float, float]]:
-        """Compute perturbation amounts for each level."""
+    def _compute_level_perturbations(self) -> list[tuple[float, float]]:
         base_trans = 0.05
         base_rot = 2.0
 
@@ -532,8 +521,6 @@ class HierarchicalPoseGenerator:
 
 
 class CurriculumPoseScheduler:
-    """Curriculum learning scheduler for pose difficulty."""
-
     def __init__(self,
                  total_steps: int,
                  initial_difficulty: float = 0.1,
@@ -545,14 +532,12 @@ class CurriculumPoseScheduler:
         self.warmup_steps = warmup_steps
 
     def get_difficulty(self, step: int) -> float:
-        """Get current difficulty level based on training step."""
         if step < self.warmup_steps:
             return self.initial_difficulty
 
         progress = (step - self.warmup_steps) / (self.total_steps - self.warmup_steps)
         progress = min(1.0, progress)
 
-        # Smooth curriculum with cosine schedule
         difficulty = self.initial_difficulty + (self.final_difficulty - self.initial_difficulty) * \
                      (1 - math.cos(progress * math.pi)) / 2
 
@@ -561,7 +546,7 @@ class CurriculumPoseScheduler:
 
 def generate_quality_aware_poses(base_poses: np.ndarray,
                                  num_poses: int,
-                                 quality_scores: Optional[np.ndarray] = None,
+                                 quality_scores: np.ndarray | None = None,
                                  diversity_weight: float = 0.3) -> np.ndarray:
     """Generate poses that balance quality and diversity."""
     if quality_scores is None:

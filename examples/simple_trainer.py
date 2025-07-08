@@ -858,8 +858,7 @@ class Runner:
                 if cfg.nrqm_model == "clipiqa":
                     gen_nrqm_loss = -gen_nrqm_loss
 
-                adversarial_gs_loss = -gen_nrqm_loss * cfg.adversarial_loss_lambda
-
+                adversarial_gs_loss = gen_nrqm_loss * cfg.adversarial_loss_lambda
 
                 if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                     self.writer.add_scalar("train/gen_nrqm_loss", gen_nrqm_loss.item(), step)
@@ -869,7 +868,9 @@ class Runner:
                         step,
                     )
 
-                gen_nrqm_loss.backward()
+                generator_loss_for_update = adversarial_gs_loss
+                generator_loss_for_update.backward(retain_graph=True)
+                
                 self.generator_optimizer.step()
                 loss += adversarial_gs_loss
 

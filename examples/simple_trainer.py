@@ -871,7 +871,7 @@ class Runner:
                 adversarial_gs_loss.backward(retain_graph=True)
 
                 self.generator_optimizer.step()
-                loss = loss + adversarial_gs_loss * cfg.adversarial_loss_lambda
+                loss = loss + gen_nrqm_loss * cfg.adversarial_loss_lambda
 
             # regularizations
             if cfg.opacity_reg > 0.0:

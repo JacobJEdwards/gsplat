@@ -757,33 +757,89 @@ class Runner:
                 loss += tvloss
 
             if cfg.use_nrqm:
-                num_nrqm_poses = min(4, self.novel_poses_np.shape[0])
-                sampled_pose_indices = torch.randperm(self.novel_poses_np.shape[0])[:num_nrqm_poses]
-                nrqm_camtoworlds = self.novel_poses_np[sampled_pose_indices]
+                if cfg.use_adversarial_views:
+                    z = torch.randn(cfg.num_adversarial_views, cfg.generator_noise_dim, device=device)
+                    pose_deltas_raw, intrinsic_deltas_raw = self.generator(z)
 
-                nrqm_Ks = Ks.repeat(num_nrqm_poses, 1, 1)
-                nrqm_width = width
-                nrqm_height = height
+                    trans_deltas = torch.tanh(pose_deltas_raw[:, :3]) * cfg.gen_trans_limit
+                    rot_deltas_6d = torch.tanh(pose_deltas_raw[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
 
-                nrqm_renders, _, _ = self.rasterize_splats(
-                    camtoworlds=nrqm_camtoworlds,
-                    Ks=nrqm_Ks,
-                    width=nrqm_width,
-                    height=nrqm_height,
-                    sh_degree=sh_degree_to_use,
-                    near_plane=cfg.near_plane,
-                    far_plane=cfg.far_plane,
-                )
+                    rotation_matrices = rotation_6d_to_matrix(rot_deltas_6d + self.generator.identity_rot)
 
-                nrqm_colors = torch.clamp(nrqm_renders[..., 0:3], 0.0, 1.0)
-                nrqm_colors_permuted = nrqm_colors.permute(0, 3, 1, 2)
-                nrqm_colors_permuted = torch.nan_to_num(nrqm_colors_permuted, nan=0.0, posinf=1.0, neginf=0.0)
-                nrqm_colors_permuted = nrqm_colors_permuted.clamp(min=1e-8, max=1.0 - 1e-8)
+                    gen_transforms = torch.zeros(cfg.num_adversarial_views, 4, 4, device=device, dtype=torch.float)
+                    gen_transforms[:, :3, :3] = rotation_matrices
+                    gen_transforms[:, :3, 3] = trans_deltas
+                    gen_transforms[:, 3, 3] = 1.0
 
-                nrqm_loss = self.nrqm_model(nrqm_colors_permuted).mean()
+                    base_camtoworld = torch.from_numpy(self.parser.camtoworlds[np.random.randint(len(self.trainset))]).float().to(device)
+                    base_K = Ks[0]
 
-                if cfg.nrqm_model == "clipiqa":
-                    nrqm_loss = -nrqm_loss
+                    gen_camtoworlds = base_camtoworld.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
+                    gen_camtoworlds = torch.matmul(gen_camtoworlds, gen_transforms)
+
+                    gen_Ks = base_K.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
+                    focal_deltas = torch.tanh(intrinsic_deltas_raw[:, :2]) * cfg.gen_focal_limit
+                    pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:]) * cfg.gen_pp_limit
+                    intrinsic_deltas = torch.cat([focal_deltas, pp_deltas], dim=-1)
+
+                    fx_new = gen_Ks[:, 0, 0] * (1.0 + intrinsic_deltas[:, 0])
+                    fy_new = gen_Ks[:, 1, 1] * (1.0 + intrinsic_deltas[:, 1])
+                    cx_new = gen_Ks[:, 0, 2] + intrinsic_deltas[:, 2]
+                    cy_new = gen_Ks[:, 1, 2] + intrinsic_deltas[:, 3]
+
+                    new_K_rows = [torch.stack([fx_new, torch.zeros_like(fx_new), cx_new], dim=-1),
+                                  torch.stack([torch.zeros_like(fy_new), fy_new, cy_new], dim=-1), torch.stack(
+                            [torch.zeros_like(gen_Ks[:, 2, 2]), torch.zeros_like(gen_Ks[:, 2, 2]), gen_Ks[:, 2, 2]],
+                            dim=-1)]
+                    updated_gen_Ks = torch.stack(new_K_rows, dim=-2)
+
+                    gen_renders, _, _ = self.rasterize_splats(
+                        camtoworlds=gen_camtoworlds,
+                        Ks=updated_gen_Ks,
+                        width=width,
+                        height=height,
+                        sh_degree=sh_degree_to_use,
+                        near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane,
+                    )
+
+                    gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)
+                    gen_colors_permuted = gen_colors.permute(0, 3, 1, 2)
+                    gen_colors_permuted = torch.nan_to_num(gen_colors_permuted, nan=0.0, posinf=1.0, neginf=0.0)
+                    gen_colors_permuted = gen_colors_permuted.clamp(min=1e-8, max=1.0 - 1e-8)
+
+                    generator_loss = self.nrqm_model(gen_colors_permuted).mean()
+                    if cfg.nrqm_model == "clipiqa":
+                        generator_loss = -generator_loss
+                    nrqm_loss = generator_loss
+                else:
+                    num_nrqm_poses = min(4, self.novel_poses_np.shape[0])
+                    sampled_pose_indices = torch.randperm(self.novel_poses_np.shape[0])[:num_nrqm_poses]
+                    nrqm_camtoworlds = self.novel_poses_np[sampled_pose_indices]
+
+                    nrqm_Ks = Ks.repeat(num_nrqm_poses, 1, 1)
+                    nrqm_width = width
+                    nrqm_height = height
+
+                    nrqm_renders, _, _ = self.rasterize_splats(
+                        camtoworlds=nrqm_camtoworlds,
+                        Ks=nrqm_Ks,
+                        width=nrqm_width,
+                        height=nrqm_height,
+                        sh_degree=sh_degree_to_use,
+                        near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane,
+                    )
+
+                    nrqm_colors = torch.clamp(nrqm_renders[..., 0:3], 0.0, 1.0)
+                    nrqm_colors_permuted = nrqm_colors.permute(0, 3, 1, 2)
+                    nrqm_colors_permuted = torch.nan_to_num(nrqm_colors_permuted, nan=0.0, posinf=1.0, neginf=0.0)
+                    nrqm_colors_permuted = nrqm_colors_permuted.clamp(min=1e-8, max=1.0 - 1e-8)
+
+                    nrqm_loss = self.nrqm_model(nrqm_colors_permuted).mean()
+
+                    if cfg.nrqm_model == "clipiqa":
+                        nrqm_loss = -nrqm_loss
 
                 loss += nrqm_loss * cfg.nrqm_lambda
 
@@ -848,17 +904,18 @@ class Runner:
                 gen_colors_permuted = torch.nan_to_num(gen_colors_permuted, nan=0.0, posinf=1.0, neginf=0.0)
                 gen_colors_permuted = gen_colors_permuted.clamp(min=1e-8, max=1.0 - 1e-8)
 
-                generator_loss = -self.nrqm_model(gen_colors_permuted).mean()
-
+                generator_loss = -self.nrqm_model(gen_colors_permuted).mean() * cfg.adversarial_loss_lambda
                 generator_loss.backward()
                 self.generator_optimizer.step()
 
-                adversarial_loss = self.nrqm_model(gen_colors_permuted).mean()
-                if cfg.nrqm_model == "clipiqa":
-                    adversarial_loss = -adversarial_loss
+                if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
+                    self.writer.add_scalar("train/generator_loss", generator_loss.item(), step)
+                    self.writer.add_images(
+                        "train/gen_render",
+                        gen_colors.permute(0, 3, 1, 2).detach().cpu().numpy(),
+                        step,
+                    )
 
-                self.generator_optimizer.step()
-                loss = loss + adversarial_loss * cfg.adversarial_loss_lambda
 
             # regularizations
             if cfg.opacity_reg > 0.0:

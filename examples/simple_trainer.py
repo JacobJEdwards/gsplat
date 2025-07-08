@@ -827,10 +827,10 @@ class Runner:
 
                     nrqm_colors = gen_colors
 
-                    generator_loss = self.nrqm_model(gen_colors_permuted).mean()
+                    nrqm_loss_all = self.nrqm_model(gen_colors_permuted)
+                    nrqm_loss = nrqm_loss_all.mean()
                     if cfg.nrqm_model == "clipiqa":
-                        generator_loss = -generator_loss
-                    nrqm_loss = generator_loss
+                        nrqm_loss = -nrqm_loss
                 else:
                     if step % 100 == 0:
                         self.novel_poses_np = integrate_enhanced_pose_generation(self, step)
@@ -858,7 +858,8 @@ class Runner:
                     nrqm_colors_permuted = torch.nan_to_num(nrqm_colors_permuted, nan=0.0, posinf=1.0, neginf=0.0)
                     nrqm_colors_permuted = nrqm_colors_permuted.clamp(min=1e-8, max=1.0 - 1e-8)
 
-                    nrqm_loss = self.nrqm_model(nrqm_colors_permuted).mean()
+                    nrqm_loss_all = self.nrqm_model(nrqm_colors_permuted)
+                    nrqm_loss = nrqm_loss_all.mean()
 
                     if cfg.nrqm_model == "clipiqa":
                         nrqm_loss = -nrqm_loss
@@ -866,7 +867,7 @@ class Runner:
                 loss += nrqm_loss * cfg.nrqm_lambda
                 self.adaptive_sampler.update_quality_history(
                     nrqm_camtoworlds.detach().cpu().numpy(),
-                    nrqm_loss.detach().cpu().numpy(),
+                    nrqm_loss_all.detach().cpu().numpy(),
                 )
 
                 if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:

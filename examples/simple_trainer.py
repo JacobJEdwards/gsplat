@@ -756,7 +756,7 @@ class Runner:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
 
-            if cfg.use_nrqm and step > 50:
+            if cfg.use_nrqm:
                 num_nrqm_poses = min(4, self.novel_poses_np.shape[0])
                 sampled_pose_indices = torch.randperm(self.novel_poses_np.shape[0])[:num_nrqm_poses]
                 nrqm_camtoworlds = self.novel_poses_np[sampled_pose_indices]

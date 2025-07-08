@@ -322,8 +322,6 @@ class PoseGeneratorModule(torch.nn.Module):
         return pose_deltas, intrinsic_deltas
 
 class ImprovedPoseGeneratorModule(torch.nn.Module):
-    """Enhanced pose generator with better conditioning and more sophisticated architecture."""
-
     def __init__(self,
                  mlp_width: int = 128,
                  mlp_depth: int = 4,
@@ -337,9 +335,8 @@ class ImprovedPoseGeneratorModule(torch.nn.Module):
         self.condition_dim = condition_dim
         self.use_attention = use_attention
 
-        # Conditioning network for scene-aware generation
         self.condition_encoder = nn.Sequential(
-            nn.Linear(9, condition_dim),  # 9 for camera pose stats
+            nn.Linear(9, condition_dim),
             nn.LayerNorm(condition_dim),
             nn.ReLU(),
             nn.Linear(condition_dim, condition_dim),
@@ -349,10 +346,8 @@ class ImprovedPoseGeneratorModule(torch.nn.Module):
 
         input_dim = noise_dim + condition_dim
 
-        # Main generator network with residual connections
         layers = [nn.Linear(input_dim, mlp_width), nn.LayerNorm(mlp_width), nn.ReLU()]
 
-        # Residual blocks
         for i in range(mlp_depth - 1):
             layer = nn.Linear(mlp_width, mlp_width)
             if use_spectral_norm:
@@ -361,11 +356,9 @@ class ImprovedPoseGeneratorModule(torch.nn.Module):
             layers.append(nn.LayerNorm(mlp_width))
             layers.append(nn.ReLU())
 
-        # Self-attention layer
         if use_attention:
             self.attention = nn.MultiheadAttention(mlp_width, num_heads=8, batch_first=True)
 
-        # Separate heads for pose and intrinsics
         self.pose_head = nn.Sequential(
             nn.Linear(mlp_width, mlp_width // 2),
             nn.ReLU(),
@@ -380,14 +373,11 @@ class ImprovedPoseGeneratorModule(torch.nn.Module):
 
         self.net = nn.Sequential(*layers)
 
-        # Identity rotation in 6D representation
         self.register_buffer("identity_rot", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
 
-        # Initialize weights
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights for stable training."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.02)

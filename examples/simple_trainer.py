@@ -772,7 +772,7 @@ class Runner:
                 if cfg.use_adversarial_views and (step + 1) % cfg.generator_train_interval != 0:
                     scene_stats = self.adaptive_sampler.scene_stats.unsqueeze(0).repeat(
                         cfg.num_adversarial_views, 1
-                    )
+                    ).to(self.device)
                     z = torch.randn(cfg.num_adversarial_views, cfg.generator_noise_dim, device=device)
                     pose_deltas_raw, intrinsic_deltas_raw = self.generator(z, scene_stats)
 
@@ -882,7 +882,7 @@ class Runner:
 
                 scene_stats = self.adaptive_sampler.scene_stats.unsqueeze(0).repeat(
                     cfg.num_adversarial_views, 1
-                )
+                ).to(self.device)
                 z = torch.randn(cfg.num_adversarial_views, cfg.generator_noise_dim, device=device)
                 pose_deltas_raw, intrinsic_deltas_raw = self.generator(z, scene_stats)
 

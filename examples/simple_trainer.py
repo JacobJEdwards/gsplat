@@ -43,13 +43,24 @@ from utils import (
     rotation_6d_to_matrix,
 )
 
-from gsplat import export_splats
+from gsplat import export_splats, Strategy
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 
+def strategy_representer(dumper: yaml.Dumper, data: Strategy) -> yaml.nodes.MappingNode:
+    strategy_dict = vars(data).copy()
+
+    strategy_dict['class'] = type(data).__name__
+
+    strategy_dict.pop('rasterizer_fn', None)
+    strategy_dict.pop('nrqm_model', None)
+
+    return dumper.represent_mapping('tag:yaml.org,2002:map', strategy_dict)
+
+yaml.add_representer(Strategy, strategy_representer)
 
 @dataclass
 class Config:
@@ -605,14 +616,6 @@ class Runner:
 
         # Dump cfg.
         if world_rank == 0:
-            cfg_to_save = copy.deepcopy(cfg)
-
-            if hasattr(cfg_to_save, 'strategy') and hasattr(cfg_to_save.strategy, '__dict__'):
-                strategy_dict = vars(cfg_to_save.strategy)
-                strategy_dict.pop('rasterizer_fn', None)
-                strategy_dict.pop('nrqm_model', None)
-                cfg_to_save.strategy = strategy_dict
-
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
                 yaml.dump(vars(cfg), f)
 

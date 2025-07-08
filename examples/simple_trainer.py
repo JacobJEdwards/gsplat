@@ -245,8 +245,11 @@ class Config:
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
-        else:
-            assert_never(strategy)
+        elif isinstance(strategy, NRQMStrategy):
+            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.refine_every = int(strategy.refine_every * factor)
+            strategy.novel_view_every = int(strategy.novel_view_every * factor)
 
 
 def create_splats_with_optimizers(
@@ -421,8 +424,10 @@ class Runner:
             )
         elif isinstance(self.cfg.strategy, MCMCStrategy):
             self.strategy_state = self.cfg.strategy.initialize_state()
-        else:
-            assert_never(self.cfg.strategy)
+        elif isinstance(self.cfg.strategy, NRQMStrategy):
+            self.strategy_state = self.cfg.strategy.initialize_state(
+                scene_scale=self.scene_scale,
+            )
 
         # Compression Strategy
         self.compression_method = None
@@ -617,13 +622,13 @@ class Runner:
         # Dump cfg.
         # if world_rank == 0:
         #     cfg_to_save = copy.deepcopy(cfg)
-        #     
+        #
         #     if hasattr(cfg_to_save, 'strategy') and hasattr(cfg_to_save.strategy, '__dict__'):
         #         strategy_dict = vars(cfg_to_save.strategy)
         #         strategy_dict.pop('rasterizer_fn', None)
         #         strategy_dict.pop('nrqm_model', None)
         #         cfg_to_save.strategy = strategy_dict
-        # 
+        #
         #     with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
         #         yaml.dump(vars(cfg_to_save), f)
 
@@ -1104,6 +1109,18 @@ class Runner:
                     info=info,
                     lr=schedulers[0].get_last_lr()[0],
                 )
+            elif isinstance(self.cfg.strategy, NRQMStrategy):
+                info["camtoworlds"] = camtoworlds
+                info["step"] = step
+
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                )
+
             else:
                 assert_never(self.cfg.strategy)
 

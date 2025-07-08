@@ -852,7 +852,6 @@ class Runner:
 
                 gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)
                 gen_colors_permuted = gen_colors.permute(0, 3, 1, 2)
-                gen_colors_permuted = torch.nan_to_num(gen_colors_permuted, nan=0.0, posinf=1.0, neginf=0.0)
 
                 gen_nrqm_loss = self.nrqm_model(gen_colors_permuted).mean()
                 if cfg.nrqm_model == "clipiqa":
@@ -868,7 +867,7 @@ class Runner:
                         step,
                     )
 
-                # adversarial_gs_loss.backward(retain_graph=True)
+                adversarial_gs_loss.backward(retain_graph=True)
 
                 self.generator_optimizer.step()
                 loss += adversarial_gs_loss

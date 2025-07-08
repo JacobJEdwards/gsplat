@@ -48,11 +48,11 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: Path = Path("data/360_v2/garden")
+    data_dir: Path = Path("../../360_v2/garden")
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = 1
     # Directory to save results
-    result_dir: Path = Path("results/garden")
+    result_dir: Path = Path("../../result")
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -738,6 +738,9 @@ class Runner:
                 nrqm_colors_permuted = nrqm_colors.permute(0, 3, 1, 2)
 
                 nrqm_loss = self.nrqm_model(nrqm_colors_permuted).mean()
+
+                if cfg.nrqm_model == "clipiqa":
+                    nrqm_loss = -nrqm_loss
 
                 loss += nrqm_loss * cfg.nrqm_lambda
 

@@ -102,7 +102,6 @@ class NRQMStrategy(DefaultStrategy):
             Ks=K,
             width=width,
             height=height,
-            packed=False,
             sh_degree=params["shN"].shape[1],
             camtoworlds=camtoworlds,
         )

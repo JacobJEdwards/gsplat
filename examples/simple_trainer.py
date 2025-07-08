@@ -910,7 +910,7 @@ class Runner:
                 generator_loss.backward()
                 self.generator_optimizer.step()
 
-                if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
+                if world_rank == 0 and cfg.tb_every > 0 and (step + 1) % cfg.tb_every == 0:
                     self.writer.add_scalar("train/generator_loss", generator_loss.item(), step)
                     self.writer.add_images(
                         "train/gen_render",

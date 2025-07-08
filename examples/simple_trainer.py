@@ -28,6 +28,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
+
+from examples.NRQMStrategy import NRQMStrategy
 from utils import (
     AppearanceOptModule,
     CameraOptModule,
@@ -355,6 +357,9 @@ class Runner:
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
+
+        if isinstance(cfg.strategy, NRQMStrategy):
+            cfg.strategy.rasterizer_fn = self.rasterize_splats
 
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
@@ -1325,6 +1330,12 @@ if __name__ == "__main__":
                 opacity_reg=0.01,
                 scale_reg=0.01,
                 strategy=MCMCStrategy(verbose=True),
+            ),
+        ),
+        "nrqm": (
+            "Gaussian splatting training with NRQM model for quality assessment.",
+            Config(
+                strategy=NRQMStrategy(verbose=True),
             ),
         ),
     }

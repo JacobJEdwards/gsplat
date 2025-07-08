@@ -803,7 +803,7 @@ class Runner:
 
                 trans_deltas = torch.tanh(pose_deltas_raw[:, :3]) * cfg.gen_trans_limit
                 rot_deltas_6d = torch.tanh(pose_deltas_raw[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
-                
+
                 rotation_matrices = rotation_6d_to_matrix(rot_deltas_6d + self.generator.identity_rot)
 
                 gen_transforms = torch.zeros(cfg.num_adversarial_views, 4, 4, device=device, dtype=torch.float)
@@ -837,7 +837,7 @@ class Runner:
 
                 gen_renders, _, _ = self.rasterize_splats(
                     camtoworlds=gen_camtoworlds,
-                    Ks=updated_gen_Ks, 
+                    Ks=updated_gen_Ks,
                     width=width,
                     height=height,
                     sh_degree=sh_degree_to_use,
@@ -857,11 +857,11 @@ class Runner:
 
                 adversarial_gs_loss = -gen_nrqm_loss
 
-                adversarial_gs_loss.backward()
+                adversarial_gs_loss.backward(retain_graph=True)
 
                 self.generator_optimizer.step()
                 loss = loss + gen_nrqm_loss * cfg.adversarial_loss_lambda
-                
+
             # regularizations
             if cfg.opacity_reg > 0.0:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()

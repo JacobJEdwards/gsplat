@@ -202,7 +202,7 @@ class Config:
 
     use_adversarial_views: bool = True
     generator_lr: float = 1e-4
-    generator_train_interval: int = 20
+    generator_train_interval: int = 50
     adversarial_loss_lambda: float = 0.1
     num_adversarial_views: int = 4
     generator_noise_dim: int = 32

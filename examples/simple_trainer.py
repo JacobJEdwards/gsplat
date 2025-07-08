@@ -568,23 +568,26 @@ class Runner:
             means = self.splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
-        
+
         if kwargs.get("quats", None) is not None:
             quats = kwargs.pop("quats")
         else:
             quats = self.splats["quats"]  # [N, 4]
-            
+
         if kwargs.get("scales", None) is not None:
             scales = torch.exp(kwargs.pop("scales"))
         else:
             scales = torch.exp(self.splats["scales"])  # [N, 3]
-        
+
         if kwargs.get("opacities", None) is not None:
             opacities = torch.sigmoid(kwargs.pop("opacities"))
         else:
             opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
         image_ids = kwargs.pop("image_ids", None)
-        if self.cfg.app_opt:
+
+        if kwargs.get("colors", None) is not None:
+            colors = kwargs.pop("colors")
+        elif self.cfg.app_opt:
             colors = self.app_module(
                 features=self.splats["features"],
                 embed_ids=image_ids,

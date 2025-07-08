@@ -604,6 +604,7 @@ class Runner:
 
         max_steps = cfg.max_steps
         init_step = 0
+        torch.autograd.set_detect_anomaly(True)
 
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value

@@ -87,9 +87,6 @@ class NRQMStrategy(DefaultStrategy):
             state: Dict[str, Any],
             info: Dict[str, Any],
     ):
-        if self.verbose:
-            print(f"Step {info['step']}: Updating NRQM quality map...")
-
         cam_idx = torch.randint(0, info['n_cameras'], (1,)).item()
         camtoworld = info['camtoworlds'][cam_idx].unsqueeze(0)
         K = info['Ks'][cam_idx].unsqueeze(0)

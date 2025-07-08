@@ -857,7 +857,7 @@ class Runner:
 
                 adversarial_gs_loss = -gen_nrqm_loss
 
-                adversarial_gs_loss.backward()
+                adversarial_gs_loss.backward(retain_graph=True)
 
                 self.generator_optimizer.step()
                 loss = loss + adversarial_loss * cfg.adversarial_loss_lambda

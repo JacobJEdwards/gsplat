@@ -29,7 +29,7 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
-from examples.NRQMStrategy import NRQMStrategy
+from NRQMStrategy import NRQMStrategy
 from utils import (
     AppearanceOptModule,
     CameraOptModule,

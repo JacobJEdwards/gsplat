@@ -212,6 +212,7 @@ class Config:
     gen_focal_limit: float = 0.1
     gen_pp_limit: int = 20
     gen_skew_limit: float = 0.01
+    gen_radial_limit: float = 0.1
 
     generator_anneal_steps: int = 10000
     generator_min_lr_factor: float = 0.01
@@ -481,7 +482,7 @@ class Runner:
         self.generator = None
         self.generator_optimizer = None
         if cfg.use_adversarial_views:
-            self.generator = PoseGeneratorModule(output_dim=9+4, input_dim=cfg.generator_noise_dim + 3).to(self.device)
+            self.generator = PoseGeneratorModule(output_dim=9+4+1+1, input_dim=cfg.generator_noise_dim + 12).to(self.device)
             self.generator_optimizer = torch.optim.AdamW(
                 self.generator.parameters(), lr=cfg.generator_lr
             )
@@ -510,7 +511,6 @@ class Runner:
                 self.parser.camtoworlds, n_interp=5
             )
             if candidate_poses_np.shape[1] == 3:
-                print("Padding interpolated poses from 3x4 to 4x4...")
                 bottom_row = np.array([[[0.0, 0.0, 0.0, 1.0]]])
                 repeated_bottom_row = np.repeat(
                     bottom_row, len(candidate_poses_np), axis=0
@@ -667,8 +667,6 @@ class Runner:
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
-            print(f"Shape of Ks: {Ks.shape}")
-            print(f"Content of Ks[0]: {Ks[0]}")
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
@@ -765,11 +763,11 @@ class Runner:
                 if cfg.use_adversarial_views and (step + 1) % cfg.generator_train_interval != 0:
                     z = torch.randn(cfg.num_adversarial_views, cfg.generator_noise_dim, device=device)
                     base_idx = np.random.randint(len(self.trainset))
-                    base_camtoworld = torch.from_numpy(self.parser.camtoworlds[base_idx]).float().to(device)
-                    base_translation = base_camtoworld[:3, 3].unsqueeze(0).repeat(cfg.num_adversarial_views, 1) #
-                    base_K = Ks[0]
 
-                    pose_deltas_raw, intrinsic_deltas_raw = self.generator(z, base_translation)
+                    base_camtoworld = torch.from_numpy(self.parser.camtoworlds[base_idx]).float().to(device)
+
+                    base_camtoworld_batch = base_camtoworld.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
+                    pose_deltas_raw, intrinsic_deltas_raw, radial_deltas_raw = self.generator(z, base_camtoworld_batch)
 
                     trans_deltas = torch.tanh(pose_deltas_raw[:, :3]) * cfg.gen_trans_limit
                     rot_deltas_6d = torch.tanh(pose_deltas_raw[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
@@ -781,13 +779,14 @@ class Runner:
                     gen_transforms[:, :3, 3] = trans_deltas
                     gen_transforms[:, 3, 3] = 1.0
 
-                    gen_camtoworlds = base_camtoworld.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
+                    gen_camtoworlds = base_camtoworld_batch
                     gen_camtoworlds = torch.matmul(gen_camtoworlds, gen_transforms)
 
-                    gen_Ks = base_K.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
+                    gen_Ks = Ks[0].unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1) 
                     focal_deltas = torch.tanh(intrinsic_deltas_raw[:, :2]) * cfg.gen_focal_limit
-                    pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:4]) * cfg.gen_pp_limit #
+                    pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:4]) * cfg.gen_pp_limit
                     skew_deltas = torch.tanh(intrinsic_deltas_raw[:, 4:5]) * cfg.gen_skew_limit
+                    radial_k1 = torch.tanh(radial_deltas_raw[:, 0:1]) * cfg.gen_radial_limit
 
                     fx_new = gen_Ks[:, 0, 0] * (1.0 + focal_deltas[:, 0])
                     fy_new = gen_Ks[:, 1, 1] * (1.0 + focal_deltas[:, 1])
@@ -795,11 +794,11 @@ class Runner:
                     cy_new = gen_Ks[:, 1, 2] + pp_deltas[:, 1]
                     skew_new = gen_Ks[:, 0, 1] + skew_deltas[:, 0]
 
-                    new_K_rows = [torch.stack([fx_new, skew_new, cx_new], dim=-1), # Use skew_new
+                    new_K_rows = [torch.stack([fx_new, skew_new, cx_new], dim=-1),
                                   torch.stack([torch.zeros_like(fy_new), fy_new, cy_new], dim=-1),
                                   torch.stack([torch.zeros_like(gen_Ks[:, 2, 2]), torch.zeros_like(gen_Ks[:, 2, 2]), gen_Ks[:, 2, 2]], dim=-1)]
                     updated_gen_Ks = torch.stack(new_K_rows, dim=-2)
-
+                    
                     gen_renders, _, _ = self.rasterize_splats(
                         camtoworlds=gen_camtoworlds,
                         Ks=updated_gen_Ks,
@@ -808,6 +807,7 @@ class Runner:
                         sh_degree=sh_degree_to_use,
                         near_plane=cfg.near_plane,
                         far_plane=cfg.far_plane,
+                        radial_k1=radial_k1,
                     )
 
                     gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)
@@ -862,14 +862,14 @@ class Runner:
 
             if cfg.use_adversarial_views and (step + 1) % cfg.generator_train_interval == 0:
                 self.generator_optimizer.zero_grad()
-                
+
                 z = torch.randn(cfg.num_adversarial_views, cfg.generator_noise_dim, device=device)
                 base_idx = np.random.randint(len(self.trainset))
-                base_camtoworld = torch.from_numpy(self.parser.camtoworlds[base_idx]).float().to(device)
-                base_translation = base_camtoworld[:3, 3].unsqueeze(0).repeat(cfg.num_adversarial_views, 1) #
-                base_K = Ks[0]
 
-                pose_deltas_raw, intrinsic_deltas_raw = self.generator(z, base_translation)
+                base_camtoworld = torch.from_numpy(self.parser.camtoworlds[base_idx]).float().to(device)
+
+                base_camtoworld_batch = base_camtoworld.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
+                pose_deltas_raw, intrinsic_deltas_raw, radial_deltas_raw = self.generator(z, base_camtoworld_batch)
 
                 trans_deltas = torch.tanh(pose_deltas_raw[:, :3]) * cfg.gen_trans_limit
                 rot_deltas_6d = torch.tanh(pose_deltas_raw[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
@@ -881,13 +881,14 @@ class Runner:
                 gen_transforms[:, :3, 3] = trans_deltas
                 gen_transforms[:, 3, 3] = 1.0
 
-                gen_camtoworlds = base_camtoworld.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
+                gen_camtoworlds = base_camtoworld_batch
                 gen_camtoworlds = torch.matmul(gen_camtoworlds, gen_transforms)
 
-                gen_Ks = base_K.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
+                gen_Ks = Ks[0].unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
                 focal_deltas = torch.tanh(intrinsic_deltas_raw[:, :2]) * cfg.gen_focal_limit
-                pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:4]) * cfg.gen_pp_limit #
+                pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:4]) * cfg.gen_pp_limit
                 skew_deltas = torch.tanh(intrinsic_deltas_raw[:, 4:5]) * cfg.gen_skew_limit
+                radial_k1 = torch.tanh(radial_deltas_raw[:, 0:1]) * cfg.gen_radial_limit
 
                 fx_new = gen_Ks[:, 0, 0] * (1.0 + focal_deltas[:, 0])
                 fy_new = gen_Ks[:, 1, 1] * (1.0 + focal_deltas[:, 1])
@@ -895,7 +896,7 @@ class Runner:
                 cy_new = gen_Ks[:, 1, 2] + pp_deltas[:, 1]
                 skew_new = gen_Ks[:, 0, 1] + skew_deltas[:, 0]
 
-                new_K_rows = [torch.stack([fx_new, skew_new, cx_new], dim=-1), # Use skew_new
+                new_K_rows = [torch.stack([fx_new, skew_new, cx_new], dim=-1),
                               torch.stack([torch.zeros_like(fy_new), fy_new, cy_new], dim=-1),
                               torch.stack([torch.zeros_like(gen_Ks[:, 2, 2]), torch.zeros_like(gen_Ks[:, 2, 2]), gen_Ks[:, 2, 2]], dim=-1)]
                 updated_gen_Ks = torch.stack(new_K_rows, dim=-2)
@@ -908,6 +909,7 @@ class Runner:
                     sh_degree=sh_degree_to_use,
                     near_plane=cfg.near_plane,
                     far_plane=cfg.far_plane,
+                    radial_k1=radial_k1,
                 )
 
                 gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)

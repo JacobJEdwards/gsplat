@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
+import torch.nn as nn
 import tyro
 import piq
 import yaml
@@ -57,7 +58,7 @@ class PatchBasedNRQM(nn.Module):
 
     def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
         return self.brisque(image_patches)
-    
+
 def strategy_representer(dumper: yaml.Dumper, data: Strategy) -> yaml.nodes.MappingNode:
     strategy_dict = vars(data).copy()
 

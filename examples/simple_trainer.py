@@ -667,6 +667,8 @@ class Runner:
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
+            print(f"Shape of Ks: {Ks.shape}")
+            print(f"Content of Ks[0]: {Ks[0]}")
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]

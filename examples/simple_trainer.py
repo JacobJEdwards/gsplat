@@ -1093,6 +1093,7 @@ class Runner:
             if isinstance(self.cfg.strategy, NRQMStrategy):
                 info["camtoworlds"] = camtoworlds
                 info["step"] = step
+                info["Ks"] = Ks
 
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,

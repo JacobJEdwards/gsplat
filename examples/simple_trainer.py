@@ -865,7 +865,7 @@ class Runner:
 
                 loss += nrqm_loss * cfg.nrqm_lambda
                 self.adaptive_sampler.update_quality_history(
-                    nrqm_camtoworlds.cpu().numpy(),
+                    nrqm_camtoworlds.detach().cpu().numpy(),
                     nrqm_loss.detach().cpu().numpy(),
                 )
 

@@ -28,7 +28,17 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, generate_novel_views, generate_variational_intrinsics
+from utils import (
+    AppearanceOptModule,
+    CameraOptModule,
+    knn,
+    rgb_to_sh,
+    set_random_seed,
+    generate_novel_views,
+    generate_variational_intrinsics,
+    PoseGeneratorModule,
+    rotation_6d_to_matrix,
+)
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -189,6 +199,20 @@ class Config:
     novel_view_translation_pertube: float = 1.0
     novel_view_rotation_pertube: float = 40.0
     nrqm_lambda: float = 1.0
+
+    use_adversarial_views: bool = False
+    generator_lr: float = 1e-4
+    generator_train_interval: int = 50
+    adversarial_loss_lambda: float = 0.1
+    num_adversarial_views: int = 1
+    generator_noise_dim: int = 32
+
+    gen_trans_limit: float = 0.5
+    gen_rot_limit: float = 10.0
+    gen_focal_limit: float = 0.1
+    gen_pp_limit: int = 20
+
+    use_scene_aware_sampling: bool = False
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -450,6 +474,16 @@ class Runner:
                 ),
             ]
 
+        self.generator = None
+        self.generator_optimizer = None
+        if cfg.use_adversarial_views:
+            self.generator = PoseGeneratorModule(output_dim=9+4).to(self.device)
+            self.generator_optimizer = torch.optim.Adam(
+                self.generator.parameters(), lr=cfg.generator_lr
+            )
+            if world_size > 1:
+                self.generator = DDP(self.generator)
+
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
@@ -598,6 +632,13 @@ class Runner:
                             self.bil_grid_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                         ),
                     ]
+                )
+            )
+
+        if cfg.use_adversarial_views:
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.generator_optimizer, gamma=0.01 ** (1.0 / max_steps)
                 )
             )
 
@@ -751,6 +792,71 @@ class Runner:
                         nrqm_colors.permute(0, 3, 1, 2).detach().cpu().numpy(),
                         step,
                     )
+
+            if cfg.use_adversarial_views and (step + 1) % cfg.generator_train_interval == 0:
+                self.generator_optimizer.zero_grad()
+
+                z = torch.randn(cfg.num_adversarial_views, cfg.generator_noise_dim, device=device)
+                pose_deltas_raw, intrinsic_deltas_raw = self.generator(z)
+
+                pose_deltas = pose_deltas_raw.clone()
+                pose_deltas[:, :3] = torch.tanh(pose_deltas[:, :3]) * cfg.gen_trans_limit
+
+                pose_deltas[:, 3:] = torch.tanh(pose_deltas[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
+
+                intrinsic_deltas = intrinsic_deltas_raw.clone()
+                intrinsic_deltas[:, :2] = torch.tanh(intrinsic_deltas[:, :2]) * cfg.gen_focal_limit
+                intrinsic_deltas[:, 2:] = torch.tanh(intrinsic_deltas[:, 2:]) * cfg.gen_pp_limit
+
+                base_camtoworld = camtoworlds[np.random.randint(len(self.trainset))].to(device)
+                base_K = Ks[0]
+
+                gen_camtoworlds = base_camtoworld.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
+
+                gen_transforms = torch.eye(4, device=device).unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
+                gen_transforms[:, :3, :3] = rotation_6d_to_matrix(pose_deltas[:, 3:] + self.generator.identity_rot)
+                gen_transforms[:, :3, 3] = pose_deltas[:, :3]
+
+                gen_camtoworlds = torch.matmul(gen_camtoworlds, gen_transforms)
+
+
+                gen_Ks = base_K.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
+                gen_Ks[:, 0, 0] = gen_Ks[:, 0, 0] * (1.0 + intrinsic_deltas[:, 0]) # fx_new = fx_base * (1 + dfx)
+                gen_Ks[:, 1, 1] = gen_Ks[:, 1, 1] * (1.0 + intrinsic_deltas[:, 1]) # fy_new = fy_base * (1 + dfy)
+                gen_Ks[:, 0, 2] = gen_Ks[:, 0, 2] + intrinsic_deltas[:, 2] # cx_new = cx_base + dcx
+                gen_Ks[:, 1, 2] = gen_Ks[:, 1, 2] + intrinsic_deltas[:, 3]
+
+                gen_renders, _, _ = self.rasterize_splats(
+                    camtoworlds=gen_camtoworlds,
+                    Ks=gen_Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree_to_use,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                )
+
+                gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)
+                gen_colors_permuted = gen_colors.permute(0, 3, 1, 2)
+
+                gen_nrqm_loss = self.nrqm_model(gen_colors_permuted).mean()
+                if cfg.nrqm_model == "clipiqa":
+                    gen_nrqm_loss = -gen_nrqm_loss
+
+                adversarial_gs_loss = -gen_nrqm_loss * cfg.adversarial_loss_lambda
+
+                gen_nrqm_loss.backward()
+                self.generator_optimizer.step()
+
+                if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
+                    self.writer.add_scalar("train/gen_nrqm_loss", gen_nrqm_loss.item(), step)
+                    self.writer.add_images(
+                        "train/adv_render",
+                        gen_colors.permute(0, 3, 1, 2).detach().cpu().numpy(),
+                        step,
+                    )
+
+                loss += adversarial_gs_loss
 
             # regularizations
             if cfg.opacity_reg > 0.0:

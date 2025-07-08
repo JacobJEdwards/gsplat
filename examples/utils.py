@@ -218,7 +218,7 @@ def apply_depth_colormap(
     far_plane = far_plane or float(torch.max(depth))
     depth = (depth - near_plane) / (far_plane - near_plane + 1e-10)
     depth = torch.clip(depth, 0.0, 1.0)
-    img = apply_float_colormap(depth, colormap="turbo")
+    img = apply_float_colormap(depth)
     if acc is not None:
         img = img * acc + (1.0 - acc)
     return img
@@ -299,3 +299,26 @@ def generate_novel_views(
         novel_poses.append(novel_pose)
 
     return np.array(novel_poses)
+
+class PoseGeneratorModule(torch.nn.Module):
+    def __init__(self, mlp_width: int = 64, mlp_depth: int = 3,
+                 output_dim: int = 9 + 4):
+        super().__init__()
+        input_dim = 32
+
+        layers = [torch.nn.Linear(input_dim, mlp_width), torch.nn.PReLU()]
+        for _ in range(mlp_depth - 1):
+            layers.append(torch.nn.Linear(mlp_width, mlp_width))
+            layers.append(torch.nn.PReLU())
+        layers.append(torch.nn.Linear(mlp_width, output_dim))
+
+        self.net = torch.nn.Sequential(*layers)
+
+        self.register_buffer("identity_rot", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
+
+    def forward(self, z: Tensor) -> tuple[Tensor, Tensor]:
+        raw_output = self.net(z)
+        pose_deltas = raw_output[..., :9]
+        intrinsic_deltas = raw_output[..., 9:]
+
+        return pose_deltas, intrinsic_deltas

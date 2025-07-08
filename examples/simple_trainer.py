@@ -605,7 +605,7 @@ class Runner:
 
         # Dump cfg.
         if world_rank == 0:
-            cfg_to_save = cfg
+            cfg_to_save = copy.deepcopy(cfg)
 
             if hasattr(cfg_to_save, 'strategy') and hasattr(cfg_to_save.strategy, '__dict__'):
                 strategy_dict = vars(cfg_to_save.strategy)

@@ -833,16 +833,15 @@ class Runner:
                         dim=-1)]
                 updated_gen_Ks = torch.stack(new_K_rows, dim=-2)
 
-                with torch.no_grad():
-                    gen_renders, _, _ = self.rasterize_splats(
-                        camtoworlds=gen_camtoworlds,
-                        Ks=updated_gen_Ks,
-                        width=width,
-                        height=height,
-                        sh_degree=sh_degree_to_use,
-                        near_plane=cfg.near_plane,
-                        far_plane=cfg.far_plane,
-                    )
+                gen_renders, _, _ = self.rasterize_splats(
+                    camtoworlds=gen_camtoworlds,
+                    Ks=updated_gen_Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree_to_use,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                )
 
                 gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)
                 gen_colors_permuted = gen_colors.permute(0, 3, 1, 2)

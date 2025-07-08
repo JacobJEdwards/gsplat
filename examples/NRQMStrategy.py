@@ -14,7 +14,7 @@ class PatchBasedNRQM(nn.Module):
 
     def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
         return self.brisque(image_patches)
-    
+
 from gsplat.strategy.base import Strategy
 from gsplat.strategy.ops import duplicate, remove, reset_opa, split
 from gsplat.strategy.default import DefaultStrategy
@@ -88,7 +88,8 @@ class NRQMStrategy(DefaultStrategy):
             info: Dict[str, Any],
     ):
         cam_idx = torch.randint(0, info['n_cameras'], (1,)).item()
-        camtoworld = info['camtoworlds'][cam_idx].unsqueeze(0)
+        camtoworlds = info['camtoworlds']
+        camtoworld = camtoworlds[cam_idx].unsqueeze(0)
         K = info['Ks'][cam_idx].unsqueeze(0)
         width, height = info['width'], info['height']
 
@@ -104,7 +105,7 @@ class NRQMStrategy(DefaultStrategy):
             height=height,
             packed=False,
             sh_degree=params["shN"].shape[1],
-            camtoworlds=camtoworld,
+            camtoworlds=camtoworlds,
         )
         novel_render = torch.clamp(novel_render.permute(0, 3, 1, 2), 0.0, 1.0) # [1, C, H, W]
 
@@ -163,7 +164,7 @@ class NRQMStrategy(DefaultStrategy):
 
             patch_scores = state["quality_heatmap"][patch_coords_y, patch_coords_x]
 
-            is_in_low_quality_region = patch_scores < self.prune_opa * 10 
+            is_in_low_quality_region = patch_scores < self.prune_opa * 10
 
             is_grad_high = is_grad_high & is_in_low_quality_region
 

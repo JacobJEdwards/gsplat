@@ -807,6 +807,8 @@ class Runner:
                     gen_colors_permuted = gen_colors.permute(0, 3, 1, 2)
                     gen_colors_permuted = torch.nan_to_num(gen_colors_permuted, nan=0.0, posinf=1.0, neginf=0.0)
                     gen_colors_permuted = gen_colors_permuted.clamp(min=1e-8, max=1.0 - 1e-8)
+                    
+                    nrqm_colors = gen_colors
 
                     generator_loss = self.nrqm_model(gen_colors_permuted).mean()
                     if cfg.nrqm_model == "clipiqa":

@@ -87,11 +87,13 @@ class NRQMStrategy(DefaultStrategy):
             state: Dict[str, Any],
             info: Dict[str, Any],
     ):
+        step = info["step"]
         cam_idx = torch.randint(0, info['n_cameras'], (1,)).item()
         camtoworlds = info['camtoworlds']
         camtoworld = camtoworlds[cam_idx].unsqueeze(0)
         K = info['Ks'][cam_idx].unsqueeze(0)
         width, height = info['width'], info['height']
+        sh_degree_to_use = min(step // 1000, 3)
 
         novel_render, _, _ = self.rasterizer_fn(
             means=params["means"],
@@ -102,7 +104,7 @@ class NRQMStrategy(DefaultStrategy):
             Ks=K,
             width=width,
             height=height,
-            sh_degree=params["shN"].shape[1],
+            sh_degree=sh_degree_to_use,
             camtoworlds=camtoworlds,
         )
         novel_render = torch.clamp(novel_render.permute(0, 3, 1, 2), 0.0, 1.0) # [1, C, H, W]

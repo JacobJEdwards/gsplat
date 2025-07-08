@@ -300,29 +300,11 @@ def generate_novel_views(
 
     return np.array(novel_poses)
 
-# Function to apply radial distortion
-def apply_radial_distortion(coords: Tensor, k1: Tensor) -> Tensor:
-    """
-    Applies radial distortion to normalized image coordinates.
-    Args:
-        coords: (..., 2) Normalized image coordinates (e.g., in [-1, 1] range).
-        k1: (..., 1) Radial distortion coefficient.
-    Returns:
-        (..., 2) Distorted normalized coordinates.
-    """
-    r2 = coords[..., 0]**2 + coords[..., 1]**2
-    # Ensure k1 has compatible batch dimensions
-    if k1.ndim < coords.ndim - 1:
-        k1 = k1.reshape(*coords.shape[:-1], 1)
-    distortion_factor = 1 + k1 * r2
-    return coords * distortion_factor.unsqueeze(-1)
-
-
 class PoseGeneratorModule(torch.nn.Module):
     def __init__(self, mlp_width: int = 64, mlp_depth: int = 3,
-                 output_dim: int = 9 + 4 + 1, # +1 for radial distortion coefficient
-                 input_dim: int = 32 + 12): # +12 for 3x4 base camtoworld (rotation + translation)
+                 output_dim: int = 9 + 4):
         super().__init__()
+        input_dim = 32
 
         layers = [torch.nn.Linear(input_dim, mlp_width), torch.nn.PReLU()]
         for _ in range(mlp_depth - 1):
@@ -334,11 +316,9 @@ class PoseGeneratorModule(torch.nn.Module):
 
         self.register_buffer("identity_rot", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
 
-    def forward(self, z: Tensor, base_camtoworld: Tensor) -> tuple[Tensor, Tensor, Tensor]: # Added base_camtoworld input, and radial_delta output
-        h = torch.cat([z, base_camtoworld[..., :3, :].reshape(base_camtoworld.shape[0], -1)], dim=-1)
-        raw_output = self.net(h)
-        pose_deltas = raw_output[..., :9] # 3 trans + 6 rot
-        intrinsic_deltas = raw_output[..., 9:14] # 2 focal + 2 pp + 1 skew
-        radial_delta = raw_output[..., 14:] # 1 radial distortion coefficient
+    def forward(self, z: Tensor) -> tuple[Tensor, Tensor]:
+        raw_output = self.net(z)
+        pose_deltas = raw_output[..., :9]
+        intrinsic_deltas = raw_output[..., 9:]
 
-        return pose_deltas, intrinsic_deltas, radial_delta
+        return pose_deltas, intrinsic_deltas

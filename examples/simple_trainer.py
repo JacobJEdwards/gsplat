@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 import tqdm
 import tyro
-import viser
+import piq
 import yaml
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
@@ -28,7 +28,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, generate_novel_views, generate_variational_intrinsics
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -36,14 +36,10 @@ from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from gsplat_viewer import GsplatViewer, GsplatRenderTabState
-from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
 @dataclass
 class Config:
-    # Disable viewer
-    disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # Name of compression strategy to use
@@ -52,11 +48,11 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    data_dir: Path = Path("data/360_v2/garden")
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
-    result_dir: str = "results/garden"
+    result_dir: Path = Path("results/garden")
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -87,7 +83,7 @@ class Config:
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to disable video generation during training and evaluation
-    disable_video: bool = False
+    disable_video: bool = True
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -187,6 +183,13 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
+    use_nrqm: bool = True
+    nrqm_model: Literal["brisque", "clipiqa"] = "brisque"
+    num_novel_poses: int = 50
+    novel_view_translation_pertube: float = 1.0
+    novel_view_rotation_pertube: float = 40.0
+    nrqm_lambda: float = 1.0
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -241,7 +244,7 @@ def create_splats_with_optimizers(
         raise ValueError("Please specify a correct init_type: sfm or random")
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    dist2_avg = (knn(points)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
@@ -281,7 +284,6 @@ def create_splats_with_optimizers(
     # Note that this would not make the training exactly equivalent, see
     # https://arxiv.org/pdf/2402.18824v1
     BS = batch_size * world_size
-    optimizer_class = None
     if sparse_grad:
         optimizer_class = torch.optim.SparseAdam
     elif visible_adam:
@@ -332,17 +334,12 @@ class Runner:
 
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
-            data_dir=cfg.data_dir,
+            data_dir=str(cfg.data_dir),
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
         )
-        self.trainset = Dataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
-        )
+        self.trainset = Dataset(self.parser, patch_size=cfg.patch_size, load_depths=cfg.depth_loss)
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
@@ -458,26 +455,46 @@ class Runner:
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
         if cfg.lpips_net == "alex":
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="alex", normalize=True
-            ).to(self.device)
+            self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True).to(self.device)
         elif cfg.lpips_net == "vgg":
             # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="vgg", normalize=False
-            ).to(self.device)
+            self.lpips = LearnedPerceptualImagePatchSimilarity(net_type="vgg").to(self.device)
         else:
             raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
 
-        # Viewer
-        if not self.cfg.disable_viewer:
-            self.server = viser.ViserServer(port=cfg.port, verbose=False)
-            self.viewer = GsplatViewer(
-                server=self.server,
-                render_fn=self._viewer_render_fn,
-                output_dir=Path(cfg.result_dir),
-                mode="training",
+        if cfg.use_nrqm:
+            if cfg.nrqm_model == "brisque":
+                self.nrqm_model = piq.BRISQUELoss().to(self.device)
+            elif cfg.nrqm_model == "clipiqa":
+                self.nrqm_model = piq.CLIPIQA().to(self.device)
+
+            candidate_poses_np = generate_interpolated_path(
+                self.parser.camtoworlds, n_interp=5
             )
+            if candidate_poses_np.shape[1] == 3:
+                print("Padding interpolated poses from 3x4 to 4x4...")
+                bottom_row = np.array([[[0.0, 0.0, 0.0, 1.0]]])
+                repeated_bottom_row = np.repeat(
+                    bottom_row, len(candidate_poses_np), axis=0
+                )
+                candidate_poses_np = np.concatenate(
+                    [candidate_poses_np, repeated_bottom_row], axis=1
+                )
+
+            perturbed_poses_np = generate_novel_views(
+                self.parser.camtoworlds,
+                num_novel_views=cfg.num_novel_poses,
+                translation_perturbation=cfg.novel_view_translation_pertube,
+                rotation_perturbation=cfg.novel_view_rotation_pertube,
+            )
+
+            all_poses_np = np.concatenate(
+                [candidate_poses_np, perturbed_poses_np], axis=0
+            )
+            np.random.shuffle(all_poses_np)
+            self.novel_poses_np = torch.from_numpy(all_poses_np).float().to(self.device)
+
+
 
     def rasterize_splats(
         self,
@@ -512,8 +529,6 @@ class Runner:
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
-        if camera_model is None:
-            camera_model = self.cfg.camera_model
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -600,12 +615,6 @@ class Runner:
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
-            if not cfg.disable_viewer:
-                while self.viewer.state == "paused":
-                    time.sleep(0.01)
-                self.viewer.lock.acquire()
-                tic = time.time()
-
             try:
                 data = next(trainloader_iter)
             except StopIteration:
@@ -615,9 +624,6 @@ class Runner:
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
-            num_train_rays_per_step = (
-                pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
-            )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
             if cfg.depth_loss:
@@ -669,7 +675,7 @@ class Runner:
 
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
+                colors += bkgd * (1.0 - alphas)
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -704,9 +710,44 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
+
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
+
+            if cfg.use_nrqm:
+                num_nrqm_poses = min(4, self.novel_poses_np.shape[0])
+                sampled_pose_indices = torch.randperm(self.novel_poses_np.shape[0])[:num_nrqm_poses]
+                nrqm_camtoworlds = self.novel_poses_np[sampled_pose_indices]
+
+                nrqm_Ks = Ks.repeat(num_nrqm_poses, 1, 1)
+                nrqm_width = width
+                nrqm_height = height
+
+                nrqm_renders, _, _ = self.rasterize_splats(
+                    camtoworlds=nrqm_camtoworlds,
+                    Ks=nrqm_Ks,
+                    width=nrqm_width,
+                    height=nrqm_height,
+                    sh_degree=sh_degree_to_use,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                )
+
+                nrqm_colors = torch.clamp(nrqm_renders[..., 0:3], 0.0, 1.0)
+                nrqm_colors_permuted = nrqm_colors.permute(0, 3, 1, 2)
+
+                nrqm_loss = self.nrqm_model(nrqm_colors_permuted).mean()
+
+                loss += nrqm_loss * cfg.nrqm_lambda
+
+                if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
+                    self.writer.add_scalar("train/nrqm_loss", nrqm_loss.item(), step)
+                    self.writer.add_image(
+                        "train/nrqm_render",
+                        nrqm_colors.permute(0, 3, 1, 2).detach().cpu().numpy(),
+                        step,
+                    )
 
             # regularizations
             if cfg.opacity_reg > 0.0:
@@ -803,16 +844,8 @@ class Runner:
                 scales = self.splats["scales"]
                 quats = self.splats["quats"]
                 opacities = self.splats["opacities"]
-                export_splats(
-                    means=means,
-                    scales=scales,
-                    quats=quats,
-                    opacities=opacities,
-                    sh0=sh0,
-                    shN=shN,
-                    format="ply",
-                    save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
-                )
+                export_splats(means=means, scales=scales, quats=quats, opacities=opacities, sh0=sh0, shN=shN,
+                              save_to=f"{self.ply_dir}/point_cloud_{step}.ply")
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -830,10 +863,9 @@ class Runner:
                     )
 
             if cfg.visible_adam:
-                gaussian_cnt = self.splats.means.shape[0]
                 if cfg.packed:
                     visibility_mask = torch.zeros_like(
-                        self.splats["opacities"], dtype=bool
+                        self.splats["opacities"], dtype=torch.bool
                     )
                     visibility_mask.scatter_(0, info["gaussian_ids"], 1)
                 else:
@@ -845,16 +877,16 @@ class Runner:
                     optimizer.step(visibility_mask)
                 else:
                     optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad()
             for optimizer in self.pose_optimizers:
                 optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad()
             for optimizer in self.app_optimizers:
                 optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad()
             for optimizer in self.bil_grid_optimizers:
                 optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad()
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -889,19 +921,6 @@ class Runner:
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
                 self.run_compression(step=step)
 
-            if not cfg.disable_viewer:
-                self.viewer.lock.release()
-                num_train_steps_per_sec = 1.0 / (max(time.time() - tic, 1e-10))
-                num_train_rays_per_sec = (
-                    num_train_rays_per_step * num_train_steps_per_sec
-                )
-                # Update the viewer state.
-                self.viewer.render_tab_state.num_train_rays_per_sec = (
-                    num_train_rays_per_sec
-                )
-                # Update the scene.
-                self.viewer.update(step, num_train_rays_per_step)
-
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
         """Entry for evaluation."""
@@ -909,11 +928,8 @@ class Runner:
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
-        world_size = self.world_size
 
-        valloader = torch.utils.data.DataLoader(
-            self.valset, batch_size=1, shuffle=False, num_workers=1
-        )
+        valloader = torch.utils.data.DataLoader(self.valset, shuffle=False, num_workers=1)
         ellipse_time = 0
         metrics = defaultdict(list)
         for i, data in enumerate(valloader):
@@ -1084,79 +1100,6 @@ class Runner:
             self.splats[k].data = splats_c[k].to(self.device)
         self.eval(step=step, stage="compress")
 
-    @torch.no_grad()
-    def _viewer_render_fn(
-        self, camera_state: CameraState, render_tab_state: RenderTabState
-    ):
-        assert isinstance(render_tab_state, GsplatRenderTabState)
-        if render_tab_state.preview_render:
-            width = render_tab_state.render_width
-            height = render_tab_state.render_height
-        else:
-            width = render_tab_state.viewer_width
-            height = render_tab_state.viewer_height
-        c2w = camera_state.c2w
-        K = camera_state.get_K((width, height))
-        c2w = torch.from_numpy(c2w).float().to(self.device)
-        K = torch.from_numpy(K).float().to(self.device)
-
-        RENDER_MODE_MAP = {
-            "rgb": "RGB",
-            "depth(accumulated)": "D",
-            "depth(expected)": "ED",
-            "alpha": "RGB",
-        }
-
-        render_colors, render_alphas, info = self.rasterize_splats(
-            camtoworlds=c2w[None],
-            Ks=K[None],
-            width=width,
-            height=height,
-            sh_degree=min(render_tab_state.max_sh_degree, self.cfg.sh_degree),
-            near_plane=render_tab_state.near_plane,
-            far_plane=render_tab_state.far_plane,
-            radius_clip=render_tab_state.radius_clip,
-            eps2d=render_tab_state.eps2d,
-            backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device)
-            / 255.0,
-            render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
-            rasterize_mode=render_tab_state.rasterize_mode,
-            camera_model=render_tab_state.camera_model,
-        )  # [1, H, W, 3]
-        render_tab_state.total_gs_count = len(self.splats["means"])
-        render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()
-
-        if render_tab_state.render_mode == "rgb":
-            # colors represented with sh are not guranteed to be in [0, 1]
-            render_colors = render_colors[0, ..., 0:3].clamp(0, 1)
-            renders = render_colors.cpu().numpy()
-        elif render_tab_state.render_mode in ["depth(accumulated)", "depth(expected)"]:
-            # normalize depth to [0, 1]
-            depth = render_colors[0, ..., 0:1]
-            if render_tab_state.normalize_nearfar:
-                near_plane = render_tab_state.near_plane
-                far_plane = render_tab_state.far_plane
-            else:
-                near_plane = depth.min()
-                far_plane = depth.max()
-            depth_norm = (depth - near_plane) / (far_plane - near_plane + 1e-10)
-            depth_norm = torch.clip(depth_norm, 0, 1)
-            if render_tab_state.inverse:
-                depth_norm = 1 - depth_norm
-            renders = (
-                apply_float_colormap(depth_norm, render_tab_state.colormap)
-                .cpu()
-                .numpy()
-            )
-        elif render_tab_state.render_mode == "alpha":
-            alpha = render_alphas[0, ..., 0:1]
-            if render_tab_state.inverse:
-                alpha = 1 - alpha
-            renders = (
-                apply_float_colormap(alpha, render_tab_state.colormap).cpu().numpy()
-            )
-        return renders
-
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
     if world_size > 1 and not cfg.disable_viewer:
@@ -1181,12 +1124,6 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             runner.run_compression(step=step)
     else:
         runner.train()
-
-    if not cfg.disable_viewer:
-        runner.viewer.complete()
-        print("Viewer running... Ctrl+C to exit.")
-        time.sleep(1000000)
-
 
 if __name__ == "__main__":
     """

@@ -222,3 +222,80 @@ def apply_depth_colormap(
     if acc is not None:
         img = img * acc + (1.0 - acc)
     return img
+
+def generate_variational_intrinsics(
+        base_K: Tensor,
+        num_intrinsics: int,
+        focal_perturb_factor: float,
+        principal_point_perturb_pixel: int,
+) -> Tensor:
+    device = base_K.device
+    fx_base, fy_base = base_K[0, 0], base_K[1, 1]
+    cx_base, cy_base = base_K[0, 2], base_K[1, 2]
+
+    new_Ks = base_K.unsqueeze(0).repeat(num_intrinsics, 1, 1)
+
+    focal_perturb = (
+            1.0
+            + (torch.rand(num_intrinsics, 2, device=device) * 2 - 1) * focal_perturb_factor
+    )
+    new_Ks[:, 0, 0] = fx_base * focal_perturb[:, 0]
+    new_Ks[:, 1, 1] = fy_base * focal_perturb[:, 1]
+
+    principal_point_perturb = (
+                                      torch.rand(num_intrinsics, 2, device=device) * 2 - 1
+                              ) * principal_point_perturb_pixel
+    new_Ks[:, 0, 2] = cx_base + principal_point_perturb[:, 0]
+    new_Ks[:, 1, 2] = cy_base + principal_point_perturb[:, 1]
+
+    return new_Ks
+
+def generate_novel_views(
+        base_poses: np.ndarray,
+        num_novel_views: int,
+        translation_perturbation: float = 0.1,
+        rotation_perturbation: float = 5.0,
+) -> np.ndarray:
+    novel_poses = []
+    num_base_poses = base_poses.shape[0]
+
+    for _ in range(num_novel_views):
+        base_pose = base_poses[np.random.randint(num_base_poses)]
+
+        translation_offset = np.random.uniform(
+            -translation_perturbation, translation_perturbation, size=3
+        )
+        novel_pose = np.copy(base_pose)
+        novel_pose[:3, 3] += translation_offset
+
+        angle_rad = np.deg2rad(
+            np.random.uniform(-rotation_perturbation, rotation_perturbation, size=3)
+        )
+        rx = np.array(
+            [
+                [1, 0, 0],
+                [0, np.cos(angle_rad[0]), -np.sin(angle_rad[0])],
+                [0, np.sin(angle_rad[0]), np.cos(angle_rad[0])],
+            ]
+        )
+        ry = np.array(
+            [
+                [np.cos(angle_rad[1]), 0, np.sin(angle_rad[1])],
+                [0, 1, 0],
+                [-np.sin(angle_rad[1]), 0, np.cos(angle_rad[1])],
+            ]
+        )
+        rz = np.array(
+            [
+                [np.cos(angle_rad[2]), -np.sin(angle_rad[2]), 0],
+                [np.sin(angle_rad[2]), np.cos(angle_rad[2]), 0],
+                [0, 0, 1],
+            ]
+        )
+        rotation_offset = rz @ ry @ rx
+
+        novel_pose[:3, :3] = novel_pose[:3, :3] @ rotation_offset
+
+        novel_poses.append(novel_pose)
+
+    return np.array(novel_poses)

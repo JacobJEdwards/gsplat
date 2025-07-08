@@ -808,12 +808,12 @@ class Runner:
                 intrinsic_deltas[:, :2] = torch.tanh(intrinsic_deltas[:, :2]) * cfg.gen_focal_limit
                 intrinsic_deltas[:, 2:] = torch.tanh(intrinsic_deltas[:, 2:]) * cfg.gen_pp_limit
 
-                base_camtoworld = torch.from_numpy(self.parser.camtoworlds[np.random.randint(len(self.trainset))]).to(device)
+                base_camtoworld = torch.from_numpy(self.parser.camtoworlds[np.random.randint(len(self.trainset))]).float().to(device)
                 base_K = Ks[0]
 
                 gen_camtoworlds = base_camtoworld.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
 
-                gen_transforms = torch.eye(4, device=device).unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
+                gen_transforms = torch.eye(4, device=device, dtype=torch.float).unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
                 gen_transforms[:, :3, :3] = rotation_6d_to_matrix(pose_deltas[:, 3:] + self.generator.identity_rot)
                 gen_transforms[:, :3, 3] = pose_deltas[:, :3]
 

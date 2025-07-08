@@ -50,6 +50,14 @@ from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 
+class PatchBasedNRQM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.brisque = piq.BRISQUELoss(reduction='none', data_range=1.0)
+
+    def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
+        return self.brisque(image_patches)
+    
 def strategy_representer(dumper: yaml.Dumper, data: Strategy) -> yaml.nodes.MappingNode:
     strategy_dict = vars(data).copy()
 
@@ -374,6 +382,7 @@ class Runner:
 
         if isinstance(cfg.strategy, NRQMStrategy):
             cfg.strategy.rasterizer_fn = self.rasterize_splats
+            cfg.strategy.nrqm_model = PatchBasedNRQM().to(device)
 
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(

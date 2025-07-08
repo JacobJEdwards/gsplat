@@ -7,13 +7,6 @@ import torch.nn.functional as F
 from torch import nn
 from typing_extensions import Literal
 
-class PatchBasedNRQM(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.brisque = piq.BRISQUELoss(reduction='none', data_range=1.0)
-
-    def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
-        return self.brisque(image_patches)
 
 from gsplat.strategy.base import Strategy
 from gsplat.strategy.ops import duplicate, remove, reset_opa, split

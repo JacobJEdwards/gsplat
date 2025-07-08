@@ -48,7 +48,7 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: Path = Path("../../360_v2/garden")
+    data_dir: Path = Path("../../360_v2/bonsai")
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results

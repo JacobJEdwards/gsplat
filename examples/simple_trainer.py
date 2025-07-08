@@ -746,7 +746,7 @@ class Runner:
 
                 if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                     self.writer.add_scalar("train/nrqm_loss", nrqm_loss.item(), step)
-                    self.writer.add_image(
+                    self.writer.add_images(
                         "train/nrqm_render",
                         nrqm_colors.permute(0, 3, 1, 2).detach().cpu().numpy(),
                         step,

@@ -757,7 +757,7 @@ class Runner:
                 loss += tvloss
 
             if cfg.use_nrqm:
-                if cfg.use_adversarial_views:
+                if cfg.use_adversarial_views and (step + 1) % cfg.generator_train_interval != 0:
                     z = torch.randn(cfg.num_adversarial_views, cfg.generator_noise_dim, device=device)
                     pose_deltas_raw, intrinsic_deltas_raw = self.generator(z)
 

@@ -808,7 +808,7 @@ class Runner:
                 intrinsic_deltas[:, :2] = torch.tanh(intrinsic_deltas[:, :2]) * cfg.gen_focal_limit
                 intrinsic_deltas[:, 2:] = torch.tanh(intrinsic_deltas[:, 2:]) * cfg.gen_pp_limit
 
-                base_camtoworld = camtoworlds[np.random.randint(len(self.trainset))].to(device)
+                base_camtoworld = torch.from_numpy(self.parser.camtoworlds[np.random.randint(len(self.trainset))]).to(device)
                 base_K = Ks[0]
 
                 gen_camtoworlds = base_camtoworld.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)

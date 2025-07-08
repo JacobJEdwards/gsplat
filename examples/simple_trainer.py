@@ -812,7 +812,6 @@ class Runner:
                 rot_deltas = torch.tanh(pose_deltas_raw[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
                 pose_deltas = torch.cat([trans_deltas, rot_deltas], dim=-1)
 
-
                 focal_deltas = torch.tanh(intrinsic_deltas_raw[:, :2]) * cfg.gen_focal_limit
                 pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:]) * cfg.gen_pp_limit
                 intrinsic_deltas = torch.cat([focal_deltas, pp_deltas], dim=-1)
@@ -846,6 +845,7 @@ class Runner:
 
                 gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)
                 gen_colors_permuted = gen_colors.permute(0, 3, 1, 2)
+                gen_colors_permuted = torch.nan_to_num(gen_colors_permuted, nan=0.0, posinf=1.0, neginf=0.0)
 
                 gen_nrqm_loss = self.nrqm_model(gen_colors_permuted).mean()
                 if cfg.nrqm_model == "clipiqa":

@@ -197,7 +197,7 @@ class Config:
     nrqm_model: Literal["brisque", "clipiqa"] = "brisque"
     num_novel_poses: int = 50
     novel_view_translation_pertube: float = 1.0
-    novel_view_rotation_pertube: float = 40.0
+    novel_view_rotation_pertube: float = 10.0
     nrqm_lambda: float = 1.0
 
     use_adversarial_views: bool = True
@@ -757,7 +757,7 @@ class Runner:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
 
-            if cfg.use_nrqm:
+            if cfg.use_nrqm and step > 50:
                 num_nrqm_poses = min(4, self.novel_poses_np.shape[0])
                 sampled_pose_indices = torch.randperm(self.novel_poses_np.shape[0])[:num_nrqm_poses]
                 nrqm_camtoworlds = self.novel_poses_np[sampled_pose_indices]

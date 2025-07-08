@@ -52,13 +52,13 @@ class AppearanceOptModule(torch.nn.Module):
     """Appearance optimization module."""
 
     def __init__(
-        self,
-        n: int,
-        feature_dim: int,
-        embed_dim: int = 16,
-        sh_degree: int = 3,
-        mlp_width: int = 64,
-        mlp_depth: int = 2,
+            self,
+            n: int,
+            feature_dim: int,
+            embed_dim: int = 16,
+            sh_degree: int = 3,
+            mlp_width: int = 64,
+            mlp_depth: int = 2,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -76,7 +76,7 @@ class AppearanceOptModule(torch.nn.Module):
         self.color_head = torch.nn.Sequential(*layers)
 
     def forward(
-        self, features: Tensor, embed_ids: Tensor, dirs: Tensor, sh_degree: int
+            self, features: Tensor, embed_ids: Tensor, dirs: Tensor, sh_degree: int
     ) -> Tensor:
         """Adjust appearance based on embeddings.
 
@@ -198,10 +198,10 @@ def apply_float_colormap(img: torch.Tensor, colormap: str = "turbo") -> torch.Te
 
 
 def apply_depth_colormap(
-    depth: torch.Tensor,
-    acc: torch.Tensor = None,
-    near_plane: float = None,
-    far_plane: float = None,
+        depth: torch.Tensor,
+        acc: torch.Tensor = None,
+        near_plane: float = None,
+        far_plane: float = None,
 ) -> torch.Tensor:
     """Converts a depth image to color for easier analysis.
 
@@ -300,9 +300,28 @@ def generate_novel_views(
 
     return np.array(novel_poses)
 
+# Function to apply radial distortion
+def apply_radial_distortion(coords: Tensor, k1: Tensor) -> Tensor:
+    """
+    Applies radial distortion to normalized image coordinates.
+    Args:
+        coords: (..., 2) Normalized image coordinates (e.g., in [-1, 1] range).
+        k1: (..., 1) Radial distortion coefficient.
+    Returns:
+        (..., 2) Distorted normalized coordinates.
+    """
+    r2 = coords[..., 0]**2 + coords[..., 1]**2
+    # Ensure k1 has compatible batch dimensions
+    if k1.ndim < coords.ndim - 1:
+        k1 = k1.reshape(*coords.shape[:-1], 1)
+    distortion_factor = 1 + k1 * r2
+    return coords * distortion_factor.unsqueeze(-1)
+
+
 class PoseGeneratorModule(torch.nn.Module):
     def __init__(self, mlp_width: int = 64, mlp_depth: int = 3,
-                 output_dim: int = 9 + 4 + 1, input_dim: int = 32 + 12):
+                 output_dim: int = 9 + 4 + 1, # +1 for radial distortion coefficient
+                 input_dim: int = 32 + 12): # +12 for 3x4 base camtoworld (rotation + translation)
         super().__init__()
 
         layers = [torch.nn.Linear(input_dim, mlp_width), torch.nn.PReLU()]
@@ -315,11 +334,11 @@ class PoseGeneratorModule(torch.nn.Module):
 
         self.register_buffer("identity_rot", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
 
-    def forward(self, z: Tensor, base_camtoworld: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, z: Tensor, base_camtoworld: Tensor) -> tuple[Tensor, Tensor, Tensor]: # Added base_camtoworld input, and radial_delta output
         h = torch.cat([z, base_camtoworld[..., :3, :].reshape(base_camtoworld.shape[0], -1)], dim=-1)
         raw_output = self.net(h)
-        pose_deltas = raw_output[..., :9]
-        intrinsic_deltas = raw_output[..., 9:13]
-        radial_delta = raw_output[..., 13:]
+        pose_deltas = raw_output[..., :9] # 3 trans + 6 rot
+        intrinsic_deltas = raw_output[..., 9:14] # 2 focal + 2 pp + 1 skew
+        radial_delta = raw_output[..., 14:] # 1 radial distortion coefficient
 
         return pose_deltas, intrinsic_deltas, radial_delta

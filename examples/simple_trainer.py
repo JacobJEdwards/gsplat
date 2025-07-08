@@ -778,6 +778,7 @@ class Runner:
 
                 nrqm_colors = torch.clamp(nrqm_renders[..., 0:3], 0.0, 1.0)
                 nrqm_colors_permuted = nrqm_colors.permute(0, 3, 1, 2)
+                nrqm_colors_permuted = torch.nan_to_num(nrqm_colors_permuted, nan=0.0, posinf=1.0, neginf=0.0)
 
                 nrqm_loss = self.nrqm_model(nrqm_colors_permuted).mean()
 

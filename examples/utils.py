@@ -302,7 +302,7 @@ def generate_novel_views(
 
 class PoseGeneratorModule(torch.nn.Module):
     def __init__(self, mlp_width: int = 64, mlp_depth: int = 3,
-                 output_dim: int = 9 + 4):
+                 output_dim: int = 9 + 4, ):
         super().__init__()
         input_dim = 32
 
@@ -322,3 +322,349 @@ class PoseGeneratorModule(torch.nn.Module):
         intrinsic_deltas = raw_output[..., 9:]
 
         return pose_deltas, intrinsic_deltas
+
+class ImprovedPoseGeneratorModule(torch.nn.Module):
+    """Enhanced pose generator with better conditioning and more sophisticated architecture."""
+
+    def __init__(self,
+                 mlp_width: int = 128,
+                 mlp_depth: int = 4,
+                 noise_dim: int = 32,
+                 condition_dim: int = 16,
+                 use_attention: bool = True,
+                 use_spectral_norm: bool = True):
+        super().__init__()
+
+        self.noise_dim = noise_dim
+        self.condition_dim = condition_dim
+        self.use_attention = use_attention
+
+        # Conditioning network for scene-aware generation
+        self.condition_encoder = nn.Sequential(
+            nn.Linear(9, condition_dim),  # 9 for camera pose stats
+            nn.LayerNorm(condition_dim),
+            nn.ReLU(),
+            nn.Linear(condition_dim, condition_dim),
+            nn.LayerNorm(condition_dim),
+            nn.ReLU()
+        )
+
+        input_dim = noise_dim + condition_dim
+
+        # Main generator network with residual connections
+        layers = []
+        layers.append(nn.Linear(input_dim, mlp_width))
+        layers.append(nn.LayerNorm(mlp_width))
+        layers.append(nn.ReLU())
+
+        # Residual blocks
+        for i in range(mlp_depth - 1):
+            layer = nn.Linear(mlp_width, mlp_width)
+            if use_spectral_norm:
+                layer = nn.utils.spectral_norm(layer)
+            layers.append(layer)
+            layers.append(nn.LayerNorm(mlp_width))
+            layers.append(nn.ReLU())
+
+        # Self-attention layer
+        if use_attention:
+            self.attention = nn.MultiheadAttention(mlp_width, num_heads=8, batch_first=True)
+
+        # Separate heads for pose and intrinsics
+        self.pose_head = nn.Sequential(
+            nn.Linear(mlp_width, mlp_width // 2),
+            nn.ReLU(),
+            nn.Linear(mlp_width // 2, 9)  # 3 trans + 6 rot
+        )
+
+        self.intrinsic_head = nn.Sequential(
+            nn.Linear(mlp_width, mlp_width // 2),
+            nn.ReLU(),
+            nn.Linear(mlp_width // 2, 4)  # fx, fy, cx, cy deltas
+        )
+
+        self.net = nn.Sequential(*layers)
+
+        # Identity rotation in 6D representation
+        self.register_buffer("identity_rot", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights for stable training."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, z: torch.Tensor, scene_condition: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            z: Random noise [batch_size, noise_dim]
+            scene_condition: Scene statistics [batch_size, 9] (mean pos, std pos, mean rot euler)
+        """
+        # Encode scene condition
+        condition_encoded = self.condition_encoder(scene_condition)
+
+        x = torch.cat([z, condition_encoded], dim=-1)
+
+        x = self.net(x)
+
+        if self.use_attention:
+            x_unsqueezed = x.unsqueeze(1)
+            x_attended, _ = self.attention(x_unsqueezed, x_unsqueezed, x_unsqueezed)
+            x = x_attended.squeeze(1)
+
+        pose_deltas = self.pose_head(x)
+        intrinsic_deltas = self.intrinsic_head(x)
+
+        return pose_deltas, intrinsic_deltas
+
+class AdaptiveNovelViewSampler:
+    def __init__(self,
+                 base_poses: np.ndarray,
+                 quality_history_size: int = 1000,
+                 temperature: float = 0.1):
+        self.base_poses = base_poses
+        self.quality_history = []
+        self.pose_history = []
+        self.quality_history_size = quality_history_size
+        self.temperature = temperature
+
+        self.scene_stats = self._compute_scene_stats()
+
+    def _compute_scene_stats(self) -> torch.Tensor:
+        positions = self.base_poses[:, :3, 3]
+        rotations = self.base_poses[:, :3, :3]
+
+        euler_angles = []
+        for rot in rotations:
+            sy = np.sqrt(rot[0, 0]**2 + rot[1, 0]**2)
+            singular = sy < 1e-6
+            if not singular:
+                x = np.arctan2(rot[2, 1], rot[2, 2])
+                y = np.arctan2(-rot[2, 0], sy)
+                z = np.arctan2(rot[1, 0], rot[0, 0])
+            else:
+                x = np.arctan2(-rot[1, 2], rot[1, 1])
+                y = np.arctan2(-rot[2, 0], sy)
+                z = 0
+            euler_angles.append([x, y, z])
+
+        euler_angles = np.array(euler_angles)
+
+        pos_mean = np.mean(positions, axis=0)
+        pos_std = np.std(positions, axis=0)
+        rot_mean = np.mean(euler_angles, axis=0)
+
+        return torch.tensor(np.concatenate([pos_mean, pos_std, rot_mean]), dtype=torch.float32)
+
+    def update_quality_history(self, poses: np.ndarray, qualities: np.ndarray):
+        for pose, quality in zip(poses, qualities):
+            self.pose_history.append(pose.copy())
+            self.quality_history.append(quality)
+
+            if len(self.quality_history) > self.quality_history_size:
+                self.quality_history.pop(0)
+                self.pose_history.pop(0)
+
+    def get_difficulty_weighted_poses(self, num_poses: int) -> np.ndarray:
+        if len(self.quality_history) < 10:
+            return self._generate_random_poses(num_poses)
+
+        qualities = np.array(self.quality_history)
+        poses = np.array(self.pose_history)
+
+        probs = F.softmax(torch.tensor(qualities) / self.temperature, dim=0).numpy()
+
+        sampled_indices = np.random.choice(len(poses), size=num_poses//2, p=probs)
+        difficult_poses = poses[sampled_indices]
+
+        random_poses = self._generate_random_poses(num_poses - num_poses//2)
+
+        return np.concatenate([difficult_poses, random_poses], axis=0)
+
+    def _generate_random_poses(self, num_poses: int) -> np.ndarray:
+        """Generate random poses around base poses."""
+        return generate_novel_views(
+            self.base_poses,
+            num_novel_views=num_poses,
+            translation_perturbation=0.15,
+            rotation_perturbation=8.0
+        )
+
+class HierarchicalPoseGenerator:
+    """Hierarchical pose generation with coarse-to-fine sampling."""
+
+    def __init__(self, base_poses: np.ndarray, num_levels: int = 3):
+        self.base_poses = base_poses
+        self.num_levels = num_levels
+        self.level_perturbations = self._compute_level_perturbations()
+
+    def _compute_level_perturbations(self) -> List[Tuple[float, float]]:
+        """Compute perturbation amounts for each level."""
+        base_trans = 0.05
+        base_rot = 2.0
+
+        perturbations = []
+        for level in range(self.num_levels):
+            scale = 2.0 ** level
+            perturbations.append((base_trans * scale, base_rot * scale))
+
+        return perturbations
+
+    def generate_hierarchical_poses(self, num_poses_per_level: int) -> np.ndarray:
+        """Generate poses at multiple difficulty levels."""
+        all_poses = []
+
+        for level, (trans_pert, rot_pert) in enumerate(self.level_perturbations):
+            level_poses = generate_novel_views(
+                self.base_poses,
+                num_novel_views=num_poses_per_level,
+                translation_perturbation=trans_pert,
+                rotation_perturbation=rot_pert
+            )
+            all_poses.append(level_poses)
+
+        return np.concatenate(all_poses, axis=0)
+
+
+class CurriculumPoseScheduler:
+    """Curriculum learning scheduler for pose difficulty."""
+
+    def __init__(self,
+                 total_steps: int,
+                 initial_difficulty: float = 0.1,
+                 final_difficulty: float = 1.0,
+                 warmup_steps: int = 1000):
+        self.total_steps = total_steps
+        self.initial_difficulty = initial_difficulty
+        self.final_difficulty = final_difficulty
+        self.warmup_steps = warmup_steps
+
+    def get_difficulty(self, step: int) -> float:
+        """Get current difficulty level based on training step."""
+        if step < self.warmup_steps:
+            return self.initial_difficulty
+
+        progress = (step - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+        progress = min(1.0, progress)
+
+        # Smooth curriculum with cosine schedule
+        difficulty = self.initial_difficulty + (self.final_difficulty - self.initial_difficulty) * \
+                     (1 - math.cos(progress * math.pi)) / 2
+
+        return difficulty
+
+
+def generate_quality_aware_poses(base_poses: np.ndarray,
+                                 num_poses: int,
+                                 quality_scores: Optional[np.ndarray] = None,
+                                 diversity_weight: float = 0.3) -> np.ndarray:
+    """Generate poses that balance quality and diversity."""
+    if quality_scores is None:
+        return generate_novel_views(base_poses, num_poses)
+
+    # Use quality scores to guide sampling
+    quality_weights = F.softmax(torch.tensor(quality_scores) * 2.0, dim=0).numpy()
+
+    # Sample base poses based on quality
+    selected_bases = np.random.choice(
+        len(base_poses),
+        size=num_poses,
+        p=quality_weights
+    )
+
+    # Generate variations with adaptive perturbation
+    novel_poses = []
+    for i, base_idx in enumerate(selected_bases):
+        base_pose = base_poses[base_idx]
+
+        # Adaptive perturbation based on quality
+        quality = quality_scores[base_idx]
+        trans_scale = 0.05 + 0.15 * quality  # Higher quality = more perturbation
+        rot_scale = 2.0 + 8.0 * quality
+
+        # Add diversity term
+        diversity_factor = 1.0 + diversity_weight * (i / num_poses)
+
+        pose_variation = generate_novel_views(
+            base_pose[None, :],
+            num_novel_views=1,
+            translation_perturbation=trans_scale * diversity_factor,
+            rotation_perturbation=rot_scale * diversity_factor
+        )[0]
+
+        novel_poses.append(pose_variation)
+
+    return np.array(novel_poses)
+
+
+def generate_interpolated_challenging_poses(base_poses: np.ndarray,
+                                            num_poses: int,
+                                            challenge_factor: float = 0.5) -> np.ndarray:
+    novel_poses = []
+
+    for _ in range(num_poses):
+        idx1, idx2 = np.random.choice(len(base_poses), 2, replace=False)
+        pose1, pose2 = base_poses[idx1], base_poses[idx2]
+
+        pos_dist = np.linalg.norm(pose1[:3, 3] - pose2[:3, 3])
+
+        t = np.random.uniform(0.2, 0.8)
+        if pos_dist > np.percentile([np.linalg.norm(p1[:3, 3] - p2[:3, 3])
+                                     for p1 in base_poses for p2 in base_poses], 70):
+            t = t * challenge_factor + (1 - challenge_factor) * 0.5
+
+        interp_pos = (1 - t) * pose1[:3, 3] + t * pose2[:3, 3]
+
+        interp_rot = (1 - t) * pose1[:3, :3] + t * pose2[:3, :3]
+
+        u, s, vh = np.linalg.svd(interp_rot)
+        interp_rot = u @ vh
+
+        interp_pose = np.eye(4)
+        interp_pose[:3, :3] = interp_rot
+        interp_pose[:3, 3] = interp_pos
+
+        perturbation = np.random.normal(0, 0.02, 3)
+        interp_pose[:3, 3] += perturbation
+
+        novel_poses.append(interp_pose)
+
+    return np.array(novel_poses)
+
+def integrate_enhanced_pose_generation(runner_instance, step: int):
+    cfg = runner_instance.cfg
+
+    if not hasattr(runner_instance, 'adaptive_sampler'):
+        runner_instance.adaptive_sampler = AdaptiveNovelViewSampler(
+            runner_instance.parser.camtoworlds
+        )
+        runner_instance.curriculum_scheduler = CurriculumPoseScheduler(
+            total_steps=cfg.max_steps
+        )
+        runner_instance.hierarchical_generator = HierarchicalPoseGenerator(
+            runner_instance.parser.camtoworlds
+        )
+
+    difficulty = runner_instance.curriculum_scheduler.get_difficulty(step)
+
+    if step % 3 == 0:
+        novel_poses = runner_instance.adaptive_sampler.get_difficulty_weighted_poses(
+            cfg.num_novel_poses
+        )
+    elif step % 3 == 1:
+        novel_poses = runner_instance.hierarchical_generator.generate_hierarchical_poses(
+            cfg.num_novel_poses // 3
+        )
+    else:
+        novel_poses = generate_interpolated_challenging_poses(
+            runner_instance.parser.camtoworlds,
+            cfg.num_novel_poses,
+            challenge_factor=difficulty
+        )
+
+    return torch.from_numpy(novel_poses).float().to(runner_instance.device)

@@ -103,20 +103,25 @@ class NRQMStrategy(DefaultStrategy):
         novel_render = torch.clamp(novel_render.permute(0, 3, 1, 2), 0.0, 1.0) # [1, C, H, W]
 
         p = self.nrqm_patch_size
-        patches = novel_render.unfold(2, p, p).unfold(3, p, p) # [1, C, H/p, W/p, p, p]
-        patches = patches.contiguous().view(1, 3, -1, p, p).permute(0, 2, 1, 3, 4).squeeze(0) # [NumPatches, C, p, p]
+        patches = novel_render.unfold(2, p, p).unfold(3, p, p)
+        patches = patches.contiguous().view(1, 3, -1, p, p).permute(0, 2, 1, 3, 4).squeeze(0)
 
         patch_scores = torch.empty(patches.shape[0], device=patches.device)
         std_threshold = 0.01
 
         is_flat = patches.mean(dim=1).std(dim=[1, 2]) < std_threshold
 
-        if (~is_flat).any():
-            valid_patches = patches[~is_flat]
-            patch_scores[~is_flat] = self.nrqm_model(valid_patches.float())
-
         if is_flat.any():
-            patch_scores[is_flat] = 1.0
+            patch_scores[is_flat] = 100.0
+
+        valid_patch_indices = torch.where(~is_flat)[0]
+        for idx in valid_patch_indices:
+            patch = patches[idx].unsqueeze(0) 
+            try:
+                score = self.nrqm_model(patch.float())
+                patch_scores[idx] = score
+            except AssertionError:
+                patch_scores[idx] = 100.0
 
         num_patches_h = height // p
         quality_heatmap = patch_scores.view(num_patches_h, -1)
@@ -132,9 +137,11 @@ class NRQMStrategy(DefaultStrategy):
         state["view_proj_matrix"] = (proj_matrix.T @ view_matrix[0]).T
 
         avg_quality = patch_scores.mean()
-        quality_factor = torch.clamp(1.0 - avg_quality, 0.5, 1.5).item()
-        state["dynamic_grow_grad2d"] = self.grow_grad2d * quality_factor
+        normalized_quality = torch.clamp(avg_quality / 50.0, 0.0, 2.0) # Normalize score to ~0-2 range
+        quality_factor = torch.clamp(1.0 + (normalized_quality - 1.0) * 0.5, 0.5, 1.5).item()
 
+        state["dynamic_grow_grad2d"] = self.grow_grad2d * quality_factor
+    
     @torch.no_grad()
     def _grow_gs(
             self,

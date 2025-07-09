@@ -165,6 +165,7 @@ class NRQMStrategy(DefaultStrategy):
 
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
+        
         is_grad_high = grads > current_grow_grad2d
 
         if state.get("quality_heatmap") is not None and state.get("view_proj_matrix") is not None and state["quality_heatmap"].numel() > 0:
@@ -183,9 +184,12 @@ class NRQMStrategy(DefaultStrategy):
 
             patch_scores = state["quality_heatmap"][patch_coords_y, patch_coords_x]
 
-            is_in_low_quality_region = patch_scores < self.prune_opa * 10
+            is_in_low_quality_region = patch_scores < self.nrqm_stagnation_threshold
 
-            is_grad_high = is_grad_high & is_in_low_quality_region
+            # is_in_low_quality_region = patch_scores < self.prune_opa * 10
+            is_grad_high = is_grad_high | (is_in_low_quality_region & (grads > self.grow_grad2d * 0.5))
+
+            # is_grad_high = is_grad_high & is_in_low_quality_region
 
         is_small = (
                 torch.exp(params["scales"]).max(dim=-1).values

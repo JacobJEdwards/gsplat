@@ -275,12 +275,11 @@ class NRQMStrategy(DefaultStrategy):
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:
-            if state.get("stagnation_count") is not None:
-                state["stagnation_count"] = state["stagnation_count"][~is_prune]
-            per_gaussian_state_keys = ["grad2d", "count", "radii"]
+            per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count"]
             state_to_prune = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
 
             remove(params=params, optimizers=optimizers, state=state_to_prune, mask=is_prune)
-            state.update(state_to_prune)
 
+            state.update(state_to_prune)
+            
         return n_prune

@@ -267,7 +267,7 @@ class NRQMStrategy(DefaultStrategy):
             state["stagnation_count"][~is_stagnant] = (state["stagnation_count"][~is_stagnant] - 1).clamp(min=0)
 
             # is_prune_stagnant = state["stagnation_count"] > self.nrqm_prune_stagnant_after
-            is_prune_stagnant = state["stagnation_count"] > self.nrqm_prune_stagnant_after
+            is_prune_stagnant = state["stagnation_count"] > (self.nrqm_prune_stagnant_after + self.nrqm_every // self.refine_every)
 
             is_prune = is_prune_original | is_prune_stagnant
         else:

@@ -222,8 +222,11 @@ class NRQMStrategy(DefaultStrategy):
             is_split |= state["radii"] > self.grow_scale2d
         n_split = is_split.sum().item()
 
+        per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count"]
+        state_to_grow = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
+
         if n_dupli > 0:
-            duplicate(params=params, optimizers=optimizers, state=state, mask=is_dupli)
+            duplicate(params=params, optimizers=optimizers, state=state_to_grow, mask=is_dupli)
 
         is_split = torch.cat(
             [is_split, torch.zeros(n_dupli, dtype=torch.bool, device=is_split.device)]
@@ -233,10 +236,13 @@ class NRQMStrategy(DefaultStrategy):
             split(
                 params=params,
                 optimizers=optimizers,
-                state=state,
+                state=state_to_grow,
                 mask=is_split,
                 revised_opacity=self.revised_opacity,
             )
+            
+        state.update(state_to_grow)
+        
         return n_dupli, n_split
 
     @torch.no_grad()

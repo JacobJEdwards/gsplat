@@ -216,14 +216,14 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
-    use_nrqm: bool = True
+    use_nrqm: bool = False
     nrqm_model: Literal["brisque", "clipiqa"] = "brisque"
     num_novel_poses: int = 50
     novel_view_translation_pertube: float = 1.0
     novel_view_rotation_pertube: float = 10.0
     nrqm_lambda: float = 1.0
 
-    use_adversarial_views: bool = True
+    use_adversarial_views: bool = False
     generator_lr: float = 1e-4
     generator_train_interval: int = 50
     adversarial_loss_lambda: float = 0.1

@@ -211,8 +211,8 @@ class NRQMStrategy(DefaultStrategy):
 
         if state.get("quality_heatmap") is not None and step > state["last_nrqm_step"] and state["quality_heatmap"].numel() > 0:
             if state.get("stagnation_count") is None:
-                state["stagnation_count"] = torch.zeros_like(params["means"], dtype=torch.int)
-
+                state["stagnation_count"] = torch.zeros(params["means"].shape[0], dtype=torch.int, device=params["means"].device)
+                
             grads = state["grad2d"] / state["count"].clamp_min(1)
             is_grad_low = grads < self.grow_grad2d
 
@@ -234,10 +234,10 @@ class NRQMStrategy(DefaultStrategy):
             is_stagnant = is_grad_low & is_in_low_quality_region
 
             state["stagnation_count"][is_stagnant] += 1
-            state["stagnation_count"][~is_stagnant] = 0
+            state["stagnation_count"][~is_stagnant] = (state["stagnation_count"][~is_stagnant] - 1).clamp(min=0)
 
             # is_prune_stagnant = state["stagnation_count"] > self.nrqm_prune_stagnant_after
-            is_prune_stagnant = torch.any(state["stagnation_count"] > self.nrqm_prune_stagnant_after, dim=1)
+            is_prune_stagnant = state["stagnation_count"] > self.nrqm_prune_stagnant_after
 
             is_prune = is_prune_original | is_prune_stagnant
         else:
@@ -247,6 +247,10 @@ class NRQMStrategy(DefaultStrategy):
         if n_prune > 0:
             if state.get("stagnation_count") is not None:
                 state["stagnation_count"] = state["stagnation_count"][~is_prune]
-            remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
+            per_gaussian_state_keys = ["grad2d", "count", "radii"]
+            state_to_prune = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
+
+            remove(params=params, optimizers=optimizers, state=state_to_prune, mask=is_prune)
+            state.update(state_to_prune)
 
         return n_prune

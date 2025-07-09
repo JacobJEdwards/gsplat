@@ -106,7 +106,17 @@ class NRQMStrategy(DefaultStrategy):
         patches = novel_render.unfold(2, p, p).unfold(3, p, p) # [1, C, H/p, W/p, p, p]
         patches = patches.contiguous().view(1, 3, -1, p, p).permute(0, 2, 1, 3, 4).squeeze(0) # [NumPatches, C, p, p]
 
-        patch_scores = self.nrqm_model(patches)
+        patch_scores = torch.empty(patches.shape[0], device=patches.device)
+        std_threshold = 0.01
+
+        is_flat = patches.mean(dim=1).std(dim=[1, 2]) < std_threshold
+
+        if (~is_flat).any():
+            valid_patches = patches[~is_flat]
+            patch_scores[~is_flat] = self.nrqm_model(valid_patches.float())
+
+        if is_flat.any():
+            patch_scores[is_flat] = 1.0
 
         num_patches_h = height // p
         quality_heatmap = patch_scores.view(num_patches_h, -1)
@@ -212,7 +222,7 @@ class NRQMStrategy(DefaultStrategy):
         if state.get("quality_heatmap") is not None and step > state["last_nrqm_step"] and state["quality_heatmap"].numel() > 0:
             if state.get("stagnation_count") is None:
                 state["stagnation_count"] = torch.zeros(params["means"].shape[0], dtype=torch.int, device=params["means"].device)
-                
+
             grads = state["grad2d"] / state["count"].clamp_min(1)
             is_grad_low = grads < self.grow_grad2d
 

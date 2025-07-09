@@ -114,7 +114,6 @@ class NRQMStrategy(DefaultStrategy):
         if is_flat.any():
             patch_scores[is_flat] = 100.0
         
-        worked = False
 
         valid_patch_indices = torch.where(~is_flat)[0]
         for idx in valid_patch_indices:
@@ -122,16 +121,9 @@ class NRQMStrategy(DefaultStrategy):
             try:
                 score = self.nrqm_model(patch.float())
                 patch_scores[idx] = score
-                worked = True
             except AssertionError:
                 patch_scores[idx] = 100.0
         
-        if not worked:
-            print(f"NRQM model failed to process any patches at step {step}. Using default scores.")
-            patch_scores[~is_flat] = 100.0
-        else:
-            print(f"NRQM model worked at step {step}.")
-
         num_patches_h = height // p
         quality_heatmap = patch_scores.view(num_patches_h, -1)
         state["quality_heatmap"] = quality_heatmap
@@ -150,6 +142,32 @@ class NRQMStrategy(DefaultStrategy):
         quality_factor = torch.clamp(1.0 + (normalized_quality - 1.0) * 0.5, 0.5, 1.5).item()
 
         state["dynamic_grow_grad2d"] = self.grow_grad2d * quality_factor
+
+    @torch.no_grad()
+    def _project_to_patch_coords(self, means3d, view_proj_matrix, num_patches_h, num_patches_w):
+        means_h = F.pad(means3d, (0, 1), value=1.0)
+        p_hom = means_h @ view_proj_matrix
+
+        w_coord = p_hom[:, 3]
+        
+        w_coord_safe = torch.clamp(w_coord, min=1e-6)
+        p_w = 1.0 / w_coord_safe
+
+        p_proj = p_hom[:, :2] * p_w[:, None]
+
+        valid_mask = (
+                torch.isfinite(p_proj).all(dim=1) &
+                (torch.abs(p_proj) < 10.0).all(dim=1) &
+                (w_coord > 1e-6)
+        )
+
+        patch_coords_x = (p_proj[:, 0] * 0.5 + 0.5) * num_patches_w
+        patch_coords_y = (p_proj[:, 1] * 0.5 + 0.5) * num_patches_h
+
+        patch_coords_x = torch.clamp(torch.floor(patch_coords_x), 0, num_patches_w - 1).long()
+        patch_coords_y = torch.clamp(torch.floor(patch_coords_y), 0, num_patches_h - 1).long()
+
+        return patch_coords_x, patch_coords_y, valid_mask
     
     @torch.no_grad()
     def _grow_gs(
@@ -170,26 +188,26 @@ class NRQMStrategy(DefaultStrategy):
 
         if state.get("quality_heatmap") is not None and state.get("view_proj_matrix") is not None and state["quality_heatmap"].numel() > 0:
             means3d = params["means"]
-
-            means_h = F.pad(means3d, (0, 1), value=1.0)
-            p_hom = means_h @ state["view_proj_matrix"]
-            p_w = 1.0 / (p_hom[:, 3] + 1e-7)
-            p_proj = p_hom[:, :2] * p_w[:, None] # [-1, 1] range
-
-            p = self.nrqm_patch_size
             num_patches_h = state["quality_heatmap"].shape[0]
             num_patches_w = state["quality_heatmap"].shape[1]
-            patch_coords_x = torch.clamp(torch.floor((p_proj[:, 0] * 0.5 + 0.5) * num_patches_w), 0, num_patches_w - 1).long()
-            patch_coords_y = torch.clamp(torch.floor((p_proj[:, 1] * 0.5 + 0.5) * num_patches_h), 0, num_patches_h - 1).long()
 
-            patch_scores = state["quality_heatmap"][patch_coords_y, patch_coords_x]
+            patch_coords_x, patch_coords_y, valid_mask = self._project_to_patch_coords(
+                means3d, state["view_proj_matrix"], num_patches_h, num_patches_w
+            )
 
-            is_in_low_quality_region = patch_scores < self.nrqm_stagnation_threshold
+            is_in_low_quality_region = torch.zeros(len(means3d), dtype=torch.bool, device=means3d.device)
 
-            # is_in_low_quality_region = patch_scores < self.prune_opa * 10
-            is_grad_high = is_grad_high | (is_in_low_quality_region & (grads > self.grow_grad2d * 0.5))
+            if valid_mask.any():
+                valid_indices = torch.where(valid_mask)[0]
+                patch_scores = state["quality_heatmap"][
+                    patch_coords_y[valid_indices],
+                    patch_coords_x[valid_indices]
+                ]
+                is_in_low_quality_region[valid_indices] = patch_scores < self.nrqm_stagnation_threshold
 
-            # is_grad_high = is_grad_high & is_in_low_quality_region
+                # Apply spatial awareness to gradient threshold
+                is_grad_high = is_grad_high | (is_in_low_quality_region & (grads > self.grow_grad2d * 0.5))
+
 
         is_small = (
                 torch.exp(params["scales"]).max(dim=-1).values
@@ -247,26 +265,28 @@ class NRQMStrategy(DefaultStrategy):
             is_grad_low = grads < self.grow_grad2d
 
             means3d = params["means"]
-            means_h = F.pad(means3d, (0, 1), value=1.0)
-            p_hom = means_h @ state["view_proj_matrix"]
-            p_w = 1.0 / (p_hom[:, 3] + 1e-7)
-            p_proj = p_hom[:, :2] * p_w[:, None]
-
-            p = self.nrqm_patch_size
             num_patches_h = state["quality_heatmap"].shape[0]
             num_patches_w = state["quality_heatmap"].shape[1]
-            patch_coords_x = torch.clamp(torch.floor((p_proj[:, 0] * 0.5 + 0.5) * num_patches_w), 0, num_patches_w - 1).long()
-            patch_coords_y = torch.clamp(torch.floor((p_proj[:, 1] * 0.5 + 0.5) * num_patches_h), 0, num_patches_h - 1).long()
 
-            patch_scores = state["quality_heatmap"][patch_coords_y, patch_coords_x]
-            is_in_low_quality_region = patch_scores < self.nrqm_stagnation_threshold
+            patch_coords_x, patch_coords_y, valid_mask = self._project_to_patch_coords(
+                means3d, state["view_proj_matrix"], num_patches_h, num_patches_w
+            )
+
+            is_in_low_quality_region = torch.zeros(len(means3d), dtype=torch.bool, device=means3d.device)
+
+            if valid_mask.any():
+                valid_indices = torch.where(valid_mask)[0]
+                patch_scores = state["quality_heatmap"][
+                    patch_coords_y[valid_indices],
+                    patch_coords_x[valid_indices]
+                ]
+                is_in_low_quality_region[valid_indices] = patch_scores < self.nrqm_stagnation_threshold
 
             is_stagnant = is_grad_low & is_in_low_quality_region
 
             state["stagnation_count"][is_stagnant] += 1
             state["stagnation_count"][~is_stagnant] = (state["stagnation_count"][~is_stagnant] - 1).clamp(min=0)
 
-            # is_prune_stagnant = state["stagnation_count"] > self.nrqm_prune_stagnant_after
             is_prune_stagnant = state["stagnation_count"] > (self.nrqm_prune_stagnant_after + self.nrqm_every // self.refine_every)
 
             is_prune = is_prune_original | is_prune_stagnant

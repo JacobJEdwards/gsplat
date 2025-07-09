@@ -45,7 +45,7 @@ class NRQMStrategy(DefaultStrategy):
     nrqm_prune_stagnant_after: int = 15
 
     rasterizer_fn: Any = field(default=None, repr=False)
-    nrqm_model: Any = field(default=lambda: PatchBasedNRQM(), repr=False)
+    nrqm_model: Any = field(default=None, repr=False)
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         state = super().initialize_state(scene_scale)
@@ -141,7 +141,7 @@ class NRQMStrategy(DefaultStrategy):
         grads = state["grad2d"] / count.clamp_min(1)
         is_grad_high = grads > current_grow_grad2d
 
-        if state.get("quality_heatmap") is not None and state.get("view_proj_matrix") is not None:
+        if state.get("quality_heatmap") is not None and state.get("view_proj_matrix") is not None and state["quality_heatmap"].numel() > 0:
             means3d = params["means"]
 
             means_h = F.pad(means3d, (0, 1), value=1.0)
@@ -209,7 +209,7 @@ class NRQMStrategy(DefaultStrategy):
                 is_too_big |= state["radii"] > self.prune_scale2d
             is_prune_original |= is_too_big
 
-        if state.get("quality_heatmap") is not None and step > state["last_nrqm_step"]:
+        if state.get("quality_heatmap") is not None and step > state["last_nrqm_step"] and state["quality_heatmap"].numel() > 0:
             if state.get("stagnation_count") is None:
                 state["stagnation_count"] = torch.zeros_like(params["means"], dtype=torch.int)
 

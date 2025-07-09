@@ -3,7 +3,7 @@ import random
 import numpy as np
 import torch
 from sklearn.neighbors import NearestNeighbors
-from torch import Tensor
+from torch import Tensor, nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
@@ -320,5 +320,85 @@ class PoseGeneratorModule(torch.nn.Module):
         raw_output = self.net(z)
         pose_deltas = raw_output[..., :9]
         intrinsic_deltas = raw_output[..., 9:]
+
+        return pose_deltas, intrinsic_deltas
+
+class ImprovedPoseGeneratorModule(torch.nn.Module):
+    def __init__(self,
+                 mlp_width: int = 128,
+                 mlp_depth: int = 4,
+                 noise_dim: int = 32,
+                 condition_dim: int = 16,
+                 use_attention: bool = True,
+                 use_spectral_norm: bool = True):
+        super().__init__()
+
+        self.noise_dim = noise_dim
+        self.condition_dim = condition_dim
+        self.use_attention = use_attention
+
+        self.condition_encoder = nn.Sequential(
+            nn.Linear(9, condition_dim),  # 9 for camera pose stats
+            nn.LayerNorm(condition_dim),
+            nn.PReLU(),
+            nn.Linear(condition_dim, condition_dim),
+            nn.LayerNorm(condition_dim),
+            nn.PReLU()
+        )
+
+        input_dim = noise_dim + condition_dim
+
+        layers = [nn.Linear(input_dim, mlp_width), nn.LayerNorm(mlp_width), nn.PReLU()]
+
+        for i in range(mlp_depth - 1):
+            layer = nn.Linear(mlp_width, mlp_width)
+            if use_spectral_norm:
+                layer = nn.utils.spectral_norm(layer)
+            layers.append(layer)
+            layers.append(nn.LayerNorm(mlp_width))
+            layers.append(nn.PReLU())
+
+        if use_attention:
+            self.attention = nn.MultiheadAttention(mlp_width, num_heads=8, batch_first=True)
+
+        self.pose_head = nn.Sequential(
+            nn.Linear(mlp_width, mlp_width // 2),
+            nn.PReLU(),
+            nn.Linear(mlp_width // 2, 9) 
+        )
+
+        self.intrinsic_head = nn.Sequential(
+            nn.Linear(mlp_width, mlp_width // 2),
+            nn.PReLU(),
+            nn.Linear(mlp_width // 2, 4) 
+        )
+
+        self.net = nn.Sequential(*layers)
+
+        self.register_buffer("identity_rot", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, z: torch.Tensor, scene_condition: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        condition_encoded = self.condition_encoder(scene_condition)
+
+        x = torch.cat([z, condition_encoded], dim=-1)
+
+        x = self.net(x)
+
+        if self.use_attention:
+            x_unsqueezed = x.unsqueeze(1)
+            x_attended, _ = self.attention(x_unsqueezed, x_unsqueezed, x_unsqueezed)
+            x = x_attended.squeeze(1)
+
+        pose_deltas = self.pose_head(x)
+        intrinsic_deltas = self.intrinsic_head(x)
 
         return pose_deltas, intrinsic_deltas

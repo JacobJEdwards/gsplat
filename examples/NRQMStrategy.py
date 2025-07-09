@@ -113,6 +113,8 @@ class NRQMStrategy(DefaultStrategy):
 
         if is_flat.any():
             patch_scores[is_flat] = 100.0
+        
+        worked = False
 
         valid_patch_indices = torch.where(~is_flat)[0]
         for idx in valid_patch_indices:
@@ -120,8 +122,15 @@ class NRQMStrategy(DefaultStrategy):
             try:
                 score = self.nrqm_model(patch.float())
                 patch_scores[idx] = score
+                worked = True
             except AssertionError:
                 patch_scores[idx] = 100.0
+        
+        if not worked:
+            print(f"NRQM model failed to process any patches at step {step}. Using default scores.")
+            patch_scores[~is_flat] = 100.0
+        else:
+            print(f"NRQM model worked at step {step}.")
 
         num_patches_h = height // p
         quality_heatmap = patch_scores.view(num_patches_h, -1)
@@ -137,7 +146,7 @@ class NRQMStrategy(DefaultStrategy):
         state["view_proj_matrix"] = (proj_matrix.T @ view_matrix[0]).T
 
         avg_quality = patch_scores.mean()
-        normalized_quality = torch.clamp(avg_quality / 50.0, 0.0, 2.0) # Normalize score to ~0-2 range
+        normalized_quality = torch.clamp(avg_quality / 50.0, 0.0, 2.0)
         quality_factor = torch.clamp(1.0 + (normalized_quality - 1.0) * 0.5, 0.5, 1.5).item()
 
         state["dynamic_grow_grad2d"] = self.grow_grad2d * quality_factor

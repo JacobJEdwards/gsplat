@@ -390,7 +390,7 @@ class Runner:
         if isinstance(cfg.strategy, NRQMStrategy):
             cfg.strategy.rasterizer_fn = self.rasterize_splats
             cfg.strategy.nrqm_model = PatchBasedNRQM().to(self.device)
-            cfg.strategy.knn_fn = faiss_knn_with_ids
+            cfg.strategy.knn_fn = knn_with_ids
 
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(

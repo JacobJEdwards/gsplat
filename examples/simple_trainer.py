@@ -32,7 +32,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
 from NRQMStrategy import NRQMStrategy
-from examples.utils import faiss_knn_with_ids
+from utils import faiss_knn_with_ids
 from utils import (
     AppearanceOptModule,
     CameraOptModule,

@@ -302,7 +302,7 @@ class NRQMStrategy(DefaultStrategy):
             camtoworlds=camtoworlds_gt,
             image_ids=gt_ids,
         )
-        photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=0)  # [H, W, C]
+        photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=0).squeeze(0) # [H, W, C]
 
         if state["photometric_error_map"] is None:
             state["photometric_error_map"] = photometric_error_map
@@ -352,59 +352,42 @@ class NRQMStrategy(DefaultStrategy):
 
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
+        is_grad_high_orig = grads > current_grow_grad2d
 
-        is_grad_high = grads > current_grow_grad2d
+        densification_potential = torch.zeros(len(params["means"]), dtype=torch.float32, device=params["means"].device)
 
-        # --- NRQM-guided densification ---
-        # 1. Prioritize densification in low-quality regions.
-        # 2. Add geometric uncertainty check (optional, placeholder added)
-
-        if state.get("view_proj_matrix") is not None and state.get("quality_heatmap") is not None and state["quality_heatmap"].numel() > 0:
+        if state.get("view_proj_matrix") is not None:
             means3d = params["means"]
-            densification_potential = torch.zeros(len(means3d), dtype=torch.float32, device=means3d.device)
-
-            h = state["quality_heatmap"].shape[0] * self.nrqm_patch_size
-            w = state["quality_heatmap"].shape[1] * self.nrqm_patch_size
+            if state.get("photometric_error_map") is not None:
+                h, w = state["photometric_error_map"].shape
+            else:
+                h = state["quality_heatmap"].shape[0] * self.nrqm_patch_size
+                w = state["quality_heatmap"].shape[1] * self.nrqm_patch_size
 
             patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask = self._project_to_patch_coords(
                 means3d, state["view_proj_matrix"], h, w
             )
 
-            is_in_low_quality_region = torch.zeros(len(means3d), dtype=torch.bool, device=means3d.device)
+            valid_indices = torch.where(valid_mask)[0]
 
-            if valid_mask.any():
-                valid_indices = torch.where(valid_mask)[0]
-                patch_scores = state["quality_heatmap"][
-                    patch_coords_y[valid_indices],
-                    patch_coords_x[valid_indices]
-                ]
-                nrqm_potential = torch.clamp(1.0 - patch_scores / self.nrqm_stagnation_threshold, 0.0, 1.0)
-                densification_potential[valid_indices] += 0.5 * nrqm_potential
+            if valid_indices.any():
+                if state.get("photometric_error_map") is not None:
+                    error_scores = state["photometric_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+                    error_potential = torch.clamp(error_scores / self.photometric_error_thresh, 0.0, 1.0)
+                    densification_potential[valid_indices] += 0.4 * error_potential # weight for photometric error
 
-                # is_in_low_quality_region[valid_indices] = patch_scores < self.nrqm_stagnation_threshold
-                # quality_scores_clamped = torch.clamp(patch_scores, 0.0, self.nrqm_stagnation_threshold)
-                # quality_based_multiplier = 1.0 + (1.0 - quality_scores_clamped / self.nrqm_stagnation_threshold)
-                # modified_grads = grads.clone()
-                # modified_grads[valid_indices] *= quality_based_multiplier
-                # is_grad_high = modified_grads > current_grow_grad2d
-                # is_grad_high = is_grad_high | (is_in_low_quality_region & (grads > self.grow_grad2d * 0.5))
+                if state.get("quality_heatmap") is not None and state["quality_heatmap"].numel() > 0:
+                    patch_scores = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
+                    nrqm_potential = torch.clamp(1.0 - patch_scores / self.nrqm_stagnation_threshold, 0.0, 1.0)
+                    densification_potential[valid_indices] += 0.3 * nrqm_potential # weight for NRQM
 
-            if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
-                # is_geom_uncertain = torch.zeros(len(means3d), dtype=torch.bool, device=means3d.device)
-                if valid_mask.any():
-                    valid_indices = torch.where(valid_mask)[0]
-                    uncertainty_scores = state["geom_uncertainty_map"][
-                        pixel_coords_y[valid_indices],
-                        pixel_coords_x[valid_indices]
-                    ]
-                    # is_geom_uncertain[valid_indices] = uncertainty_scores > self.geom_uncertainty_thresh
+                if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
+                    uncertainty_scores = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
                     uncertainty_potential = torch.clamp(uncertainty_scores / self.geom_uncertainty_thresh, 0.0, 1.0)
-                    densification_potential[valid_indices] += 0.5 * uncertainty_potential
+                    densification_potential[valid_indices] += 0.3 * uncertainty_potential # weight for uncertainty
 
-                # is_grad_high = is_grad_high | is_geom_uncertain
-            is_high_potential = densification_potential > 0.7 # maybe make tuneable
-            is_grad_high = is_grad_high | is_high_potential
-
+        is_high_potential = densification_potential > 0.7
+        is_grad_high = is_grad_high_orig | is_high_potential
 
         is_small = (
                 torch.exp(params["scales"]).max(dim=-1).values
@@ -440,7 +423,6 @@ class NRQMStrategy(DefaultStrategy):
             )
 
         state.update(state_to_grow)
-
         return n_dupli, n_split
 
     @torch.no_grad()
@@ -496,10 +478,10 @@ class NRQMStrategy(DefaultStrategy):
             means3d = params["means"]
             num_points = len(means3d)
             last_count = state.get("last_prune_count", 0)
-            
+
             if last_count == -1 or num_points > last_count * 1.05:
                 state["last_prune_count"] = num_points
-                
+
                 if num_points > self.redundancy_knn:
                     scales = torch.exp(params["scales"]).max(dim=-1).values
                     opacities = torch.sigmoid(params["opacities"].flatten())

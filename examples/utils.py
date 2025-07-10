@@ -328,7 +328,7 @@ class ImprovedPoseGeneratorModule(torch.nn.Module):
                  mlp_width: int = 128,
                  mlp_depth: int = 4,
                  noise_dim: int = 32,
-                 condition_dim: int = 16,
+                 condition_dim: int = 12,
                  use_attention: bool = True,
                  use_spectral_norm: bool = True):
         super().__init__()
@@ -338,15 +338,15 @@ class ImprovedPoseGeneratorModule(torch.nn.Module):
         self.use_attention = use_attention
 
         self.condition_encoder = nn.Sequential(
-            nn.Linear(9, condition_dim),  # 9 for camera pose stats
-            nn.LayerNorm(condition_dim),
+            nn.Linear(condition_dim * 2, mlp_width // 2),
+            nn.LayerNorm(mlp_width // 2),
             nn.PReLU(),
-            nn.Linear(condition_dim, condition_dim),
-            nn.LayerNorm(condition_dim),
+            nn.Linear(mlp_width // 2, mlp_width // 2),
+            nn.LayerNorm(mlp_width // 2),
             nn.PReLU()
         )
 
-        input_dim = noise_dim + condition_dim
+        input_dim = noise_dim + mlp_width // 2
 
         layers = [nn.Linear(input_dim, mlp_width), nn.LayerNorm(mlp_width), nn.PReLU()]
 
@@ -388,11 +388,11 @@ class ImprovedPoseGeneratorModule(torch.nn.Module):
 
     def forward(self, z: torch.Tensor, scene_condition: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         if scene_condition is not None:
-            condition_encoded = self.condition_encoder(scene_condition)
+            condition_encoded = self.condition_encoder(scene_condition.expand(z.shape[0], -1))
         else:
             batch_size = z.shape[0]
             condition_encoded = torch.zeros(
-                (batch_size, self.condition_dim),
+                (batch_size, self.net[0].in_features - self.noise_dim),
                 device=z.device,
                 dtype=z.dtype
             )

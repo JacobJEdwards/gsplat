@@ -32,7 +32,6 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
 from NRQMStrategy import NRQMStrategy
-from utils import knn_with_ids
 from utils import (
     AppearanceOptModule,
     CameraOptModule,
@@ -40,10 +39,9 @@ from utils import (
     rgb_to_sh,
     set_random_seed,
     generate_novel_views,
-    generate_variational_intrinsics,
-    PoseGeneratorModule,
     ImprovedPoseGeneratorModule,
     rotation_6d_to_matrix,
+    knn_with_ids,
 )
 
 from gsplat import export_splats, Strategy

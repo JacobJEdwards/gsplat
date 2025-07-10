@@ -483,22 +483,23 @@ class NRQMStrategy(DefaultStrategy):
         is_prune_redundant = torch.zeros_like(is_prune_original)
         if self.prune_redundant and self.knn_fn is not None:
             means3d = params["means"]
-            scales = torch.exp(params["scales"]).max(dim=-1).values
-            opacities = torch.sigmoid(params["opacities"].flatten())
-            sh0 = params["sh0"].squeeze(1)
+            if len(means3d) > self.redundancy_knn:
+                scales = torch.exp(params["scales"]).max(dim=-1).values
+                opacities = torch.sigmoid(params["opacities"].flatten())
+                sh0 = params["sh0"].squeeze(1)
 
-            dists, idxs = self.knn_fn(means3d, K=self.redundancy_knn)
+                dists, idxs = self.knn_fn(means3d, K=self.redundancy_knn)
 
-            neighbor_idxs = idxs[:, 1:]
-            neighbor_dists = dists[:, 1:]
+                neighbor_idxs = idxs[:, 1:]
+                neighbor_dists = dists[:, 1:]
 
-            overlap_mask = neighbor_dists < (scales.unsqueeze(1) + scales[neighbor_idxs]) * self.redundancy_overlap_thresh
-            color_dist = torch.norm(sh0.unsqueeze(1) - sh0[neighbor_idxs], dim=-1)
-            color_sim_mask = color_dist < self.redundancy_color_thresh
-            is_less_opaque = opacities.unsqueeze(1) < opacities[neighbor_idxs]
+                overlap_mask = neighbor_dists < (scales.unsqueeze(1) + scales[neighbor_idxs]) * self.redundancy_overlap_thresh
+                color_dist = torch.norm(sh0.unsqueeze(1) - sh0[neighbor_idxs], dim=-1)
+                color_sim_mask = color_dist < self.redundancy_color_thresh
+                is_less_opaque = opacities.unsqueeze(1) < opacities[neighbor_idxs]
 
-            is_redundant_neighbor = overlap_mask & color_sim_mask & is_less_opaque
-            is_prune_redundant = is_redundant_neighbor.any(dim=1)
+                is_redundant_neighbor = overlap_mask & color_sim_mask & is_less_opaque
+                is_prune_redundant = is_redundant_neighbor.any(dim=1)
 
 
         is_prune = is_prune_original | is_prune_stagnant | is_prune_redundant

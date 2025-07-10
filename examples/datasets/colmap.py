@@ -57,11 +57,11 @@ class Parser:
     """COLMAP parser."""
 
     def __init__(
-        self,
-        data_dir: str,
-        factor: int = 1,
-        normalize: bool = False,
-        test_every: int = 8,
+            self,
+            data_dir: str,
+            factor: int = 1,
+            normalize: bool = False,
+            test_every: int = 8,
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -128,7 +128,7 @@ class Parser:
                 params = np.array([cam.k1, cam.k2, cam.k3, cam.k4], dtype=np.float32)
                 camtype = "fisheye"
             assert (
-                camtype == "perspective" or camtype == "fisheye"
+                    camtype == "perspective" or camtype == "fisheye"
             ), f"Only perspective and fisheye cameras are supported, got {type_}"
 
             params_dict[camera_id] = params
@@ -180,8 +180,8 @@ class Parser:
             image_dir_suffix = f"_{factor}"
         else:
             image_dir_suffix = ""
-        colmap_image_dir = os.path.join(data_dir, "images_8")
-        image_dir = os.path.join(data_dir, "images_8" + image_dir_suffix)
+        colmap_image_dir = os.path.join(data_dir, "images")
+        image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
         for d in [image_dir, colmap_image_dir]:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
@@ -282,7 +282,7 @@ class Parser:
                 continue  # no distortion
             assert camera_id in self.Ks_dict, f"Missing K for camera {camera_id}"
             assert (
-                camera_id in self.params_dict
+                    camera_id in self.params_dict
             ), f"Missing params for camera {camera_id}"
             K = self.Ks_dict[camera_id]
             width, height = self.imsize_dict[camera_id]
@@ -309,11 +309,11 @@ class Parser:
                 y1 = (grid_y - cy) / fy
                 theta = np.sqrt(x1**2 + y1**2)
                 r = (
-                    1.0
-                    + params[0] * theta**2
-                    + params[1] * theta**4
-                    + params[2] * theta**6
-                    + params[3] * theta**8
+                        1.0
+                        + params[0] * theta**2
+                        + params[1] * theta**4
+                        + params[2] * theta**6
+                        + params[3] * theta**8
                 )
                 mapx = (fx * x1 * r + width // 2).astype(np.float32)
                 mapy = (fy * y1 * r + height // 2).astype(np.float32)
@@ -352,11 +352,11 @@ class Dataset:
     """A simple dataset class."""
 
     def __init__(
-        self,
-        parser: Parser,
-        split: str = "train",
-        patch_size: Optional[int] = None,
-        load_depths: bool = False,
+            self,
+            parser: Parser,
+            split: str = "train",
+            patch_size: Optional[int] = None,
+            load_depths: bool = False,
     ):
         self.parser = parser
         self.split = split
@@ -420,11 +420,11 @@ class Dataset:
             depths = points_cam[:, 2]  # (M,)
             # filter out points outside the image
             selector = (
-                (points[:, 0] >= 0)
-                & (points[:, 0] < image.shape[1])
-                & (points[:, 1] >= 0)
-                & (points[:, 1] < image.shape[0])
-                & (depths > 0)
+                    (points[:, 0] >= 0)
+                    & (points[:, 0] < image.shape[1])
+                    & (points[:, 1] >= 0)
+                    & (points[:, 1] < image.shape[0])
+                    & (depths > 0)
             )
             points = points[selector]
             depths = depths[selector]

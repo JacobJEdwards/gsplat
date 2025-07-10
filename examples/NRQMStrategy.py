@@ -186,8 +186,8 @@ class NRQMStrategy(DefaultStrategy):
         width, height = info['width'], info['height']
         sh_degree_to_use = min(step // 1000, 3)
 
-        gt_image = info["pixels"].unsqueeze(0)  # [1, C, H, W]
-        gt_ids = info["image_ids"].unsqueeze(0)  # [1, H, W]
+        gt_image = info["pixels"]
+        gt_ids = info["image_ids"]
         gt_image = gt_image.permute(0, 2, 3, 1)
         gt_ks = info["Ks"][gt_ids].unsqueeze(0)  # [1, 3, 3]
 

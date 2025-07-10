@@ -155,7 +155,7 @@ def knn_with_ids(x: Tensor, K: int = 4) -> tuple[Tensor, Tensor]:
     x_np = x.cpu().numpy()
     model = NearestNeighbors(n_neighbors=K, metric="euclidean").fit(x_np)
     distances, indices = model.kneighbors(x_np)
-    return torch.from_numpy(distances).to(x), torch.from_numpy(indices).to(x)
+    return torch.from_numpy(distances).to(x), torch.from_numpy(indices).to(x.device, dtype=torch.long)
 
 def rgb_to_sh(rgb: Tensor) -> Tensor:
     C0 = 0.28209479177387814

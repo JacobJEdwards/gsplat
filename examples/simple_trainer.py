@@ -67,6 +67,7 @@ def strategy_representer(dumper: yaml.Dumper, data: Strategy) -> yaml.nodes.Mapp
 
     strategy_dict.pop('rasterizer_fn', None)
     strategy_dict.pop('nrqm_model', None)
+    strategy_dict.pop('knn_fn', None)
 
     return dumper.represent_mapping('tag:yaml.org,2002:map', strategy_dict)
 
@@ -389,6 +390,7 @@ class Runner:
         if isinstance(cfg.strategy, NRQMStrategy):
             cfg.strategy.rasterizer_fn = self.rasterize_splats
             cfg.strategy.nrqm_model = PatchBasedNRQM().to(self.device)
+            cfg.strategy.knn_fn = knn
 
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
@@ -919,7 +921,7 @@ class Runner:
                     # nrqm_input[~roi_mask.expand(-1, 3, -1, -1)] = 0.5
                     nrqm_input = torch.nan_to_num(nrqm_input, nan=0.0, posinf=1.0, neginf=0.0)
                     nrqm_input = nrqm_input.clamp(min=1e-8, max=1.0 - 1e-8)
-                    
+
                     # noise = torch.randn_like(nrqm_input) * 1e-5
                     # nrqm_input = (nrqm_input + noise).clamp(0.0, 1.0)
 
@@ -998,7 +1000,7 @@ class Runner:
                 # gen_input[~roi_mask.expand(-1, 3, -1, -1)] = 0.5
                 gen_input = torch.nan_to_num(gen_input, nan=0.0, posinf=1.0, neginf=0.0)
                 gen_input = gen_input.clamp(min=1e-8, max=1.0 - 1e-8)
-                
+
                 # noise = torch.randn_like(gen_input) * 1e-5
                 # gen_input = (gen_input + noise).clamp(0.0, 1.0)
 
@@ -1175,6 +1177,8 @@ class Runner:
                 info["camtoworlds"] = camtoworlds
                 info["step"] = step
                 info["Ks"] = Ks
+                info["pixels"] = pixels
+                info["image_ids"] = image_ids
 
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
@@ -1453,7 +1457,11 @@ if __name__ == "__main__":
         "nrqm": (
             "Gaussian splatting training with NRQM model for quality assessment.",
             Config(
-                strategy=NRQMStrategy(verbose=True),
+                strategy=NRQMStrategy(
+                    verbose=True,
+                    anisotropic_split=True,
+                    prune_redundant=True,
+                ),
             ),
         ),
     }
@@ -1487,8 +1495,8 @@ if __name__ == "__main__":
         except:
             raise ImportError(
                 "To use PNG compression, you need to install "
-                "torchpq (instruction at https://github.com/DeMoriarty/TorchPQ?tab=readme-ov-file#install) "
-                "and plas (via 'pip install git+https://github.com/fraunhoferhhi/PLAS.git') "
+                "torchpq (instruction at [https://github.com/DeMoriarty/TorchPQ?tab=readme-ov-file#install](https://github.com/DeMoriarty/TorchPQ?tab=readme-ov-file#install)) "
+                "and plas (via 'pip install git+[https://github.com/fraunhoferhhi/PLAS.git](https://github.com/fraunhoferhhi/PLAS.git)') "
             )
 
     if cfg.with_ut:

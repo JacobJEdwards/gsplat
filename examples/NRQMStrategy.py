@@ -160,7 +160,7 @@ class NRQMStrategy(DefaultStrategy):
     photometric_error_thresh: float = 0.1
 
     use_learned_densification: bool = True
-    bootstrap_steps: int = 4000
+    bootstrap_steps: int = 1
     learn_every: int = 500
     hindsight_delay: int = 100
 
@@ -476,7 +476,7 @@ class NRQMStrategy(DefaultStrategy):
             )
             features = self._get_gaussian_features(
                 params, state, valid_mask, pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y
-            )
+            ).to(self.densification_net.net[0].weight.device)
         else:
             return 0, 0
 

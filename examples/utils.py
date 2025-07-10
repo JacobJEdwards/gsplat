@@ -188,7 +188,7 @@ def faiss_knn_with_ids(
 
     euclidean_distances = torch.sqrt(distances)
 
-    return euclidean_distances, indices
+    return euclidean_distances.to(x.device), indices.to(x.device)
 
 def rgb_to_sh(rgb: Tensor) -> Tensor:
     C0 = 0.28209479177387814

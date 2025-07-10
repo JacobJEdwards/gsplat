@@ -565,20 +565,15 @@ class NRQMStrategy(DefaultStrategy):
             original_indices = subset_indices[final_split_indices_in_subset]
             is_split[original_indices] = True
 
-        n_split = is_split.sum().item()
-        n_dupli = is_dupli.sum().item()
+        per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count"]
+        state_to_densify = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
 
-        if n_dupli > 0 or n_split > 0:
-            per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count"]
-            state_to_grow = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
-            if n_dupli > 0:
-                duplicate(params=params, optimizers=optimizers, state=state_to_grow, mask=is_dupli)
+        if n_dupli > 0: duplicate(params, optimizers, state_to_densify, is_dupli)
+        if n_split > 0:
+            is_split_after_dup = torch.cat([is_split, torch.zeros(n_dupli, dtype=torch.bool, device=device)])
+            split(params, optimizers, state_to_densify, is_split_after_dup, anisotropic=self.anisotropic_split)
 
-            is_split_after_dup = torch.cat([is_split, torch.zeros(n_dupli, dtype=torch.bool, device=is_split.device)])
-            if n_split > 0:
-                split(params=params, optimizers=optimizers, state=state_to_grow, mask=is_split_after_dup,
-                      revised_opacity=self.revised_opacity, anisotropic=self.anisotropic_split)
-            state.update(state_to_grow)
+        state.update(state_to_densify)
 
         return n_dupli, n_split
     

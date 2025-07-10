@@ -65,14 +65,11 @@ class AppearanceOptModule(torch.nn.Module):
         self.embed_dim = embed_dim
         self.sh_degree = sh_degree
         self.embeds = torch.nn.Embedding(n, embed_dim)
-        layers = []
-        layers.append(
-            torch.nn.Linear(embed_dim + feature_dim + (sh_degree + 1) ** 2, mlp_width)
-        )
-        layers.append(torch.nn.ReLU(inplace=True))
+        layers = [torch.nn.Linear(embed_dim + feature_dim + (sh_degree + 1) ** 2, mlp_width),
+                  torch.nn.PReLU()]
         for _ in range(mlp_depth - 1):
             layers.append(torch.nn.Linear(mlp_width, mlp_width))
-            layers.append(torch.nn.ReLU(inplace=True))
+            layers.append(torch.nn.PReLU())
         layers.append(torch.nn.Linear(mlp_width, 3))
         self.color_head = torch.nn.Sequential(*layers)
 

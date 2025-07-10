@@ -17,10 +17,10 @@ class DensificationNetwork(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(input_dim, mlp_width),
             nn.LayerNorm(mlp_width),
-            nn.ReLU(),
+            nn.PReLU(),
             nn.Linear(mlp_width, mlp_width),
             nn.LayerNorm(mlp_width),
-            nn.ReLU(),
+            nn.PReLU(),
             nn.Linear(mlp_width, 1)
         )
 
@@ -55,18 +55,14 @@ def split(
     rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
 
     if anisotropic:
-        # Find the axis of largest variance (longest scale)
         largest_scale_idx = torch.argmax(scales, dim=1)
         samples = torch.zeros(2, len(scales), 3, device=device)
 
-        # Create displacement vectors along the principal axes
         displacements = torch.zeros_like(scales)
         displacements[torch.arange(len(scales)), largest_scale_idx] = scales[torch.arange(len(scales)), largest_scale_idx] * 0.4
 
-        # Rotate displacements to world coordinates
         rotated_displacements = torch.einsum("nij,nj->ni", rotmats, displacements)
 
-        # Place new Gaussians along the split axis
         samples[0] = rotated_displacements
         samples[1] = -rotated_displacements
     else:
@@ -423,7 +419,7 @@ class NRQMStrategy(DefaultStrategy):
         grads = state["grad2d"] / state["count"].clamp_min(1)
         features[:, 9] = grads
 
-        return torch.nan_to_num(features, 0.0)
+        return torch.nan_to_num(features, 0.0).to(device)
 
     def _process_hindsight_buffer(self, state, current_step):
         while state["hindsight_buffer"] and (current_step - state["hindsight_buffer"][0]["step"]) >= self.hindsight_delay:

@@ -127,9 +127,9 @@ class NRQMStrategy(DefaultStrategy):
         if state["quality_heatmap"] is None:
             state["quality_heatmap"] = quality_heatmap
         else:
-            state["quality_heatmap_ema"] = torch.lerp(
+            state["quality_heatmap"] = torch.lerp(
                 quality_heatmap,
-                state["quality_heatmap_ema"],
+                state["quality_heatmap"],
                 self.nrqm_ema_decay 
             )
 

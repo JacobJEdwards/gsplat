@@ -144,6 +144,8 @@ class NRQMStrategy(DefaultStrategy):
     use_geom_uncertainty: bool = True
     num_uncertainty_views: int = 3
     geom_uncertainty_thresh: float = 0.002
+    
+    photometric_error_thresh: float = 0.1
 
     rasterizer_fn: Any = field(default=None, repr=False)
     nrqm_model: Any = field(default=None, repr=False)

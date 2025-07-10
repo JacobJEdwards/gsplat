@@ -7,6 +7,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
+import faiss
 
 
 class CameraOptModule(torch.nn.Module):
@@ -163,6 +164,29 @@ def knn_with_ids(x: Tensor, K: int = 4, batch_size: int = 1000) -> tuple[Tensor,
             torch.cuda.empty_cache()
 
     return all_distances, all_indices
+
+def faiss_knn_with_ids(
+        x: Tensor, K: int = 4
+) -> tuple[Tensor, Tensor]:
+    if x.is_cuda:
+        x_np = x.cpu().numpy().astype('float32')
+    else:
+        x_np = x.numpy().astype('float32')
+
+    N, D = x_np.shape
+
+    index = faiss.IndexFlatL2(D)
+
+    index.add(x_np)
+
+    D_np, I_np = index.search(x_np, K)
+
+    distances = torch.from_numpy(D_np)
+    indices = torch.from_numpy(I_np).long()
+
+    euclidean_distances = torch.sqrt(distances)
+
+    return euclidean_distances, indices
 
 def rgb_to_sh(rgb: Tensor) -> Tensor:
     C0 = 0.28209479177387814

@@ -304,7 +304,7 @@ class NRQMStrategy(DefaultStrategy):
             camtoworlds=camtoworlds_gt,
             image_ids=gt_ids,
         )
-        photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=0).squeeze(0) # [H, W, C]
+        photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=-1).squeeze(0) # [H, W]
 
         if state["photometric_error_map"] is None:
             state["photometric_error_map"] = photometric_error_map

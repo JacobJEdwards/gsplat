@@ -630,27 +630,21 @@ class NRQMStrategy(DefaultStrategy):
             if subset_indices_map.numel() > self.redundancy_knn:
                 subset_means = params["means"][subset_mask]
                 dists_subset, idxs_subset = self.knn_fn(subset_means, K=self.redundancy_knn)
-
+                original_neighbor_idxs = subset_indices_map[idxs_subset[:, 1:]]
+                neighbor_scales = torch.exp(params["scales"][original_neighbor_idxs]).max(dim=-1).values
+                
+                neighbor_opacities = torch.sigmoid(params["opacities"][original_neighbor_idxs].squeeze(-1))
+                neighbor_sh0 = params["sh0"][original_neighbor_idxs].squeeze(-2)
                 scales_subset = torch.exp(params["scales"][subset_mask]).max(dim=-1).values
                 opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
                 sh0_subset = params["sh0"][subset_mask].squeeze(1)
-
-                original_neighbor_idxs = subset_indices_map[idxs_subset[:, 1:]]
-
-                neighbor_scales = torch.exp(params["scales"][original_neighbor_idxs]).max(dim=-1).values
-                neighbor_opacities = torch.sigmoid(params["opacities"][original_neighbor_idxs].flatten())
-                neighbor_sh0 = params["sh0"][original_neighbor_idxs].squeeze(1)
-
+                
                 overlap_mask = dists_subset[:, 1:] < (scales_subset.unsqueeze(1) + neighbor_scales) * self.redundancy_overlap_thresh
                 color_dist = torch.norm(sh0_subset.unsqueeze(1) - neighbor_sh0, dim=-1)
                 color_sim_mask = color_dist < self.redundancy_color_thresh
                 is_less_opaque = opacities_subset.unsqueeze(1) < neighbor_opacities
-
                 is_redundant_neighbor = overlap_mask & color_sim_mask & is_less_opaque
-                is_prune_redundant_subset = is_redundant_neighbor.any(dim=1)
-
-                is_prune_redundant[subset_indices_map] = is_prune_redundant_subset
-
+                is_prune_redundant[subset_indices_map] = is_redundant_neighbor.any(dim=1)
 
         is_prune = is_prune_original | is_prune_stagnant | is_prune_redundant
 

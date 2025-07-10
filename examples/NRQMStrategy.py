@@ -141,6 +141,10 @@ class NRQMStrategy(DefaultStrategy):
     redundancy_overlap_thresh: float = 0.6
     redundancy_color_thresh: float = 0.1
 
+    use_geom_uncertainty: bool = True
+    num_uncertainty_views: int = 3
+    geom_uncertainty_thresh: float = 0.002
+
     rasterizer_fn: Any = field(default=None, repr=False)
     nrqm_model: Any = field(default=None, repr=False)
     knn_fn: Any = field(default=None, repr=False)
@@ -154,6 +158,7 @@ class NRQMStrategy(DefaultStrategy):
             "last_nrqm_step": -1,
             "dynamic_grow_grad2d": self.grow_grad2d,
             "photometric_error_map": None,
+            "geom_uncertainty_map": None,
         })
         return state
 
@@ -180,71 +185,51 @@ class NRQMStrategy(DefaultStrategy):
             info: Dict[str, Any],
     ):
         step = info["step"]
-        gt_image = info["pixels"]  # [B, H, W, C]
-        gt_ids = info["image_ids"]  # [B,]
-        gt_ks = info["Ks"]  # [B, 3, 3]
-        camtoworlds_gt = info["camtoworlds"] # [B, 4, 4]
-
         width, height = info['width'], info['height']
         sh_degree_to_use = min(step // 1000, 3)
 
-        # Render the training view to get photometric error
-        rendered_train_view, _, _ = self.rasterizer_fn(
-            means=params["means"],
-            quats=params["quats"],
-            scales=params["scales"],
-            opacities=params["opacities"],
-            colors=torch.cat([params["sh0"], params["shN"]], 1),
-            Ks=gt_ks,
-            width=width,
-            height=height,
-            sh_degree=sh_degree_to_use,
-            camtoworlds=camtoworlds_gt,
-            image_ids=gt_ids,
-        )
-        # Assuming batch size is 1 for this calculation
-        photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=0)  # [H, W, C]
+        all_depth_renders = []
+        main_novel_view_idx = -1
 
-        if state["photometric_error_map"] is None:
-            state["photometric_error_map"] = photometric_error_map
-        else:
-            state["photometric_error_map"] = torch.lerp(
-                photometric_error_map,
-                state["photometric_error_map"],
-                self.nrqm_ema_decay
+        for i in range(self.num_uncertainty_views):
+            cam_idx = torch.randint(0, info['n_cameras'], (1,)).item()
+            if i == 0:
+                main_novel_view_idx = cam_idx
+
+            novel_camtoworld = info['camtoworlds'][cam_idx].unsqueeze(0)
+            novel_K = info['Ks'][cam_idx].unsqueeze(0)
+
+            novel_render_pkg, _, _ = self.rasterizer_fn(
+                means=params["means"],
+                quats=params["quats"],
+                scales=params["scales"],
+                opacities=params["opacities"],
+                colors=torch.cat([params["sh0"], params["shN"]], 1),
+                Ks=novel_K,
+                width=width,
+                height=height,
+                sh_degree=sh_degree_to_use,
+                camtoworlds=novel_camtoworld,
+                render_mode="RGB+ED"
             )
 
-        # Generate a novel view for NRQM
-        cam_idx = torch.randint(0, info['n_cameras'], (1,)).item()
-        novel_camtoworld = info['camtoworlds'][cam_idx].unsqueeze(0)
-        novel_K = info['Ks'][cam_idx].unsqueeze(0)
+            novel_color = novel_render_pkg[..., :3]
+            novel_depth = novel_render_pkg[..., 3]
+            all_depth_renders.append(novel_depth)
 
-        novel_render, _, _ = self.rasterizer_fn(
-            means=params["means"],
-            quats=params["quats"],
-            scales=params["scales"],
-            opacities=params["opacities"],
-            colors=torch.cat([params["sh0"], params["shN"]], 1),
-            Ks=novel_K,
-            width=width,
-            height=height,
-            sh_degree=sh_degree_to_use,
-            camtoworlds=novel_camtoworld,
-        )
-        novel_render = torch.clamp(novel_render.permute(0, 3, 1, 2), 0.0, 1.0) # [1, C, H, W]
+            if i == 0:
+                novel_render_for_nrqm = torch.clamp(novel_color.permute(0, 3, 1, 2), 0.0, 1.0)
 
         p = self.nrqm_patch_size
-        patches = novel_render.unfold(2, p, p).unfold(3, p, p)
+        patches = novel_render_for_nrqm.unfold(2, p, p).unfold(3, p, p)
         patches = patches.contiguous().view(1, 3, -1, p, p).permute(0, 2, 1, 3, 4).squeeze(0)
 
         patch_scores = torch.empty(patches.shape[0], device=patches.device)
         std_threshold = 0.01
-
         is_flat = patches.mean(dim=1).std(dim=[1, 2]) < std_threshold
 
         if is_flat.any():
             patch_scores[is_flat] = 100.0
-
 
         valid_patch_indices = torch.where(~is_flat)[0]
         for idx in valid_patch_indices:
@@ -266,47 +251,91 @@ class NRQMStrategy(DefaultStrategy):
                 self.nrqm_ema_decay
             )
 
-        # Use the novel view's projection matrix for subsequent checks
-        view_matrix = torch.inverse(novel_camtoworld)
+        if self.use_geom_uncertainty:
+            depth_stack = torch.stack(all_depth_renders)
+
+            min_d = torch.min(depth_stack[depth_stack > 0])
+            max_d = torch.max(depth_stack)
+            normalized_depth = (depth_stack - min_d) / (max_d - min_d + 1e-8)
+            normalized_depth[depth_stack == 0] = 0
+
+            geom_uncertainty_map = torch.var(normalized_depth, dim=0)
+
+            if state["geom_uncertainty_map"] is None:
+                state["geom_uncertainty_map"] = geom_uncertainty_map
+            else:
+                state["geom_uncertainty_map"] = torch.lerp(
+                    geom_uncertainty_map, state["geom_uncertainty_map"], self.nrqm_ema_decay)
+
+        main_novel_camtoworld = info['camtoworlds'][main_novel_view_idx].unsqueeze(0)
+        main_novel_K = info['Ks'][main_novel_view_idx].unsqueeze(0)
+        view_matrix = torch.inverse(main_novel_camtoworld)
         proj_matrix = torch.zeros(4, 4, device=view_matrix.device)
-        proj_matrix[0, 0] = 2 * novel_K[0, 0, 0] / width
-        proj_matrix[1, 1] = 2 * novel_K[0, 1, 1] / height
-        proj_matrix[0, 2] = -2 * novel_K[0, 0, 2] / width + 1
-        proj_matrix[1, 2] = -2 * novel_K[0, 1, 2] / height + 1
+        proj_matrix[0, 0] = 2 * main_novel_K[0, 0, 0] / width
+        proj_matrix[1, 1] = 2 * main_novel_K[0, 1, 1] / height
+        proj_matrix[0, 2] = -2 * main_novel_K[0, 0, 2] / width + 1
+        proj_matrix[1, 2] = -2 * main_novel_K[0, 1, 2] / height + 1
         proj_matrix[3, 2] = 1.0
         state["view_proj_matrix"] = (proj_matrix.T @ view_matrix[0]).T
 
         avg_quality = patch_scores.mean()
         normalized_quality = torch.clamp(avg_quality / 50.0, 0.0, 2.0)
         quality_factor = torch.clamp(1.0 + (normalized_quality - 1.0) * 0.5, 0.5, 1.5).item()
-
         state["dynamic_grow_grad2d"] = self.grow_grad2d * quality_factor
 
+        gt_image = info["pixels"]  # [B, H, W, C]
+        gt_ids = info["image_ids"]  # [B,]
+        gt_ks = info["Ks"]  # [B, 3, 3]
+        camtoworlds_gt = info["camtoworlds"] # [B, 4, 4]
+
+        rendered_train_view, _, _ = self.rasterizer_fn(
+            means=params["means"],
+            quats=params["quats"],
+            scales=params["scales"],
+            opacities=params["opacities"],
+            colors=torch.cat([params["sh0"], params["shN"]], 1),
+            Ks=gt_ks,
+            width=width,
+            height=height,
+            sh_degree=sh_degree_to_use,
+            camtoworlds=camtoworlds_gt,
+            image_ids=gt_ids,
+        )
+        photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=0)  # [H, W, C]
+
+        if state["photometric_error_map"] is None:
+            state["photometric_error_map"] = photometric_error_map
+        else:
+            state["photometric_error_map"] = torch.lerp(
+                photometric_error_map,
+                state["photometric_error_map"],
+                self.nrqm_ema_decay
+            )
+
+
     @torch.no_grad()
-    def _project_to_patch_coords(self, means3d, view_proj_matrix, num_patches_h, num_patches_w):
+    def _project_to_patch_coords(self, means3d, view_proj_matrix, h, w):
         means_h = F.pad(means3d, (0, 1), value=1.0)
         p_hom = means_h @ view_proj_matrix
-
         w_coord = p_hom[:, 3]
-
         w_coord_safe = torch.clamp(w_coord, min=1e-6)
         p_w = 1.0 / w_coord_safe
-
         p_proj = p_hom[:, :2] * p_w[:, None]
 
-        valid_mask = (
-                torch.isfinite(p_proj).all(dim=1) &
-                (torch.abs(p_proj) < 10.0).all(dim=1) &
-                (w_coord > 1e-6)
-        )
+        valid_mask = (torch.isfinite(p_proj).all(dim=1) &
+                      (torch.abs(p_proj) < 10.0).all(dim=1) &
+                      (w_coord > 1e-6))
 
-        patch_coords_x = (p_proj[:, 0] * 0.5 + 0.5) * num_patches_w
-        patch_coords_y = (p_proj[:, 1] * 0.5 + 0.5) * num_patches_h
+        coords_x = (p_proj[:, 0] * 0.5 + 0.5) * w
+        coords_y = (p_proj[:, 1] * 0.5 + 0.5) * h
 
-        patch_coords_x = torch.clamp(torch.floor(patch_coords_x), 0, num_patches_w - 1).long()
-        patch_coords_y = torch.clamp(torch.floor(patch_coords_y), 0, num_patches_h - 1).long()
+        patch_coords_x = torch.clamp(torch.floor(coords_x / self.nrqm_patch_size), 0, (w // self.nrqm_patch_size) - 1).long()
+        patch_coords_y = torch.clamp(torch.floor(coords_y / self.nrqm_patch_size), 0, (h // self.nrqm_patch_size) - 1).long()
 
-        return patch_coords_x, patch_coords_y, valid_mask
+        pixel_coords_x = torch.clamp(coords_x, 0, w - 1).long()
+        pixel_coords_y = torch.clamp(coords_y, 0, h - 1).long()
+
+        return patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask
 
     @torch.no_grad()
     def _grow_gs(
@@ -328,13 +357,13 @@ class NRQMStrategy(DefaultStrategy):
         # --- NRQM-guided densification ---
         # 1. Prioritize densification in low-quality regions.
         # 2. Add geometric uncertainty check (optional, placeholder added)
-        if state.get("quality_heatmap") is not None and state.get("view_proj_matrix") is not None and state["quality_heatmap"].numel() > 0:
+        if state.get("view_proj_matrix") is not None and state.get("quality_heatmap") is not None and state["quality_heatmap"].numel() > 0:
             means3d = params["means"]
-            num_patches_h = state["quality_heatmap"].shape[0]
-            num_patches_w = state["quality_heatmap"].shape[1]
+            h = state["quality_heatmap"].shape[0] * self.nrqm_patch_size
+            w = state["quality_heatmap"].shape[1] * self.nrqm_patch_size
 
-            patch_coords_x, patch_coords_y, valid_mask = self._project_to_patch_coords(
-                means3d, state["view_proj_matrix"], num_patches_h, num_patches_w
+            patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask = self._project_to_patch_coords(
+                means3d, state["view_proj_matrix"], h, w
             )
 
             is_in_low_quality_region = torch.zeros(len(means3d), dtype=torch.bool, device=means3d.device)
@@ -346,25 +375,24 @@ class NRQMStrategy(DefaultStrategy):
                     patch_coords_x[valid_indices]
                 ]
                 is_in_low_quality_region[valid_indices] = patch_scores < self.nrqm_stagnation_threshold
-
                 quality_scores_clamped = torch.clamp(patch_scores, 0.0, self.nrqm_stagnation_threshold)
-
                 quality_based_multiplier = 1.0 + (1.0 - quality_scores_clamped / self.nrqm_stagnation_threshold)
-
                 modified_grads = grads.clone()
                 modified_grads[valid_indices] *= quality_based_multiplier
-
                 is_grad_high = modified_grads > current_grow_grad2d
                 # is_grad_high = is_grad_high | (is_in_low_quality_region & (grads > self.grow_grad2d * 0.5))
 
-        # --- Placeholder for Geometric Uncertainty ---
-        # For a full implementation, one would:
-        # 1. Compute per-Gaussian normals.
-        # 2. Find K-nearest neighbors for each Gaussian.
-        # 3. Compute the variance of normals within each neighborhood.
-        # 4. Create a `is_geom_uncertain` mask for Gaussians with high normal variance.
-        # 5. `is_grad_high = is_grad_high | is_geom_uncertain`
-        # This focuses densification on geometrically complex or ambiguous areas.
+            if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
+                is_geom_uncertain = torch.zeros(len(means3d), dtype=torch.bool, device=means3d.device)
+                if valid_mask.any():
+                    valid_indices = torch.where(valid_mask)[0]
+                    uncertainty_scores = state["geom_uncertainty_map"][
+                        pixel_coords_y[valid_indices],
+                        pixel_coords_x[valid_indices]
+                    ]
+                    is_geom_uncertain[valid_indices] = uncertainty_scores > self.geom_uncertainty_thresh
+
+                is_grad_high = is_grad_high | is_geom_uncertain
 
 
         is_small = (
@@ -431,15 +459,14 @@ class NRQMStrategy(DefaultStrategy):
             is_grad_low = grads < self.grow_grad2d
 
             means3d = params["means"]
-            num_patches_h = state["quality_heatmap"].shape[0]
-            num_patches_w = state["quality_heatmap"].shape[1]
+            h = state["quality_heatmap"].shape[0] * self.nrqm_patch_size
+            w = state["quality_heatmap"].shape[1] * self.nrqm_patch_size
 
-            patch_coords_x, patch_coords_y, valid_mask = self._project_to_patch_coords(
-                means3d, state["view_proj_matrix"], num_patches_h, num_patches_w
+            patch_coords_x, patch_coords_y, _, _, valid_mask = self._project_to_patch_coords(
+                means3d, state["view_proj_matrix"], h, w
             )
 
             is_in_low_quality_region = torch.zeros(len(means3d), dtype=torch.bool, device=means3d.device)
-
             if valid_mask.any():
                 valid_indices = torch.where(valid_mask)[0]
                 patch_scores = state["quality_heatmap"][
@@ -449,10 +476,8 @@ class NRQMStrategy(DefaultStrategy):
                 is_in_low_quality_region[valid_indices] = patch_scores < self.nrqm_stagnation_threshold
 
             is_stagnant = is_grad_low & is_in_low_quality_region
-
             state["stagnation_count"][is_stagnant] += 1
             state["stagnation_count"][~is_stagnant] = (state["stagnation_count"][~is_stagnant] - 1).clamp(min=0)
-
             is_prune_stagnant = state["stagnation_count"] > self.nrqm_prune_stagnant_after
 
         is_prune_redundant = torch.zeros_like(is_prune_original)
@@ -462,22 +487,14 @@ class NRQMStrategy(DefaultStrategy):
             opacities = torch.sigmoid(params["opacities"].flatten())
             sh0 = params["sh0"].squeeze(1)
 
-            # Find K-nearest neighbors
-            # This can be computationally expensive. Consider running it less frequently.
             dists, idxs = self.knn_fn(means3d, K=self.redundancy_knn)
 
             neighbor_idxs = idxs[:, 1:]
             neighbor_dists = dists[:, 1:]
 
-            # Check for overlap
             overlap_mask = neighbor_dists < (scales.unsqueeze(1) + scales[neighbor_idxs]) * self.redundancy_overlap_thresh
-
-            # Check for color similarity
             color_dist = torch.norm(sh0.unsqueeze(1) - sh0[neighbor_idxs], dim=-1)
             color_sim_mask = color_dist < self.redundancy_color_thresh
-
-            # A Gaussian is redundant if it overlaps with a similar-colored neighbor
-            # that is more opaque.
             is_less_opaque = opacities.unsqueeze(1) < opacities[neighbor_idxs]
 
             is_redundant_neighbor = overlap_mask & color_sim_mask & is_less_opaque

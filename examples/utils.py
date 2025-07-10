@@ -139,11 +139,23 @@ def rotation_6d_to_matrix(d6: Tensor) -> Tensor:
 
 
 def knn(x: Tensor, K: int = 4) -> Tensor:
+    return knn_with_ids(x, K)[0]
+
+def knn_with_ids(x: Tensor, K: int = 4) -> tuple[Tensor, Tensor]:
+    """Find K nearest neighbors for each point in x.
+
+    Args:
+        x: Tensor of shape (N, D) where N is the number of points and D is the dimension.
+        K: Number of nearest neighbors to find.
+
+    Returns:
+        distances: Tensor of shape (N, K) containing distances to the K nearest neighbors.
+        indices: Tensor of shape (N, K) containing indices of the K nearest neighbors.
+    """
     x_np = x.cpu().numpy()
     model = NearestNeighbors(n_neighbors=K, metric="euclidean").fit(x_np)
-    distances, _ = model.kneighbors(x_np)
-    return torch.from_numpy(distances).to(x)
-
+    distances, indices = model.kneighbors(x_np)
+    return torch.from_numpy(distances).to(x), torch.from_numpy(indices).to(x)
 
 def rgb_to_sh(rgb: Tensor) -> Tensor:
     C0 = 0.28209479177387814

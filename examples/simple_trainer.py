@@ -32,6 +32,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
 from NRQMStrategy import NRQMStrategy
+from examples.utils import knn_with_ids
 from utils import (
     AppearanceOptModule,
     CameraOptModule,
@@ -390,7 +391,7 @@ class Runner:
         if isinstance(cfg.strategy, NRQMStrategy):
             cfg.strategy.rasterizer_fn = self.rasterize_splats
             cfg.strategy.nrqm_model = PatchBasedNRQM().to(self.device)
-            cfg.strategy.knn_fn = knn
+            cfg.strategy.knn_fn = knn_with_ids
 
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(

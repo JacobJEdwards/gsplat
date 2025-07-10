@@ -32,7 +32,6 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
 from NRQMStrategy import NRQMStrategy
-from examples.utils import ImprovedPoseGeneratorModule
 from utils import (
     AppearanceOptModule,
     CameraOptModule,
@@ -42,6 +41,7 @@ from utils import (
     generate_novel_views,
     generate_variational_intrinsics,
     PoseGeneratorModule,
+    ImprovedPoseGeneratorModule,
     rotation_6d_to_matrix,
 )
 

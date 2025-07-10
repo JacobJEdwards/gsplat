@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
 import faiss
+import faiss.contrib.torch_utils
 
 
 class CameraOptModule(torch.nn.Module):
@@ -139,8 +140,7 @@ def rotation_6d_to_matrix(d6: Tensor) -> Tensor:
 def knn(x: Tensor, K: int = 4, batch_size: int = 1000) -> Tensor:
     return knn_with_ids(x, K, batch_size)[0]
 
-
-def knn_with_ids(x: Tensor, K: int = 4, batch_size: int = 1000) -> tuple[Tensor, Tensor]:
+def knn_with_ids(x: Tensor, K: int = 4, batch_size: int = 2000) -> tuple[Tensor, Tensor]:
     N = x.size(0)
     all_distances = torch.zeros((N, K), device=x.device, dtype=x.dtype)
     all_indices = torch.zeros((N, K), device=x.device, dtype=torch.long)
@@ -165,27 +165,39 @@ def knn_with_ids(x: Tensor, K: int = 4, batch_size: int = 1000) -> tuple[Tensor,
 def faiss_knn_with_ids(
         x: Tensor, K: int = 4
 ) -> tuple[Tensor, Tensor]:
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available. Please install faiss-gpu and ensure CUDA is set up.")
-
-    x_np = x.cpu().numpy().astype('float32')
-    N, D = x_np.shape
-
-    index_cpu = faiss.IndexFlatL2(D)
+    x = x.float()
+    N, D = x.shape
 
     res = faiss.StandardGpuResources()
-    index_gpu = faiss.index_cpu_to_gpu(res, 0, index_cpu)
 
-    index_gpu.add(x_np)
+    index_flat = faiss.IndexFlatL2(D)
 
-    D_np, I_np = index_gpu.search(x_np, K)
+    gpu_index = faiss.index_cpu_to_gpu(res, 0, index_flat)
 
-    distances = torch.from_numpy(D_np)
-    indices = torch.from_numpy(I_np).long()
+    gpu_index.add(x)
 
-    euclidean_distances = torch.sqrt(distances)
+    distances, indices = gpu_index.search(x, K)
 
-    return euclidean_distances.to(x.device), indices.to(x.device)
+    return torch.sqrt(distances), indices
+
+    # x_np = x.cpu().numpy().astype('float32')
+    # N, D = x_np.shape
+    #
+    # index_cpu = faiss.IndexFlatL2(D)
+    #
+    # res = faiss.StandardGpuResources()
+    # index_gpu = faiss.index_cpu_to_gpu(res, 0, index_cpu)
+    #
+    # index_gpu.add(x_np)
+    #
+    # D_np, I_np = index_gpu.search(x_np, K)
+    #
+    # distances = torch.from_numpy(D_np)
+    # indices = torch.from_numpy(I_np).long()
+    #
+    # euclidean_distances = torch.sqrt(distances)
+    #
+    # return euclidean_distances.to(x.device), indices.to(x.device)
 
 def rgb_to_sh(rgb: Tensor) -> Tensor:
     C0 = 0.28209479177387814

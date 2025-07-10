@@ -464,7 +464,7 @@ class NRQMStrategy(DefaultStrategy):
 
             # Find K-nearest neighbors
             # This can be computationally expensive. Consider running it less frequently.
-            dists, idxs = self.knn_fn(means3d, k=self.redundancy_knn)
+            dists, idxs = self.knn_fn(means3d, K=self.redundancy_knn)
 
             neighbor_idxs = idxs[:, 1:]
             neighbor_dists = dists[:, 1:]

@@ -138,24 +138,30 @@ def rotation_6d_to_matrix(d6: Tensor) -> Tensor:
     return torch.stack((b1, b2, b3), dim=-2)
 
 
-def knn(x: Tensor, K: int = 4) -> Tensor:
-    return knn_with_ids(x, K)[0]
+def knn(x: Tensor, K: int = 4, batch_size: int = 1000) -> Tensor:
+    return knn_with_ids(x, K, batch_size)[0]
 
-def knn_with_ids(x: Tensor, K: int = 4) -> tuple[Tensor, Tensor]:
-    """Find K nearest neighbors for each point in x.
+def knn_with_ids(x: Tensor, K: int = 4, batch_size: int = 1000) -> tuple[Tensor, Tensor]:
+    N = x.size(0)
+    all_distances = torch.zeros((N, K), device=x.device, dtype=x.dtype)
+    all_indices = torch.zeros((N, K), device=x.device, dtype=torch.long)
 
-    Args:
-        x: Tensor of shape (N, D) where N is the number of points and D is the dimension.
-        K: Number of nearest neighbors to find.
+    for i in range(0, N, batch_size):
+        end = min(i + batch_size, N)
+        batch_x = x[i:end]
 
-    Returns:
-        distances: Tensor of shape (N, K) containing distances to the K nearest neighbors.
-        indices: Tensor of shape (N, K) containing indices of the K nearest neighbors.
-    """
-    dist_matrix = torch.cdist(x, x, p=2)
-    distances, indices = torch.topk(dist_matrix, k=K, largest=False)
+        dist_matrix = torch.cdist(batch_x, x, p=2)
 
-    return torch.sqrt(distances), indices
+        distances, indices = torch.topk(dist_matrix, k=K, largest=False)
+
+        all_distances[i:end] = distances
+        all_indices[i:end] = indices
+
+        del dist_matrix
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return all_distances, all_indices
 
 def rgb_to_sh(rgb: Tensor) -> Tensor:
     C0 = 0.28209479177387814

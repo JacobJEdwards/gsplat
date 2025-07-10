@@ -168,18 +168,20 @@ def knn_with_ids(x: Tensor, K: int = 4, batch_size: int = 1000) -> tuple[Tensor,
 def faiss_knn_with_ids(
         x: Tensor, K: int = 4
 ) -> tuple[Tensor, Tensor]:
-    if x.is_cuda:
-        x_np = x.cpu().numpy().astype('float32')
-    else:
-        x_np = x.numpy().astype('float32')
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available. Please install faiss-gpu and ensure CUDA is set up.")
 
+    x_np = x.cpu().numpy().astype('float32')
     N, D = x_np.shape
 
-    index = faiss.IndexFlatL2(D)
+    index_cpu = faiss.IndexFlatL2(D)
 
-    index.add(x_np)
+    res = faiss.StandardGpuResources()
+    index_gpu = faiss.index_cpu_to_gpu(res, 0, index_cpu)
 
-    D_np, I_np = index.search(x_np, K)
+    index_gpu.add(x_np)
+
+    D_np, I_np = index_gpu.search(x_np, K)
 
     distances = torch.from_numpy(D_np)
     indices = torch.from_numpy(I_np).long()

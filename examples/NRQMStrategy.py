@@ -3,98 +3,11 @@ from typing import Any, Dict, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
 
-from gsplat.strategy.ops import duplicate, remove, _update_param_with_optimizer
+
+from gsplat.strategy.ops import duplicate, remove, split
 from gsplat.strategy.default import DefaultStrategy
-from gsplat.utils import normalized_quat_to_rotmat
 
-
-@torch.no_grad()
-def split(
-        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-        optimizers: Dict[str, torch.optim.Optimizer],
-        state: Dict[str, Tensor],
-        mask: Tensor,
-        revised_opacity: bool = False,
-        anisotropic: bool = False,
-):
-    """Inplace split the Gaussian with the given mask.
-
-    Args:
-        params: A dictionary of parameters.
-        optimizers: A dictionary of optimizers, each corresponding to a parameter.
-        mask: A boolean mask to split the Gaussians.
-        revised_opacity: Whether to use revised opacity formulation
-          from arXiv:2404.06109. Default: False.
-        anisotropic: Whether to split along the largest variance axis. Default: False.
-    """
-    device = mask.device
-    sel = torch.where(mask)[0]
-    rest = torch.where(~mask)[0]
-
-    scales = torch.exp(params["scales"][sel])
-    quats = F.normalize(params["quats"][sel], dim=-1)
-    rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
-
-    if anisotropic:
-        # Find the axis of largest variance (longest scale)
-        largest_scale_idx = torch.argmax(scales, dim=1)
-        samples = torch.zeros(2, len(scales), 3, device=device)
-
-        # Create displacement vectors along the principal axes
-        displacements = torch.zeros_like(scales)
-        displacements[torch.arange(len(scales)), largest_scale_idx] = scales[torch.arange(len(scales)), largest_scale_idx] * 0.4
-
-        # Rotate displacements to world coordinates
-        rotated_displacements = torch.einsum("nij,nj->ni", rotmats, displacements)
-
-        # Place new Gaussians along the split axis
-        samples[0] = rotated_displacements
-        samples[1] = -rotated_displacements
-    else:
-        # Original isotropic split by sampling from the covariance matrix
-        samples = torch.einsum(
-            "nij,nj,bnj->bni",
-            rotmats,
-            scales,
-            torch.randn(2, len(scales), 3, device=device),
-        )  # [2, N, 3]
-
-
-    def param_fn(name: str, p: Tensor) -> Tensor:
-        repeats = [2] + [1] * (p.dim() - 1)
-        if name == "means":
-            p_split = (p[sel] + samples).reshape(-1, 3)  # [2N, 3]
-        elif name == "scales":
-            if anisotropic:
-                # Reduce the scale along the split axis
-                new_scales_val = scales.clone()
-                new_scales_val[torch.arange(len(scales)), largest_scale_idx] /= 1.6
-                p_split = torch.log(new_scales_val).repeat(2, 1)
-            else:
-                p_split = torch.log(scales / 1.6).repeat(2, 1)  # [2N, 3]
-        elif name == "opacities" and revised_opacity:
-            new_opacities = 1.0 - torch.sqrt(1.0 - torch.sigmoid(p[sel]))
-            p_split = torch.logit(new_opacities).repeat(repeats)  # [2N]
-        else:
-            p_split = p[sel].repeat(repeats)
-        p_new = torch.cat([p[rest], p_split])
-        p_new = torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
-        return p_new
-
-    def optimizer_fn(key: str, v: Tensor) -> Tensor:
-        v_split = torch.zeros((2 * len(sel), *v.shape[1:]), device=device)
-        return torch.cat([v[rest], v_split])
-
-    # update the parameters and the state in the optimizers
-    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
-    # update the extra running state
-    for k, v in state.items():
-        if isinstance(v, torch.Tensor):
-            repeats = [2] + [1] * (v.dim() - 1)
-            v_new = v[sel].repeat(repeats)
-            state[k] = torch.cat((v[rest], v_new))
 
 @dataclass
 class NRQMStrategy(DefaultStrategy):
@@ -179,20 +92,15 @@ class NRQMStrategy(DefaultStrategy):
             info: Dict[str, Any],
     ):
         step = info["step"]
-        cam_idx = torch.randint(0, info['n_cameras'], (1,)).item()
-        camtoworlds = info['camtoworlds']
-        camtoworld = camtoworlds[cam_idx].unsqueeze(0)
-        K = info['Ks'][cam_idx].unsqueeze(0)
+        gt_image = info["pixels"]  # [B, H, W, C]
+        gt_ids = info["image_ids"]  # [B,]
+        gt_ks = info["Ks"]  # [B, 3, 3]
+        camtoworlds_gt = info["camtoworlds"] # [B, 4, 4]
+
         width, height = info['width'], info['height']
         sh_degree_to_use = min(step // 1000, 3)
 
-        gt_image = info["pixels"]
-        gt_ids = info["image_ids"]
-        gt_image = gt_image.permute(0, 2, 3, 1)
-        gt_ks = info["Ks"][gt_ids].unsqueeze(0)  # [1, 3, 3]
-
-
-
+        # Render the training view to get photometric error
         rendered_train_view, _, _ = self.rasterizer_fn(
             means=params["means"],
             quats=params["quats"],
@@ -203,9 +111,10 @@ class NRQMStrategy(DefaultStrategy):
             width=width,
             height=height,
             sh_degree=sh_degree_to_use,
-            camtoworlds=camtoworlds,
+            camtoworlds=camtoworlds_gt,
             image_ids=gt_ids,
         )
+        # Assuming batch size is 1 for this calculation
         photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=0)  # [H, W, C]
 
         if state["photometric_error_map"] is None:
@@ -217,17 +126,22 @@ class NRQMStrategy(DefaultStrategy):
                 self.nrqm_ema_decay
             )
 
+        # Generate a novel view for NRQM
+        cam_idx = torch.randint(0, info['n_cameras'], (1,)).item()
+        novel_camtoworld = info['camtoworlds'][cam_idx].unsqueeze(0)
+        novel_K = info['Ks'][cam_idx].unsqueeze(0)
+
         novel_render, _, _ = self.rasterizer_fn(
             means=params["means"],
             quats=params["quats"],
             scales=params["scales"],
             opacities=params["opacities"],
             colors=torch.cat([params["sh0"], params["shN"]], 1),
-            Ks=K,
+            Ks=novel_K,
             width=width,
             height=height,
             sh_degree=sh_degree_to_use,
-            camtoworlds=camtoworlds,
+            camtoworlds=novel_camtoworld,
         )
         novel_render = torch.clamp(novel_render.permute(0, 3, 1, 2), 0.0, 1.0) # [1, C, H, W]
 
@@ -264,13 +178,13 @@ class NRQMStrategy(DefaultStrategy):
                 self.nrqm_ema_decay
             )
 
-
-        view_matrix = torch.inverse(camtoworld)
+        # Use the novel view's projection matrix for subsequent checks
+        view_matrix = torch.inverse(novel_camtoworld)
         proj_matrix = torch.zeros(4, 4, device=view_matrix.device)
-        proj_matrix[0, 0] = 2 * K[0, 0, 0] / width
-        proj_matrix[1, 1] = 2 * K[0, 1, 1] / height
-        proj_matrix[0, 2] = -2 * K[0, 0, 2] / width + 1
-        proj_matrix[1, 2] = -2 * K[0, 1, 2] / height + 1
+        proj_matrix[0, 0] = 2 * novel_K[0, 0, 0] / width
+        proj_matrix[1, 1] = 2 * novel_K[0, 1, 1] / height
+        proj_matrix[0, 2] = -2 * novel_K[0, 0, 2] / width + 1
+        proj_matrix[1, 2] = -2 * novel_K[0, 1, 2] / height + 1
         proj_matrix[3, 2] = 1.0
         state["view_proj_matrix"] = (proj_matrix.T @ view_matrix[0]).T
 
@@ -355,6 +269,8 @@ class NRQMStrategy(DefaultStrategy):
                 is_grad_high = modified_grads > current_grow_grad2d
                 # is_grad_high = is_grad_high | (is_in_low_quality_region & (grads > self.grow_grad2d * 0.5))
 
+        # --- Placeholder for Geometric Uncertainty ---
+        # For a full implementation, one would:
         # 1. Compute per-Gaussian normals.
         # 2. Find K-nearest neighbors for each Gaussian.
         # 3. Compute the variance of normals within each neighborhood.
@@ -458,22 +374,22 @@ class NRQMStrategy(DefaultStrategy):
             opacities = torch.sigmoid(params["opacities"].flatten())
             sh0 = params["sh0"].squeeze(1)
 
-            # find K-nearest neighbors
-            # may running it less frequently.
+            # Find K-nearest neighbors
+            # This can be computationally expensive. Consider running it less frequently.
             dists, idxs = self.knn_fn(means3d, k=self.redundancy_knn)
 
             neighbor_idxs = idxs[:, 1:]
             neighbor_dists = dists[:, 1:]
 
-            # overlap
+            # Check for overlap
             overlap_mask = neighbor_dists < (scales.unsqueeze(1) + scales[neighbor_idxs]) * self.redundancy_overlap_thresh
 
-            # color similarity
+            # Check for color similarity
             color_dist = torch.norm(sh0.unsqueeze(1) - sh0[neighbor_idxs], dim=-1)
             color_sim_mask = color_dist < self.redundancy_color_thresh
 
-            # a Gaussian is redundant if it overlaps with a similar-colored neighbor
-            # that is more opaque
+            # A Gaussian is redundant if it overlaps with a similar-colored neighbor
+            # that is more opaque.
             is_less_opaque = opacities.unsqueeze(1) < opacities[neighbor_idxs]
 
             is_redundant_neighbor = overlap_mask & color_sim_mask & is_less_opaque

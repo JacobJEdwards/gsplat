@@ -1,14 +1,31 @@
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
 from gsplat.strategy.ops import duplicate, remove, _update_param_with_optimizer
 from gsplat.strategy.default import DefaultStrategy
 from gsplat.utils import normalized_quat_to_rotmat
 
+class DensificationNetwork(nn.Module):
+    """A small MLP to predict densification priority for a Gaussian."""
+    def __init__(self, input_dim: int = 10, mlp_width: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, mlp_width),
+            nn.LayerNorm(mlp_width),
+            nn.ReLU(),
+            nn.Linear(mlp_width, mlp_width),
+            nn.LayerNorm(mlp_width),
+            nn.ReLU(),
+            nn.Linear(mlp_width, 1)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
 
 @torch.no_grad()
 def split(
@@ -132,7 +149,6 @@ class NRQMStrategy(DefaultStrategy):
     nrqm_patch_size: int = 32
     nrqm_stagnation_threshold: float = 0.3
     nrqm_prune_stagnant_after: int = 15
-
     nrqm_ema_decay: float = 0.9
 
     anisotropic_split: bool = True
@@ -144,12 +160,20 @@ class NRQMStrategy(DefaultStrategy):
     use_geom_uncertainty: bool = True
     num_uncertainty_views: int = 3
     geom_uncertainty_thresh: float = 0.002
-    
+
     photometric_error_thresh: float = 0.1
+
+    use_learned_densification: bool = True
+    bootstrap_steps: int = 4000
+    learn_every: int = 500
+    hindsight_delay: int = 100
 
     rasterizer_fn: Any = field(default=None, repr=False)
     nrqm_model: Any = field(default=None, repr=False)
     knn_fn: Any = field(default=None, repr=False)
+
+    densification_net: DensificationNetwork = field(default_factory=lambda: DensificationNetwork(), repr=False)
+    densification_optimizer: Any = field(default=None, repr=False)
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         state = super().initialize_state(scene_scale)
@@ -158,12 +182,25 @@ class NRQMStrategy(DefaultStrategy):
             "view_proj_matrix": None,
             "stagnation_count": None,
             "last_nrqm_step": -1,
+            "last_prune_count": -1,
             "dynamic_grow_grad2d": self.grow_grad2d,
             "photometric_error_map": None,
             "geom_uncertainty_map": None,
-            "last_prune_count": -1,
+            "replay_buffer": deque(maxlen=20_000),
+            "hindsight_buffer": deque(maxlen=5_000),
         })
+
+        if self.use_learned_densification and self.densification_net is None:
+            pass
+
         return state
+
+    def _initialize_learning_components(self, device) -> None:
+        if self.use_learned_densification and self.densification_net is None:
+            self.densification_net = DensificationNetwork().to(device)
+            self.densification_net_optimizer = torch.optim.AdamW(
+                self.densification_net.parameters(), lr=1e-4
+            )
 
     def step_post_backward(
             self,
@@ -174,11 +211,20 @@ class NRQMStrategy(DefaultStrategy):
             info: Dict[str, Any],
             packed: bool = False,
     ):
+        if self.use_learned_densification and self.densification_net is None:
+            self._initialize_learning_components(params["means"].device)
+
         if step % self.nrqm_every == 0 and self.rasterizer_fn is not None:
             self._update_quality_map(params, state, info)
             state["last_nrqm_step"] = step
 
+        if self.use_learned_densification:
+            self._process_hindsight_buffer(state, step)
+
         super().step_post_backward(params, optimizers, state, step, info, packed)
+
+        if self.use_learned_densification and step > 1000 and step % self.learn_every == 0:
+            self._train_densification_network(state)
 
     @torch.no_grad()
     def _update_quality_map(
@@ -194,6 +240,7 @@ class NRQMStrategy(DefaultStrategy):
         all_depth_renders = []
         main_novel_view_idx = -1
 
+        novel_render_for_nrqm = None
         for i in range(self.num_uncertainty_views):
             cam_idx = torch.randint(0, info['n_cameras'], (1,)).item()
             if i == 0:
@@ -341,6 +388,77 @@ class NRQMStrategy(DefaultStrategy):
         return patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask
 
     @torch.no_grad()
+    def _get_gaussian_features(
+            self, params: Dict, state: Dict, valid_mask: Tensor,
+            pixel_coords_x: Tensor, pixel_coords_y: Tensor,
+            patch_coords_x: Tensor, patch_coords_y: Tensor
+    ) -> Tensor:
+        num_gaussians = len(params["means"])
+        device = params["means"].device
+        feature_dim = 10
+        features = torch.zeros(num_gaussians, feature_dim, device=device)
+
+        features[:, 0] = torch.sigmoid(params["opacities"].flatten())
+        scales = torch.exp(params["scales"])
+        features[:, 1] = scales.max(dim=-1).values / state["scene_scale"]
+        features[:, 2] = scales.min(dim=-1).values / state["scene_scale"]
+        features[:, 3] = scales.mean(dim=-1) / state["scene_scale"]
+        features[:, 4] = torch.norm(params["sh0"], dim=(-1, -2))
+
+        valid_indices = torch.where(valid_mask)[0]
+        if valid_indices.numel() > 0:
+            if state.get("photometric_error_map") is not None:
+                features[valid_indices, 5] = state["photometric_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+
+            if state.get("geom_uncertainty_map") is not None:
+                features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+
+            if state.get("quality_heatmap") is not None:
+                features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
+
+        if self.knn_fn is not None and num_gaussians > self.redundancy_knn:
+            dists, _ = self.knn_fn(params["means"], K=self.redundancy_knn)
+            features[:, 8] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
+
+        grads = state["grad2d"] / state["count"].clamp_min(1)
+        features[:, 9] = grads
+
+        return torch.nan_to_num(features, 0.0)
+
+    def _process_hindsight_buffer(self, state, current_step):
+        while state["hindsight_buffer"] and (current_step - state["hindsight_buffer"][0]["step"]) >= self.hindsight_delay:
+            experience = state["hindsight_buffer"].popleft()
+
+            px, py = experience["pixel_coords"]
+            current_error = state["photometric_error_map"][py, px].mean()
+
+            reward = experience["initial_error"] - current_error
+            label = 1.0 if reward > 0.01 else 0.0
+
+            if len(state["replay_buffer"]) < state["replay_buffer"].maxlen:
+                state["replay_buffer"].append((experience["features"], torch.tensor(label)))
+
+    def _train_densification_network(self, state):
+        if len(state["replay_buffer"]) < 128:
+            return
+
+        self.densification_net.train()
+
+        batch_indices = torch.randint(0, len(state["replay_buffer"]), (128,))
+        batch = [state["replay_buffer"][i] for i in batch_indices]
+        features = torch.stack([x[0] for x in batch]).to(self.densification_net.net[0].weight.device)
+        labels = torch.stack([x[1] for x in batch]).to(self.densification_net.net[0].weight.device)
+
+        self.densification_net_optimizer.zero_grad()
+        logits = self.densification_net(features).squeeze()
+        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        loss.backward()
+        self.densification_net_optimizer.step()
+
+        if self.verbose:
+            print(f"Trained Densification Network, Loss: {loss.item():.4f}")
+
+    @torch.no_grad()
     def _grow_gs(
             self,
             params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
@@ -348,15 +466,6 @@ class NRQMStrategy(DefaultStrategy):
             state: Dict[str, Any],
             step: int,
     ) -> Tuple[int, int]:
-        """Override the growth logic to be spatially aware of NRQM quality."""
-
-        current_grow_grad2d = state.get("dynamic_grow_grad2d", self.grow_grad2d)
-
-        count = state["count"]
-        grads = state["grad2d"] / count.clamp_min(1)
-        is_grad_high_orig = grads > current_grow_grad2d
-
-        densification_potential = torch.zeros(len(params["means"]), dtype=torch.float32, device=params["means"].device)
 
         if state.get("view_proj_matrix") is not None:
             means3d = params["means"]
@@ -369,62 +478,77 @@ class NRQMStrategy(DefaultStrategy):
             patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask = self._project_to_patch_coords(
                 means3d, state["view_proj_matrix"], h, w
             )
+            features = self._get_gaussian_features(
+                params, state, valid_mask, pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y
+            )
+        else:
+            return 0, 0
 
-            valid_indices = torch.where(valid_mask)[0]
+        if self.use_learned_densification and step >= self.bootstrap_steps:
+            self.densification_net.eval()
+            with torch.no_grad():
+                scores = self.densification_net(features).squeeze()
+            is_grad_high = scores > 0.5
+        else:
+            current_grow_grad2d = state.get("dynamic_grow_grad2d", self.grow_grad2d)
+            grads = state["grad2d"] / state["count"].clamp_min(1)
+            is_grad_high_orig = grads > current_grow_grad2d
 
-            if valid_indices.any():
-                if state.get("photometric_error_map") is not None:
-                    error_scores = state["photometric_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
-                    error_potential = torch.clamp(error_scores / self.photometric_error_thresh, 0.0, 1.0)
-                    densification_potential[valid_indices] += 0.4 * error_potential # weight for photometric error
+            densification_potential = torch.zeros_like(grads)
+            if valid_mask.any():
+                valid_indices = torch.where(valid_mask)[0]
+                error_scores = features[valid_indices, 5]
+                nrqm_scores = features[valid_indices, 7]
+                uncertainty_scores = features[valid_indices, 6]
 
-                if state.get("quality_heatmap") is not None and state["quality_heatmap"].numel() > 0:
-                    patch_scores = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
-                    nrqm_potential = torch.clamp(1.0 - patch_scores / self.nrqm_stagnation_threshold, 0.0, 1.0)
-                    densification_potential[valid_indices] += 0.3 * nrqm_potential # weight for NRQM
+                error_potential = torch.clamp(error_scores / self.photometric_error_thresh, 0.0, 1.0)
+                nrqm_potential = torch.clamp(1.0 - nrqm_scores / self.nrqm_stagnation_threshold, 0.0, 1.0)
+                uncertainty_potential = torch.clamp(uncertainty_scores / self.geom_uncertainty_thresh, 0.0, 1.0)
 
-                if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
-                    uncertainty_scores = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
-                    uncertainty_potential = torch.clamp(uncertainty_scores / self.geom_uncertainty_thresh, 0.0, 1.0)
-                    densification_potential[valid_indices] += 0.3 * uncertainty_potential # weight for uncertainty
+                densification_potential[valid_indices] = (0.4 * error_potential + 0.3 * nrqm_potential + 0.3 * uncertainty_potential)
 
-        is_high_potential = densification_potential > 0.7
-        is_grad_high = is_grad_high_orig | is_high_potential
+            is_high_potential = densification_potential > 0.5
+            is_grad_high = is_grad_high_orig | is_high_potential
 
-        is_small = (
-                torch.exp(params["scales"]).max(dim=-1).values
-                <= self.grow_scale3d * state["scene_scale"]
-        )
+            if self.use_learned_densification:
+                densified_mask = is_grad_high
+                if densified_mask.any():
+                    densified_indices = torch.where(densified_mask)[0]
+                    for idx in densified_indices:
+                        if valid_mask[idx]:
+                            px, py = pixel_coords_x[idx], pixel_coords_y[idx]
+                            initial_error = state["photometric_error_map"][
+                                            max(0, py-2):py+3, max(0, px-2):px+3
+                                            ].mean()
+
+                            experience = {
+                                "step": step,
+                                "features": features[idx].detach().cpu(),
+                                "pixel_coords": (px, py),
+                                "initial_error": initial_error,
+                            }
+                            state["hindsight_buffer"].append(experience)
+
+        is_small = (torch.exp(params["scales"]).max(dim=-1).values <= self.grow_scale3d * state["scene_scale"])
         is_dupli = is_grad_high & is_small
         n_dupli = is_dupli.sum().item()
 
         is_large = ~is_small
         is_split = is_grad_high & is_large
-        if step < self.refine_scale2d_stop_iter:
-            is_split |= state["radii"] > self.grow_scale2d
         n_split = is_split.sum().item()
 
-        per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count"]
-        state_to_grow = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
+        if n_dupli > 0 or n_split > 0:
+            per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count"]
+            state_to_grow = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
+            if n_dupli > 0:
+                duplicate(params=params, optimizers=optimizers, state=state_to_grow, mask=is_dupli)
 
-        if n_dupli > 0:
-            duplicate(params=params, optimizers=optimizers, state=state_to_grow, mask=is_dupli)
+            is_split_after_dup = torch.cat([is_split, torch.zeros(n_dupli, dtype=torch.bool, device=is_split.device)])
+            if n_split > 0:
+                split(params=params, optimizers=optimizers, state=state_to_grow, mask=is_split_after_dup,
+                      revised_opacity=self.revised_opacity, anisotropic=self.anisotropic_split)
+            state.update(state_to_grow)
 
-        is_split = torch.cat(
-            [is_split, torch.zeros(n_dupli, dtype=torch.bool, device=is_split.device)]
-        )
-
-        if n_split > 0:
-            split(
-                params=params,
-                optimizers=optimizers,
-                state=state_to_grow,
-                mask=is_split,
-                revised_opacity=self.revised_opacity,
-                anisotropic=self.anisotropic_split,
-            )
-
-        state.update(state_to_grow)
         return n_dupli, n_split
 
     @torch.no_grad()

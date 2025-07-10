@@ -872,16 +872,24 @@ class Runner:
                     )
 
                     gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)
-                    roi_mask = (gen_alphas > cfg.nrqm_roi_threshold).permute(0, 3, 1, 2)
+                    # roi_mask = (gen_alphas > cfg.nrqm_roi_threshold).permute(0, 3, 1, 2)
 
                     nrqm_input = gen_colors.permute(0, 3, 1, 2)
-                    nrqm_input[~roi_mask.expand(-1, 3, -1, -1)] = 0.5
+                    # nrqm_input[~roi_mask.expand(-1, 3, -1, -1)] = 0.5
                     nrqm_input = torch.nan_to_num(nrqm_input, nan=0.0, posinf=1.0, neginf=0.0)
                     nrqm_input = nrqm_input.clamp(min=1e-8, max=1.0 - 1e-8)
 
+                    # noise = torch.randn_like(nrqm_input) * 1e-5
+                    # nrqm_input = (nrqm_input + noise).clamp(0.0, 1.0)
+
                     nrqm_colors = gen_colors
 
-                    generator_loss = self.nrqm_model(nrqm_input).mean()
+                    try:
+                        generator_loss = self.nrqm_model(nrqm_input).mean()
+                    except AssertionError as e:
+                        print("NRQM model assertion error:", e)
+                        generator_loss = torch.tensor(0.0, device=device)
+
                     if cfg.nrqm_model == "clipiqa":
                         generator_loss = -generator_loss
                     nrqm_loss = generator_loss
@@ -905,12 +913,15 @@ class Runner:
                     )
 
                     nrqm_colors = torch.clamp(nrqm_renders[..., 0:3], 0.0, 1.0)
-                    roi_mask = (nrqm_alphas > cfg.nrqm_roi_threshold).permute(0, 3, 1, 2)
+                    # roi_mask = (nrqm_alphas > cfg.nrqm_roi_threshold).permute(0, 3, 1, 2)
 
                     nrqm_input = nrqm_colors.permute(0, 3, 1, 2)
-                    nrqm_input[~roi_mask.expand(-1, 3, -1, -1)] = 0.5
+                    # nrqm_input[~roi_mask.expand(-1, 3, -1, -1)] = 0.5
                     nrqm_input = torch.nan_to_num(nrqm_input, nan=0.0, posinf=1.0, neginf=0.0)
                     nrqm_input = nrqm_input.clamp(min=1e-8, max=1.0 - 1e-8)
+                    
+                    # noise = torch.randn_like(nrqm_input) * 1e-5
+                    # nrqm_input = (nrqm_input + noise).clamp(0.0, 1.0)
 
                     try:
                         nrqm_loss = self.nrqm_model(nrqm_input).mean()
@@ -981,12 +992,15 @@ class Runner:
 
                 gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)
 
-                roi_mask = (gen_alphas > cfg.nrqm_roi_threshold).permute(0, 3, 1, 2)
+                # roi_mask = (gen_alphas > cfg.nrqm_roi_threshold).permute(0, 3, 1, 2)
 
                 gen_input = gen_colors.permute(0, 3, 1, 2)
-                gen_input[~roi_mask.expand(-1, 3, -1, -1)] = 0.5
+                # gen_input[~roi_mask.expand(-1, 3, -1, -1)] = 0.5
                 gen_input = torch.nan_to_num(gen_input, nan=0.0, posinf=1.0, neginf=0.0)
                 gen_input = gen_input.clamp(min=1e-8, max=1.0 - 1e-8)
+                
+                # noise = torch.randn_like(gen_input) * 1e-5
+                # gen_input = (gen_input + noise).clamp(0.0, 1.0)
 
                 try:
                     generator_loss = -self.nrqm_model(gen_input).mean() * cfg.adversarial_loss_lambda

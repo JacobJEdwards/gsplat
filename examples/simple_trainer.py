@@ -912,7 +912,11 @@ class Runner:
                     nrqm_input = torch.nan_to_num(nrqm_input, nan=0.0, posinf=1.0, neginf=0.0)
                     nrqm_input = nrqm_input.clamp(min=1e-8, max=1.0 - 1e-8)
 
-                    nrqm_loss = self.nrqm_model(nrqm_input).mean()
+                    try:
+                        nrqm_loss = self.nrqm_model(nrqm_input).mean()
+                    except AssertionError as e:
+                        print("NRQM model assertion error:", e)
+                        nrqm_loss = torch.tensor(0.0, device=device)
 
                     if cfg.nrqm_model == "clipiqa":
                         nrqm_loss = -nrqm_loss
@@ -984,7 +988,12 @@ class Runner:
                 gen_input = torch.nan_to_num(gen_input, nan=0.0, posinf=1.0, neginf=0.0)
                 gen_input = gen_input.clamp(min=1e-8, max=1.0 - 1e-8)
 
-                generator_loss = -self.nrqm_model(gen_input).mean() * cfg.adversarial_loss_lambda
+                try:
+                    generator_loss = -self.nrqm_model(gen_input).mean() * cfg.adversarial_loss_lambda
+                except AssertionError as e:
+                    print("NRQM model assertion error:", e)
+                    generator_loss = torch.tensor(0.0, device=device)
+
                 generator_loss.backward()
 
                 # gen_colors_permuted = gen_colors.permute(0, 3, 1, 2)

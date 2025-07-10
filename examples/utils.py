@@ -152,10 +152,10 @@ def knn_with_ids(x: Tensor, K: int = 4) -> tuple[Tensor, Tensor]:
         distances: Tensor of shape (N, K) containing distances to the K nearest neighbors.
         indices: Tensor of shape (N, K) containing indices of the K nearest neighbors.
     """
-    x_np = x.cpu().numpy()
-    model = NearestNeighbors(n_neighbors=K, metric="euclidean").fit(x_np)
-    distances, indices = model.kneighbors(x_np)
-    return torch.from_numpy(distances).to(x), torch.from_numpy(indices).to(x.device, dtype=torch.long)
+    dist_matrix = torch.cdist(x, x, p=2)
+    distances, indices = torch.topk(dist_matrix, k=K, largest=False)
+
+    return torch.sqrt(distances), indices
 
 def rgb_to_sh(rgb: Tensor) -> Tensor:
     C0 = 0.28209479177387814

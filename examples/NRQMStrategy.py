@@ -159,6 +159,7 @@ class NRQMStrategy(DefaultStrategy):
             "dynamic_grow_grad2d": self.grow_grad2d,
             "photometric_error_map": None,
             "geom_uncertainty_map": None,
+            "last_prune_count": -1,
         })
         return state
 
@@ -357,8 +358,11 @@ class NRQMStrategy(DefaultStrategy):
         # --- NRQM-guided densification ---
         # 1. Prioritize densification in low-quality regions.
         # 2. Add geometric uncertainty check (optional, placeholder added)
+
         if state.get("view_proj_matrix") is not None and state.get("quality_heatmap") is not None and state["quality_heatmap"].numel() > 0:
             means3d = params["means"]
+            densification_potential = torch.zeros(len(means3d), dtype=torch.float32, device=means3d.device)
+
             h = state["quality_heatmap"].shape[0] * self.nrqm_patch_size
             w = state["quality_heatmap"].shape[1] * self.nrqm_patch_size
 
@@ -374,25 +378,32 @@ class NRQMStrategy(DefaultStrategy):
                     patch_coords_y[valid_indices],
                     patch_coords_x[valid_indices]
                 ]
-                is_in_low_quality_region[valid_indices] = patch_scores < self.nrqm_stagnation_threshold
-                quality_scores_clamped = torch.clamp(patch_scores, 0.0, self.nrqm_stagnation_threshold)
-                quality_based_multiplier = 1.0 + (1.0 - quality_scores_clamped / self.nrqm_stagnation_threshold)
-                modified_grads = grads.clone()
-                modified_grads[valid_indices] *= quality_based_multiplier
-                is_grad_high = modified_grads > current_grow_grad2d
+                nrqm_potential = torch.clamp(1.0 - patch_scores / self.nrqm_stagnation_threshold, 0.0, 1.0)
+                densification_potential[valid_indices] += 0.5 * nrqm_potential
+
+                # is_in_low_quality_region[valid_indices] = patch_scores < self.nrqm_stagnation_threshold
+                # quality_scores_clamped = torch.clamp(patch_scores, 0.0, self.nrqm_stagnation_threshold)
+                # quality_based_multiplier = 1.0 + (1.0 - quality_scores_clamped / self.nrqm_stagnation_threshold)
+                # modified_grads = grads.clone()
+                # modified_grads[valid_indices] *= quality_based_multiplier
+                # is_grad_high = modified_grads > current_grow_grad2d
                 # is_grad_high = is_grad_high | (is_in_low_quality_region & (grads > self.grow_grad2d * 0.5))
 
             if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
-                is_geom_uncertain = torch.zeros(len(means3d), dtype=torch.bool, device=means3d.device)
+                # is_geom_uncertain = torch.zeros(len(means3d), dtype=torch.bool, device=means3d.device)
                 if valid_mask.any():
                     valid_indices = torch.where(valid_mask)[0]
                     uncertainty_scores = state["geom_uncertainty_map"][
                         pixel_coords_y[valid_indices],
                         pixel_coords_x[valid_indices]
                     ]
-                    is_geom_uncertain[valid_indices] = uncertainty_scores > self.geom_uncertainty_thresh
+                    # is_geom_uncertain[valid_indices] = uncertainty_scores > self.geom_uncertainty_thresh
+                    uncertainty_potential = torch.clamp(uncertainty_scores / self.geom_uncertainty_thresh, 0.0, 1.0)
+                    densification_potential[valid_indices] += 0.5 * uncertainty_potential
 
-                is_grad_high = is_grad_high | is_geom_uncertain
+                # is_grad_high = is_grad_high | is_geom_uncertain
+            is_high_potential = densification_potential > 0.7 # maybe make tuneable
+            is_grad_high = is_grad_high | is_high_potential
 
 
         is_small = (
@@ -483,23 +494,29 @@ class NRQMStrategy(DefaultStrategy):
         is_prune_redundant = torch.zeros_like(is_prune_original)
         if self.prune_redundant and self.knn_fn is not None:
             means3d = params["means"]
-            if len(means3d) > self.redundancy_knn:
-                scales = torch.exp(params["scales"]).max(dim=-1).values
-                opacities = torch.sigmoid(params["opacities"].flatten())
-                sh0 = params["sh0"].squeeze(1)
+            num_points = len(means3d)
+            last_count = state.get("last_prune_count", 0)
+            
+            if last_count == -1 or num_points > last_count * 1.05:
+                state["last_prune_count"] = num_points
+                
+                if num_points > self.redundancy_knn:
+                    scales = torch.exp(params["scales"]).max(dim=-1).values
+                    opacities = torch.sigmoid(params["opacities"].flatten())
+                    sh0 = params["sh0"].squeeze(1)
 
-                dists, idxs = self.knn_fn(means3d, K=self.redundancy_knn)
+                    dists, idxs = self.knn_fn(means3d, K=self.redundancy_knn)
 
-                neighbor_idxs = idxs[:, 1:]
-                neighbor_dists = dists[:, 1:]
+                    neighbor_idxs = idxs[:, 1:]
+                    neighbor_dists = dists[:, 1:]
 
-                overlap_mask = neighbor_dists < (scales.unsqueeze(1) + scales[neighbor_idxs]) * self.redundancy_overlap_thresh
-                color_dist = torch.norm(sh0.unsqueeze(1) - sh0[neighbor_idxs], dim=-1)
-                color_sim_mask = color_dist < self.redundancy_color_thresh
-                is_less_opaque = opacities.unsqueeze(1) < opacities[neighbor_idxs]
+                    overlap_mask = neighbor_dists < (scales.unsqueeze(1) + scales[neighbor_idxs]) * self.redundancy_overlap_thresh
+                    color_dist = torch.norm(sh0.unsqueeze(1) - sh0[neighbor_idxs], dim=-1)
+                    color_sim_mask = color_dist < self.redundancy_color_thresh
+                    is_less_opaque = opacities.unsqueeze(1) < opacities[neighbor_idxs]
 
-                is_redundant_neighbor = overlap_mask & color_sim_mask & is_less_opaque
-                is_prune_redundant = is_redundant_neighbor.any(dim=1)
+                    is_redundant_neighbor = overlap_mask & color_sim_mask & is_less_opaque
+                    is_prune_redundant = is_redundant_neighbor.any(dim=1)
 
 
         is_prune = is_prune_original | is_prune_stagnant | is_prune_redundant

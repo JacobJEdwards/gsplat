@@ -160,7 +160,7 @@ class NRQMStrategy(DefaultStrategy):
     photometric_error_thresh: float = 0.1
 
     use_learned_densification: bool = True
-    bootstrap_steps: int = 1
+    bootstrap_steps: int = 4000
     learn_every: int = 500
     hindsight_delay: int = 100
 
@@ -168,7 +168,7 @@ class NRQMStrategy(DefaultStrategy):
     nrqm_model: Any = field(default=None, repr=False)
     knn_fn: Any = field(default=None, repr=False)
 
-    densification_net: DensificationNetwork = field(default_factory=lambda: DensificationNetwork(), repr=False)
+    densification_net: DensificationNetwork = field(default=None, repr=False)
     densification_optimizer: Any = field(default=None, repr=False)
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
@@ -476,7 +476,7 @@ class NRQMStrategy(DefaultStrategy):
             )
             features = self._get_gaussian_features(
                 params, state, valid_mask, pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y
-            ).to(self.densification_net.net[0].weight.device)
+            )
         else:
             return 0, 0
 

@@ -1,15 +1,11 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple, Union
 
-import piq
 import torch
 import torch.nn.functional as F
-from torch import nn
-from typing_extensions import Literal
 
 
-from gsplat.strategy.base import Strategy
-from gsplat.strategy.ops import duplicate, remove, reset_opa, split
+from gsplat.strategy.ops import duplicate, remove, split
 from gsplat.strategy.default import DefaultStrategy
 
 
@@ -43,6 +39,8 @@ class NRQMStrategy(DefaultStrategy):
     nrqm_patch_size: int = 32
     nrqm_stagnation_threshold: float = 0.3
     nrqm_prune_stagnant_after: int = 15
+
+    nrqm_ema_decay: float = 0.9
 
     rasterizer_fn: Any = field(default=None, repr=False)
     nrqm_model: Any = field(default=None, repr=False)
@@ -126,7 +124,15 @@ class NRQMStrategy(DefaultStrategy):
         
         num_patches_h = height // p
         quality_heatmap = patch_scores.view(num_patches_h, -1)
-        state["quality_heatmap"] = quality_heatmap
+        if state["quality_heatmap"] is None:
+            state["quality_heatmap"] = quality_heatmap
+        else:
+            state["quality_heatmap_ema"] = torch.lerp(
+                quality_heatmap,
+                state["quality_heatmap_ema"],
+                self.nrqm_ema_decay 
+            )
+
 
         view_matrix = torch.inverse(camtoworld)
         proj_matrix = torch.zeros(4, 4, device=view_matrix.device)
@@ -204,9 +210,16 @@ class NRQMStrategy(DefaultStrategy):
                     patch_coords_x[valid_indices]
                 ]
                 is_in_low_quality_region[valid_indices] = patch_scores < self.nrqm_stagnation_threshold
+                
+                quality_scores_clamped = torch.clamp(patch_scores, 0.0, self.nrqm_stagnation_threshold)
 
-                # Apply spatial awareness to gradient threshold
-                is_grad_high = is_grad_high | (is_in_low_quality_region & (grads > self.grow_grad2d * 0.5))
+                quality_based_multiplier = 1.0 + (1.0 - quality_scores_clamped / self.nrqm_stagnation_threshold)
+
+                modified_grads = grads.clone()
+                modified_grads[valid_indices] *= quality_based_multiplier
+
+                is_grad_high = modified_grads > current_grow_grad2d
+                # is_grad_high = is_grad_high | (is_in_low_quality_region & (grads > self.grow_grad2d * 0.5))
 
 
         is_small = (

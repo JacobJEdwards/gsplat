@@ -386,8 +386,16 @@ class ImprovedPoseGeneratorModule(torch.nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, z: torch.Tensor, scene_condition: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        condition_encoded = self.condition_encoder(scene_condition)
+    def forward(self, z: torch.Tensor, scene_condition: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        if scene_condition is not None:
+            condition_encoded = self.condition_encoder(scene_condition)
+        else:
+            batch_size = z.shape[0]
+            condition_encoded = torch.zeros(
+                (batch_size, self.condition_dim),
+                device=z.device,
+                dtype=z.dtype
+            )
 
         x = torch.cat([z, condition_encoded], dim=-1)
 

@@ -32,6 +32,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
 from NRQMStrategy import NRQMStrategy
+from examples.utils import ImprovedPoseGeneratorModule
 from utils import (
     AppearanceOptModule,
     CameraOptModule,
@@ -216,14 +217,14 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
-    use_nrqm: bool = False
+    use_nrqm: bool = True
     nrqm_model: Literal["brisque", "clipiqa"] = "brisque"
     num_novel_poses: int = 50
     novel_view_translation_pertube: float = 1.0
     novel_view_rotation_pertube: float = 10.0
     nrqm_lambda: float = 1.0
 
-    use_adversarial_views: bool = False
+    use_adversarial_views: bool = True
     generator_lr: float = 1e-4
     generator_train_interval: int = 50
     adversarial_loss_lambda: float = 0.1
@@ -508,7 +509,8 @@ class Runner:
         self.generator = None
         self.generator_optimizer = None
         if cfg.use_adversarial_views:
-            self.generator = PoseGeneratorModule(output_dim=9+4).to(self.device)
+            # self.generator = PoseGeneratorModule(output_dim=9+4).to(self.device)
+            self.generator = ImprovedPoseGeneratorModule(noise_dim=cfg.generator_noise_dim).to(self.device)
             self.generator_optimizer = torch.optim.Adam(
                 self.generator.parameters(), lr=cfg.generator_lr
             )

@@ -141,6 +141,7 @@ def rotation_6d_to_matrix(d6: Tensor) -> Tensor:
 def knn(x: Tensor, K: int = 4, batch_size: int = 1000) -> Tensor:
     return knn_with_ids(x, K, batch_size)[0]
 
+
 def knn_with_ids(x: Tensor, K: int = 4, batch_size: int = 1000) -> tuple[Tensor, Tensor]:
     N = x.size(0)
     all_distances = torch.zeros((N, K), device=x.device, dtype=x.dtype)

@@ -514,7 +514,7 @@ class NRQMStrategy(DefaultStrategy):
 
         features[:, 16] = step / self.refine_stop_iter
 
-        return torch.nan_to_num(features, 0.0), pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y, valid_mask
+        return (torch.nan_to_num(features, 0.0), pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y, valid_mask[subset_mask])
 
     def _process_hindsight_buffer(self, state, current_step):
         if state.get("photometric_error_map") is None:

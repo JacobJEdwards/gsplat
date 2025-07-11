@@ -375,13 +375,20 @@ class NRQMStrategy(DefaultStrategy):
         main_novel_camtoworld = info['camtoworlds'][main_novel_view_idx].unsqueeze(0)
         main_novel_K = info['Ks'][main_novel_view_idx].unsqueeze(0)
         view_matrix = torch.inverse(main_novel_camtoworld)
+
+        fx = main_novel_K[0, 0, 0]
+        fy = main_novel_K[0, 1, 1]
+        cx = main_novel_K[0, 0, 2]
+        cy = main_novel_K[0, 1, 2]
+
         proj_matrix = torch.zeros(4, 4, device=view_matrix.device)
-        proj_matrix[0, 0] = 2 * main_novel_K[0, 0, 0] / width
-        proj_matrix[1, 1] = 2 * main_novel_K[0, 1, 1] / height
-        proj_matrix[0, 2] = -2 * main_novel_K[0, 0, 2] / width + 1
-        proj_matrix[1, 2] = -2 * main_novel_K[0, 1, 2] / height + 1
+        proj_matrix[0, 0] = 2 * fx / width
+        proj_matrix[1, 1] = 2 * fy / height
+        proj_matrix[2, 0] = 1.0 - 2 * cx / width
+        proj_matrix[2, 1] = 1.0 - 2 * cy / height
+        proj_matrix[2, 3] = 1.0 
         proj_matrix[3, 2] = 1.0
-        # state["view_proj_matrix"] = (proj_matrix.T @ view_matrix[0]).T
+
         state["view_proj_matrix"] = view_matrix[0] @ proj_matrix
 
         avg_quality = patch_scores.mean()
@@ -617,7 +624,7 @@ class NRQMStrategy(DefaultStrategy):
 
         if self.use_learned_densification:
             for i, original_idx in enumerate(subset_indices):
-                # if valid_mask_subset[i]:
+                if valid_mask_subset[i]:
                     initial_error = state["photometric_error_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean()
                     initial_quality = state["quality_heatmap"][pty[i], ptx[i]]
                     initial_uncertainty = state["geom_uncertainty_map"][py[i], px[i]]

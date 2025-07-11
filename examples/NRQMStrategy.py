@@ -217,7 +217,7 @@ class NRQMStrategy(DefaultStrategy):
     def _initialize_learning_components(self, device) -> None:
         if self.use_learned_densification and self.densification_net is None:
             self.densification_net = DensificationNetwork(input_dim=17).to(device)
-            self.densification_net_optimizer = torch.optim.AdamW(
+            self.densification_optimizer = torch.optim.AdamW(
                 self.densification_net.parameters(), lr=1e-4, weight_decay=1e-5
             )
 
@@ -521,7 +521,7 @@ class NRQMStrategy(DefaultStrategy):
 
         features[:, 16] = step / self.refine_stop_iter
 
-        return (torch.nan_to_num(features, 0.0), pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y, valid_mask)
+        return torch.nan_to_num(features, 0.0), pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y, valid_mask
 
     def _process_hindsight_buffer(self, state, current_step):
         if state.get("photometric_error_map") is None:
@@ -529,8 +529,6 @@ class NRQMStrategy(DefaultStrategy):
                 print("Skipping hindsight processing: photometric error map is not available.")
 
             return
-
-        device = state["photometric_error_map"].device
 
         while state["hindsight_buffer"] and (current_step - state["hindsight_buffer"][0]["step"]) >= self.hindsight_delay:
             experience = state["hindsight_buffer"].popleft()
@@ -551,7 +549,7 @@ class NRQMStrategy(DefaultStrategy):
                             self.w_uncertainty * reward_uncertainty)
 
             if len(state["replay_buffer"]) < state["replay_buffer"].maxlen:
-                state["replay_buffer"].append((experience["features"], torch.tensor(final_reward, device=device)))
+                state["replay_buffer"].append((experience["features"], final_reward.clone().detach()))
 
     def _train_densification_network(self, state):
         if len(state["replay_buffer"]) < 256:
@@ -570,7 +568,7 @@ class NRQMStrategy(DefaultStrategy):
         features = torch.stack([x[0] for x in batch]).to(device)
         rewards = torch.stack([x[1] for x in batch]).to(device)
 
-        self.densification_net_optimizer.zero_grad()
+        self.densification_optimizer.zero_grad()
         predicted_utility = self.densification_net(features).squeeze(-1)
 
         loss = F.mse_loss(predicted_utility, rewards)

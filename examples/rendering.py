@@ -767,11 +767,18 @@ def rasterization(
     if packed:
         gaussian_contribution.scatter_add_(0, gaussian_ids, opacities)
     else:
-        visible_mask = (radii > 0).squeeze(-1) # [B, C, N]
-        contribution = opacities * visible_mask.float()
+        visible_mask = (radii > 0).squeeze(-1)
+        contribution = torch.where(
+            visible_mask,
+            opacities,
+            torch.tensor(0.0, device=opacities.device, dtype=opacities.dtype)
+        )
 
-        gaussian_contribution = contribution.sum(dim=list(range(num_batch_dims + 1)))
-
+        if contribution.dim() > 1:
+            dims_to_sum = list(range(contribution.dim() - 1))
+            gaussian_contribution = contribution.sum(dim=dims_to_sum)
+        else:
+            gaussian_contribution = contribution
     meta['gaussian_contribution'] = gaussian_contribution
 
     return render_colors, render_alphas, meta

@@ -158,7 +158,7 @@ class AdaptiveStrategy(DefaultStrategy):
             return
 
         if state.get("significance") is None:
-            state["significance"] = torch.zeros(params["means"].shape[0], device=params["means"].device),
+            state["significance"] = torch.zeros(params["means"].shape[0], device=params["means"].device)
 
         if self.use_learned_densification and self.densification_net is None:
             self._initialize_learning_components(params["means"].device)

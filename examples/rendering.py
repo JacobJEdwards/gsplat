@@ -767,18 +767,28 @@ def rasterization(
     if packed:
         gaussian_contribution.scatter_add_(0, gaussian_ids, opacities)
     else:
-        visible_mask = (radii > 0).squeeze(-1)
+        visible_mask = (radii > 0) # Shape is unexpectedly e.g. [..., C, N, 2]
+
+        # 2. Key Fix: Reduce the mask along its last dimension. If any component of
+        # the radius is > 0, we consider the Gaussian visible. This correctly
+        # collapses the unexpected last dimension (e.g., size 2) into a boolean.
+        if visible_mask.dim() > opacities.dim():
+            visible_mask = visible_mask.any(dim=-1) # Shape now correctly matches opacities
+
+        # 3. Use torch.where for a safe operation.
         contribution = torch.where(
             visible_mask,
             opacities,
             torch.tensor(0.0, device=opacities.device, dtype=opacities.dtype)
         )
 
+        # 4. Sum contributions to get a per-Gaussian score.
         if contribution.dim() > 1:
             dims_to_sum = list(range(contribution.dim() - 1))
             gaussian_contribution = contribution.sum(dim=dims_to_sum)
         else:
-            gaussian_contribution = contribution
+            gaussian_contribution = contribution    
+            
     meta['gaussian_contribution'] = gaussian_contribution
 
     return render_colors, render_alphas, meta

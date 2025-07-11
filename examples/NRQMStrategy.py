@@ -711,7 +711,7 @@ class NRQMStrategy(DefaultStrategy):
                 is_in_low_quality_region[valid_indices] = patch_scores < self.nrqm_stagnation_threshold
             is_stagnant = is_grad_low & is_in_low_quality_region
 
-            state["stagnation_count"][is_stagnant] += 1;
+            state["stagnation_count"][is_stagnant] += 1
             state["stagnation_count"][~is_stagnant] = (state["stagnation_count"][~is_stagnant] - 1).clamp(min=0)
             is_prune_stagnant = state["stagnation_count"] > self.nrqm_prune_stagnant_after
 

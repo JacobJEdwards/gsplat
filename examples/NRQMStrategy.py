@@ -381,7 +381,8 @@ class NRQMStrategy(DefaultStrategy):
         proj_matrix[0, 2] = -2 * main_novel_K[0, 0, 2] / width + 1
         proj_matrix[1, 2] = -2 * main_novel_K[0, 1, 2] / height + 1
         proj_matrix[3, 2] = 1.0
-        state["view_proj_matrix"] = (proj_matrix.T @ view_matrix[0]).T
+        # state["view_proj_matrix"] = (proj_matrix.T @ view_matrix[0]).T
+        state["view_proj_matrix"] = view_matrix[0] @ proj_matrix
 
         avg_quality = patch_scores.mean()
         normalized_quality = torch.clamp(avg_quality / 50.0, 0.0, 2.0)
@@ -454,7 +455,7 @@ class NRQMStrategy(DefaultStrategy):
         if state.get("photometric_error_map") is None:
             if self.verbose:
                 print("Skipping feature extraction: photometric error map is not available.")
-                
+
             return None, None, None, None, None
 
         h, w = state["photometric_error_map"].shape
@@ -594,17 +595,17 @@ class NRQMStrategy(DefaultStrategy):
 
         subset_mask = torch.rand(num_gaussians, device=device) < self.subset_fraction
         subset_indices = torch.where(subset_mask)[0]
-        if subset_indices.numel() == 0: 
+        if subset_indices.numel() == 0:
             if self.verbose:
                 print("Skipping Gaussian growth: no valid subset indices.")
-                
+
             return 0, 0
 
         features_subset, px, py, ptx, pty, valid_mask_subset = self._get_gaussian_features(params, state, subset_mask, step)
-        if features_subset is None: 
+        if features_subset is None:
             if self.verbose:
                 print("Skipping Gaussian growth: no valid features extracted.")
-                
+
             return 0, 0
 
         if self.use_learned_densification and step >= self.bootstrap_steps:
@@ -618,7 +619,7 @@ class NRQMStrategy(DefaultStrategy):
             for i, original_idx in enumerate(subset_indices):
                 if self.verbose:
                     print(f"Processing Gaussian {original_idx} at step {step}.")
-                
+
                 if valid_mask_subset[i]:
                     initial_error = state["photometric_error_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean()
                     initial_quality = state["quality_heatmap"][pty[i], ptx[i]]
@@ -671,6 +672,8 @@ class NRQMStrategy(DefaultStrategy):
         state["prev_grad2d"] = state["grad2d"] / state["count"].clamp_min(1)
         state["prev_opacity"] = torch.sigmoid(params["opacities"].flatten())
 
+        print(state)
+
         return n_dupli, n_split
 
     @torch.no_grad()
@@ -709,7 +712,8 @@ class NRQMStrategy(DefaultStrategy):
 
             patch_coords_x, patch_coords_y, _, _, valid_mask = self._project_to_patch_coords(params["means"], state["view_proj_matrix"], h, w)
 
-            is_in_low_quality_region = torch.zeros_like(is_prune_original); valid_indices = torch.where(valid_mask)[0]
+            is_in_low_quality_region = torch.zeros_like(is_prune_original)
+            valid_indices = torch.where(valid_mask)[0]
             if valid_indices.numel() > 0:
                 patch_scores = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
                 is_in_low_quality_region[valid_indices] = patch_scores < self.nrqm_stagnation_threshold

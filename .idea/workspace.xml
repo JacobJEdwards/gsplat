@@ -4,7 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="53144da4-b0d3-4019-bbd6-5707b1d043a8" name="Changes" comment="checking timing" />
+    <list default="true" id="53144da4-b0d3-4019-bbd6-5707b1d043a8" name="Changes" comment="tuple no more">
+      <change beforePath="$PROJECT_DIR$/examples/AdaptiveStrategy.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/AdaptiveStrategy.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -262,7 +264,15 @@
       <option name="project" value="LOCAL" />
       <updated>1752271061180</updated>
     </task>
-    <option name="localTasksCounter" value="26" />
+    <task id="LOCAL-00026" summary="tuple no more">
+      <option name="closed" value="true" />
+      <created>1752271231700</created>
+      <option name="number" value="00026" />
+      <option name="presentableId" value="LOCAL-00026" />
+      <option name="project" value="LOCAL" />
+      <updated>1752271231700</updated>
+    </task>
+    <option name="localTasksCounter" value="27" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -280,6 +290,7 @@
     <MESSAGE value="config" />
     <MESSAGE value="expousre loss bak" />
     <MESSAGE value="checking timing" />
-    <option name="LAST_COMMIT_MESSAGE" value="checking timing" />
+    <MESSAGE value="tuple no more" />
+    <option name="LAST_COMMIT_MESSAGE" value="tuple no more" />
   </component>
 </project>

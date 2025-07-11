@@ -146,14 +146,6 @@ class AdaptiveStrategy(DefaultStrategy):
                 self.densification_net.parameters(), lr=1e-4, weight_decay=1e-5
             )
 
-    def _get_asc_grad2d(self, step: int) -> float:
-        if step >= self.refine_stop_iter:
-            return self.end_asc_grad2d
-
-        t = step / self.refine_stop_iter
-        return self.start_asc_grad2d + (self.end_asc_grad2d - self.start_asc_grad2d) * t
-
-
     def step_post_backward(
             self,
             params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,

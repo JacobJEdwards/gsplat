@@ -36,7 +36,6 @@ from utils import (
     knn,
     rgb_to_sh,
     set_random_seed,
-    rotation_6d_to_matrix,
 )
 
 from gsplat import export_splats, Strategy

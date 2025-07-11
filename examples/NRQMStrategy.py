@@ -511,6 +511,9 @@ class NRQMStrategy(DefaultStrategy):
 
     def _process_hindsight_buffer(self, state, current_step):
         if state.get("photometric_error_map") is None:
+            if self.verbose:
+                print("Skipping hindsight processing: photometric error map is not available.")
+
             return
 
         device = state["photometric_error_map"].device
@@ -537,14 +540,19 @@ class NRQMStrategy(DefaultStrategy):
                             self.w_uncertainty * reward_uncertainty)
 
             if len(state["replay_buffer"]) < state["replay_buffer"].maxlen:
+                if self.verbose:
+                    print(f"Adding experience to replay buffer: {len(state['replay_buffer'])} samples before adding.")
+
                 state["replay_buffer"].append((experience["features"], torch.tensor(final_reward, device=device)))
 
     def _train_densification_network(self, state):
-        if len(state["replay_buffer"]) < 128:
+        if len(state["replay_buffer"]) < 256:
             if self.verbose:
                 print(f"Not enough data in replay buffer to train the densification network: {len(state['replay_buffer'])} samples available.")
 
             return
+        elif self.verbose:
+            print(f"Training Densification Network with {len(state['replay_buffer'])} samples.")
 
         self.densification_net.train()
         device = self.densification_net.net[0].weight.device
@@ -605,6 +613,8 @@ class NRQMStrategy(DefaultStrategy):
                         "initial_error": initial_error, "initial_quality": initial_quality,
                         "initial_uncertainty": initial_uncertainty
                     })
+                    if self.verbose:
+                        print(f"Added experience to hindsight buffer at step {step} for Gaussian {original_idx}.")
 
         scales_subset = torch.exp(params["scales"][subset_mask])
         is_small_subset = scales_subset.max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]

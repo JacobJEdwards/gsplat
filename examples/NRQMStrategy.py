@@ -537,6 +537,9 @@ class NRQMStrategy(DefaultStrategy):
 
     def _train_densification_network(self, state):
         if len(state["replay_buffer"]) < 128:
+            if self.verbose:
+                print(f"Not enough data in replay buffer to train the densification network: {len(state['replay_buffer'])} samples available.")
+
             return
 
         self.densification_net.train()

@@ -4,7 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="53144da4-b0d3-4019-bbd6-5707b1d043a8" name="Changes" comment="optimised updating">
+    <list default="true" id="53144da4-b0d3-4019-bbd6-5707b1d043a8" name="Changes" comment="pruning network">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/examples/AdaptiveStrategy.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/AdaptiveStrategy.py" afterDir="false" />
     </list>
@@ -313,7 +313,15 @@
       <option name="project" value="LOCAL" />
       <updated>1752272548242</updated>
     </task>
-    <option name="localTasksCounter" value="32" />
+    <task id="LOCAL-00032" summary="pruning network">
+      <option name="closed" value="true" />
+      <created>1752273458070</created>
+      <option name="number" value="00032" />
+      <option name="presentableId" value="LOCAL-00032" />
+      <option name="project" value="LOCAL" />
+      <updated>1752273458070</updated>
+    </task>
+    <option name="localTasksCounter" value="33" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -333,6 +341,7 @@
     <MESSAGE value="checking timing" />
     <MESSAGE value="tuple no more" />
     <MESSAGE value="optimised updating" />
-    <option name="LAST_COMMIT_MESSAGE" value="optimised updating" />
+    <MESSAGE value="pruning network" />
+    <option name="LAST_COMMIT_MESSAGE" value="pruning network" />
   </component>
 </project>

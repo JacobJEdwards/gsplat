@@ -630,7 +630,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         subset_size = min(num_gaussians, self.max_densification_subset)
         selection = torch.randperm(num_gaussians, device=device)[:subset_size]
-        
+
         subset_mask = torch.rand(num_gaussians, device=device) < self.subset_fraction
         subset_mask[selection] = True
         subset_indices = torch.where(subset_mask)[0]
@@ -641,7 +641,11 @@ class AdaptiveStrategy(DefaultStrategy):
 
             return 0, 0
 
+        t = time.time()
         features_subset, px, py, ptx, pty, valid_mask_subset = self._get_gaussian_features(params, state, subset_mask, step)
+        if self.verbose:
+            print(f"Extracted features for {len(subset_indices)} Gaussians in {time.time() - t:.2f} seconds.")
+
         if features_subset is None:
             if self.verbose:
                 print("Skipping Gaussian growth: no valid features extracted.")
@@ -763,7 +767,6 @@ class AdaptiveStrategy(DefaultStrategy):
                 is_prune_significant = state["significance"] < self.prune_significance_threshold
 
 
-
         is_prune_redundant = torch.zeros_like(is_prune_original)
         if self.prune_redundant and self.knn_fn is not None:
             num_gaussians = len(params["means"])
@@ -792,7 +795,10 @@ class AdaptiveStrategy(DefaultStrategy):
 
         if self.use_learned_pruning and "photometric_error_map" in state:
             subset_mask = torch.rand(params["means"].shape[0], device=params["means"].device) < 0.1 # Use a small subset
+            t = time.time()
             features, _, _, _, _, _ = self._get_gaussian_features(params, state, subset_mask, step)
+            if self.verbose:
+                print(f"Extracted features for learned pruning in {time.time() - t:.2f} seconds.")
 
             if features is not None:
                 heuristic_prune_labels = (
@@ -812,7 +818,11 @@ class AdaptiveStrategy(DefaultStrategy):
         if self.use_learned_pruning and step > self.pruning_bootstrap_steps and "photometric_error_map" in state:
             self.pruning_net.eval()
 
+            # probably only call once
+            t = time.time()
             all_features, _, _, _, _, _ = self._get_gaussian_features(params, state, torch.ones_like(is_prune_original), step)
+            if self.verbose:
+                print(f"Extracted features for all Gaussians in {time.time() - t:.2f} seconds.")
 
             if all_features is not None:
                 pruning_logits = self.pruning_net(all_features).squeeze(-1)

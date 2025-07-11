@@ -601,6 +601,7 @@ class NRQMStrategy(DefaultStrategy):
             utility_scores = features_subset[:, 12]
 
         if self.use_learned_densification:
+            print("here")
             for i, original_idx in enumerate(subset_indices):
                 if valid_mask_subset[i]:
                     initial_error = state["photometric_error_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean()

@@ -4,7 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="53144da4-b0d3-4019-bbd6-5707b1d043a8" name="Changes" comment="tuple no more">
+    <list default="true" id="53144da4-b0d3-4019-bbd6-5707b1d043a8" name="Changes" comment="optimised updating">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/examples/AdaptiveStrategy.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/AdaptiveStrategy.py" afterDir="false" />
     </list>
@@ -305,7 +305,15 @@
       <option name="project" value="LOCAL" />
       <updated>1752271949818</updated>
     </task>
-    <option name="localTasksCounter" value="31" />
+    <task id="LOCAL-00031" summary="optimised updating">
+      <option name="closed" value="true" />
+      <created>1752272548242</created>
+      <option name="number" value="00031" />
+      <option name="presentableId" value="LOCAL-00031" />
+      <option name="project" value="LOCAL" />
+      <updated>1752272548242</updated>
+    </task>
+    <option name="localTasksCounter" value="32" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -324,6 +332,7 @@
     <MESSAGE value="expousre loss bak" />
     <MESSAGE value="checking timing" />
     <MESSAGE value="tuple no more" />
-    <option name="LAST_COMMIT_MESSAGE" value="tuple no more" />
+    <MESSAGE value="optimised updating" />
+    <option name="LAST_COMMIT_MESSAGE" value="optimised updating" />
   </component>
 </project>

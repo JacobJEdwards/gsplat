@@ -33,6 +33,22 @@ class DensificationNetwork(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.net(x)
 
+class PruningNetwork(nn.Module):
+    def __init__(self, input_dim: int = 17, mlp_width: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, mlp_width),
+            nn.LayerNorm(mlp_width),
+            nn.PReLU(),
+            nn.Linear(mlp_width, mlp_width),
+            nn.LayerNorm(mlp_width),
+            nn.PReLU(),
+            nn.Linear(mlp_width, 1)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
 class PatchBasedNRQM(nn.Module):
     def __init__(self):
         super().__init__()
@@ -79,6 +95,8 @@ class AdaptiveStrategy(DefaultStrategy):
     max_splits_per_step: int = 20000
     max_duplications_per_step: int = 20000
     subset_fraction: float = 0.2
+    max_densification_subset: int = 50_000
+
 
     nrqm_patch_size: int = 32
     nrqm_stagnation_threshold: float = 0.3
@@ -103,6 +121,13 @@ class AdaptiveStrategy(DefaultStrategy):
     learn_every: int = 500
     hindsight_delay: int = 100
 
+    use_learned_pruning: bool = True
+    pruning_bootstrap_steps: int = 5000
+    pruning_learn_every: int = 500
+    learned_prune_threshold: float = 0.5
+
+    pruning_net: Any = field(default=None, repr=False)
+    pruning_optimizer: Any = field(default=None, repr=False)
 
     w_photometric: float = 0.6
     w_quality: float = -0.2
@@ -131,6 +156,7 @@ class AdaptiveStrategy(DefaultStrategy):
             "geom_uncertainty_map": None,
             "replay_buffer": deque(maxlen=20_000),
             "hindsight_buffer": deque(maxlen=5_000),
+            "pruning_hindsight_buffer": deque(maxlen=20_000),
             "significance": None, # todo
             "prev_grad2d": None,
             "prev_opacity": None
@@ -144,6 +170,13 @@ class AdaptiveStrategy(DefaultStrategy):
             self.densification_net = DensificationNetwork(input_dim=17).to(device)
             self.densification_optimizer = torch.optim.AdamW(
                 self.densification_net.parameters(), lr=1e-4, weight_decay=1e-5
+            )
+
+    def _initialize_pruning_components(self, device) -> None:
+        if self.use_learned_pruning and self.pruning_net is None:
+            self.pruning_net = PruningNetwork().to(device)
+            self.pruning_optimizer = torch.optim.AdamW(
+                self.pruning_net.parameters(), lr=1e-4, weight_decay=1e-5
             )
 
     def step_post_backward(
@@ -163,6 +196,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
         if self.use_learned_densification and self.densification_net is None:
             self._initialize_learning_components(params["means"].device)
+        if self.use_learned_pruning and self.pruning_net is None:
+            self._initialize_pruning_components(params["means"].device)
 
         should_update_maps = (state["last_nrqm_step"] == -1 and step > 0) or \
                              (step % self.nrqm_every == 0)
@@ -220,6 +255,12 @@ class AdaptiveStrategy(DefaultStrategy):
             self._train_densification_network(state)
             if self.verbose:
                 print(f"Trained Densification Network at step {step} in {time.time() - t:.2f} seconds.")
+
+        if self.use_learned_pruning and step > 1000 and step % self.pruning_learn_every == 0:
+            t = time.time()
+            self._train_pruning_network(state)
+            if self.verbose:
+                print(f"Trained Pruning Network at step {step} in {time.time() - t:.2f} seconds.")
 
 
     def _update_state(
@@ -554,20 +595,46 @@ class AdaptiveStrategy(DefaultStrategy):
         if self.verbose:
             print(f"Trained Densification Network, Loss: {loss.item():.4f}")
 
+    def _train_pruning_network(self, state):
+        if len(state["pruning_replay_buffer"]) < 256:
+            return
+
+        self.pruning_net.train()
+        device = self.pruning_net.net[0].weight.device
+
+        batch_indices = torch.randint(0, len(state["pruning_replay_buffer"]), (256,))
+        batch = [state["pruning_replay_buffer"][i] for i in batch_indices]
+
+        features = torch.stack([x[0] for x in batch]).to(device)
+        labels = torch.stack([x[1] for x in batch]).to(device).float().unsqueeze(-1)
+
+        self.pruning_optimizer.zero_grad()
+        logits = self.pruning_net(features)
+
+        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.pruning_net.parameters(), 1.0)
+        self.pruning_optimizer.step()
+
     @torch.no_grad()
     def _grow_gs(
             self,
-            params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-            optimizers: Dict[str, torch.optim.Optimizer],
-            state: Dict[str, Any],
+            params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
+            optimizers: dict[str, torch.optim.Optimizer],
+            state: dict[str, Any],
             step: int,
     ) -> Tuple[int, int]:
         """Performs stochastic, budgeted, and policy-driven densification."""
         num_gaussians = len(params["means"])
         device = params["means"].device
 
+        subset_size = min(num_gaussians, self.max_densification_subset)
+        selection = torch.randperm(num_gaussians, device=device)[:subset_size]
+        
         subset_mask = torch.rand(num_gaussians, device=device) < self.subset_fraction
+        subset_mask[selection] = True
         subset_indices = torch.where(subset_mask)[0]
+
         if subset_indices.numel() == 0:
             if self.verbose:
                 print("Skipping Gaussian growth: no valid subset indices.")
@@ -723,7 +790,36 @@ class AdaptiveStrategy(DefaultStrategy):
                 is_redundant_neighbor = overlap_mask & color_sim_mask & is_less_opaque
                 is_prune_redundant[subset_indices_map] = is_redundant_neighbor.any(dim=1)
 
-        is_prune = is_prune_original | is_prune_stagnant | is_prune_redundant | is_prune_significant
+        if self.use_learned_pruning and "photometric_error_map" in state:
+            subset_mask = torch.rand(params["means"].shape[0], device=params["means"].device) < 0.1 # Use a small subset
+            features, _, _, _, _, _ = self._get_gaussian_features(params, state, subset_mask, step)
+
+            if features is not None:
+                heuristic_prune_labels = (
+                        is_prune_original[subset_mask] |
+                        is_prune_stagnant[subset_mask] |
+                        is_prune_redundant[subset_mask] |
+                        is_prune_significant[subset_mask]
+                )
+
+                for i in range(features.shape[0]):
+                    if len(state["pruning_replay_buffer"]) < state["pruning_replay_buffer"].maxlen:
+                        state["pruning_replay_buffer"].append(
+                            (features[i].detach().cpu(), heuristic_prune_labels[i].detach().cpu())
+                        )
+
+        is_prune_learned = torch.zeros_like(is_prune_original)
+        if self.use_learned_pruning and step > self.pruning_bootstrap_steps and "photometric_error_map" in state:
+            self.pruning_net.eval()
+
+            all_features, _, _, _, _, _ = self._get_gaussian_features(params, state, torch.ones_like(is_prune_original), step)
+
+            if all_features is not None:
+                pruning_logits = self.pruning_net(all_features).squeeze(-1)
+                pruning_probs = torch.sigmoid(pruning_logits)
+                is_prune_learned = pruning_probs > self.learned_prune_threshold
+
+        is_prune = is_prune_original | is_prune_stagnant | is_prune_redundant | is_prune_significant | is_prune_learned
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:

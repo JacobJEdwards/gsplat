@@ -481,7 +481,7 @@ class NRQMStrategy(DefaultStrategy):
         features[:, 3] = scales.mean(dim=-1) / state["scene_scale"]
         features[:, 4] = torch.norm(params["sh0"][subset_mask], dim=(-1, -2))
 
-        valid_indices = torch.where(valid_mask)[0]
+        valid_indices = torch.where(valid_mask)[0][0]
         if valid_indices.numel() > 0:
             features[valid_indices, 5] = state["photometric_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
             if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:

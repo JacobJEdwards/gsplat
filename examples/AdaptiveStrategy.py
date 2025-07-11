@@ -216,6 +216,7 @@ class AdaptiveStrategy(DefaultStrategy):
         if step % self.reset_every == 0 and step > 0:
             reset_opa(params=params, optimizers=optimizers, state=state, value=self.prune_opa * 2.0)
 
+
         if self.use_learned_densification and step > 1000 and step % self.learn_every == 0:
             t = time.time()
             self._train_densification_network(state)

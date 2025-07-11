@@ -4,7 +4,8 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="53144da4-b0d3-4019-bbd6-5707b1d043a8" name="Changes" comment="expousre loss bak">
+    <list default="true" id="53144da4-b0d3-4019-bbd6-5707b1d043a8" name="Changes" comment="simple losses">
+      <change afterPath="$PROJECT_DIR$/examples/rendering.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/examples/AdaptiveStrategy.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/AdaptiveStrategy.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/examples/simple_trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/simple_trainer.py" afterDir="false" />

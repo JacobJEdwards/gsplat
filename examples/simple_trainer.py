@@ -42,7 +42,7 @@ from gsplat import export_splats, Strategy
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
-from gsplat.rendering import rasterization
+from rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 
 def strategy_representer(dumper: yaml.Dumper, data: Strategy) -> yaml.nodes.MappingNode:

@@ -1,7 +1,7 @@
 from collections import deque
 from dataclasses import dataclass, field
+import time
 from typing import Any, Dict, Tuple, Union
-from approx_topk import topk
 
 import piq
 import torch
@@ -71,9 +71,9 @@ class AdaptiveStrategy(DefaultStrategy):
         redundancy_overlap_thresh (float): Overlap threshold for redundancy pruning. Default is 0.6.
         redundancy_color_thresh (float): Color similarity threshold for redundancy pruning. Default is 0.1.
     """
-    refine_every: int = 100
+    refine_every: int = 400
     prune_every: int = 400
-    nrqm_every: int = 500
+    nrqm_every: int = 1000
 
     max_splits_per_step: int = 20000
     max_duplications_per_step: int = 20000
@@ -83,6 +83,7 @@ class AdaptiveStrategy(DefaultStrategy):
     nrqm_stagnation_threshold: float = 0.3
     nrqm_prune_stagnant_after: int = 15
     nrqm_ema_decay: float = 0.9
+    prune_significance_threshold: float = 0.01
 
     anisotropic_split: bool = True
     prune_redundant: bool = True
@@ -115,8 +116,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
     start_asc_grad2d: float = 0.0002
     end_asc_grad2d: float = 0.001
-
-    prune_significance_threshold: float = 0.01
 
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
@@ -158,35 +157,59 @@ class AdaptiveStrategy(DefaultStrategy):
         if step >= self.refine_stop_iter:
             return
 
+        if state.get("significance") is None:
+            state["significance"] = torch.zeros(params["means"].shape[0], device=params["means"].device),
+
         if self.use_learned_densification and self.densification_net is None:
             self._initialize_learning_components(params["means"].device)
 
         should_update_maps = (state["last_nrqm_step"] == -1 and step > 0) or \
                              (step % self.nrqm_every == 0)
 
+        if "gaussian_contribution" in info:
+            current_significance = info["gaussian_contribution"]
+
+            if state["significance"] is None or state["significance"].shape[0] != current_significance.shape[0]:
+                state["significance"] = torch.zeros_like(current_significance)
+
+            if state["significance"].device != current_significance.device:
+                state["significance"] = state["significance"].to(current_significance.device)
+
+            state["significance"] = 0.9 * state["significance"] + 0.1 * current_significance
+
         if should_update_maps:
+            t = time.time()
             self._update_quality_map(params, state, info)
+            if self.verbose:
+                print(f"Updated quality maps in {time.time() - t:.2f} seconds.")
             state["last_nrqm_step"] = step
 
         if self.use_learned_densification:
+            t = time.time()
             self._process_hindsight_buffer(state, step)
+            if self.verbose:
+                print(f"Processed hindsight buffer in {time.time() - t:.2f} seconds.")
 
         self._update_state(params, state, info, packed=packed)
 
         if step > self.refine_start_iter:
             if step % self.refine_every == 0:
+                t = time.time()
                 n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
                 if self.verbose:
                     print(
                         f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
                         f"Now having {len(params['means'])} GSs."
+                        f"Took {time.time() - t:.2f} seconds."
                     )
             if step % self.prune_every == 0:
+                t = time.time()
                 n_pruned = self._prune_gs(params, optimizers, state, step)
                 if self.verbose:
                     print(
                         f"Step {step}: {n_pruned} GSs pruned. "
                         f"Now having {len(params['means'])} GSs."
+                        f"Took {time.time() - t:.2f} seconds."
                     )
                 state["last_prune_count"] = n_pruned
 
@@ -194,7 +217,11 @@ class AdaptiveStrategy(DefaultStrategy):
             reset_opa(params=params, optimizers=optimizers, state=state, value=self.prune_opa * 2.0)
 
         if self.use_learned_densification and step > 1000 and step % self.learn_every == 0:
+            t = time.time()
             self._train_densification_network(state)
+            if self.verbose:
+                print(f"Trained Densification Network at step {step} in {time.time() - t:.2f} seconds.")
+
 
 
 
@@ -636,7 +663,8 @@ class AdaptiveStrategy(DefaultStrategy):
         is_prune_significant = torch.zeros_like(is_prune_original)
         if "significance" in state and state["significance"] is not None and state["significance"].numel() > 0:
             if state["significance"].numel() == is_prune_original.numel():
-                is_prune_significance = state["significance"] < self.prune_significance_threshold
+                is_prune_significant = state["significance"] < self.prune_significance_threshold
+
 
 
         is_prune_redundant = torch.zeros_like(is_prune_original)

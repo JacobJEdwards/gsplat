@@ -515,9 +515,6 @@ class NRQMStrategy(DefaultStrategy):
 
         device = state["photometric_error_map"].device
 
-        if self.verbose:
-            print(f"Processing hindsight buffer with {len(state['hindsight_buffer'])} experiences.")
-
         while state["hindsight_buffer"] and (current_step - state["hindsight_buffer"][0]["step"]) >= self.hindsight_delay:
             if self.verbose:
                 print(f"Processing experience from step {state['hindsight_buffer'][0]['step']}.")

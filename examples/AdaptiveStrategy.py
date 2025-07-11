@@ -185,10 +185,7 @@ class AdaptiveStrategy(DefaultStrategy):
             state["last_nrqm_step"] = step
 
         if self.use_learned_densification:
-            t = time.time()
             self._process_hindsight_buffer(state, step)
-            if self.verbose:
-                print(f"Processed hindsight buffer in {time.time() - t:.2f} seconds.")
 
         self._update_state(params, state, info, packed=packed)
 

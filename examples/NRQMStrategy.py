@@ -617,9 +617,6 @@ class NRQMStrategy(DefaultStrategy):
 
         if self.use_learned_densification:
             for i, original_idx in enumerate(subset_indices):
-                if self.verbose:
-                    print(f"Processing Gaussian {original_idx} at step {step}.")
-
                 if valid_mask_subset[i]:
                     initial_error = state["photometric_error_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean()
                     initial_quality = state["quality_heatmap"][pty[i], ptx[i]]
@@ -671,8 +668,6 @@ class NRQMStrategy(DefaultStrategy):
 
         state["prev_grad2d"] = state["grad2d"] / state["count"].clamp_min(1)
         state["prev_opacity"] = torch.sigmoid(params["opacities"].flatten())
-
-        print(state)
 
         return n_dupli, n_split
 

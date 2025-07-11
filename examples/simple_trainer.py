@@ -1,4 +1,3 @@
-import copy
 import json
 import math
 import os
@@ -13,9 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
-import torch.nn as nn
 import tyro
-import piq
 import yaml
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
@@ -31,7 +28,7 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
-from NRQMStrategy import NRQMStrategy
+from AdaptiveStrategy import AdaptiveStrategy, PatchBasedNRQM
 from utils import faiss_knn_with_ids
 from utils import (
     AppearanceOptModule,
@@ -39,10 +36,7 @@ from utils import (
     knn,
     rgb_to_sh,
     set_random_seed,
-    generate_novel_views,
-    ImprovedPoseGeneratorModule,
     rotation_6d_to_matrix,
-    knn_with_ids,
 )
 
 from gsplat import export_splats, Strategy
@@ -51,14 +45,6 @@ from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-
-class PatchBasedNRQM(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.brisque = piq.BRISQUELoss(reduction='none', data_range=1.0)
-
-    def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
-        return self.brisque(image_patches)
 
 def strategy_representer(dumper: yaml.Dumper, data: Strategy) -> yaml.nodes.MappingNode:
     strategy_dict = vars(data).copy()
@@ -143,7 +129,7 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy, NRQMStrategy] = field(
+    strategy: Union[DefaultStrategy, MCMCStrategy, AdaptiveStrategy] = field(
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -218,31 +204,6 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
-    use_nrqm: bool = False
-    nrqm_model: Literal["brisque", "clipiqa"] = "brisque"
-    num_novel_poses: int = 50
-    novel_view_translation_pertube: float = 1.0
-    novel_view_rotation_pertube: float = 10.0
-    nrqm_lambda: float = 1.0
-
-    nrqm_roi_threshold: float = 0.1
-
-    use_adversarial_views: bool = False
-    generator_lr: float = 1e-4
-    generator_train_interval: int = 50
-
-    generator_grad_clip: float = 1.0
-    adversarial_loss_lambda: float = 0.1
-    num_adversarial_views: int = 4
-    generator_noise_dim: int = 32
-
-    gen_trans_limit: float = 0.5
-    gen_rot_limit: float = 10.0
-    gen_focal_limit: float = 0.1
-    gen_pp_limit: int = 20
-
-    use_scene_aware_sampling: bool = False
-
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -251,7 +212,7 @@ class Config:
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
-        if isinstance(strategy, NRQMStrategy):
+        if isinstance(strategy, AdaptiveStrategy):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
@@ -387,7 +348,7 @@ class Runner:
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
-        if isinstance(cfg.strategy, NRQMStrategy):
+        if isinstance(cfg.strategy, AdaptiveStrategy):
             cfg.strategy.rasterizer_fn = self.rasterize_splats
             cfg.strategy.nrqm_model = PatchBasedNRQM().to(self.device)
             cfg.strategy.knn_fn = faiss_knn_with_ids
@@ -440,7 +401,7 @@ class Runner:
             )
         elif isinstance(self.cfg.strategy, MCMCStrategy):
             self.strategy_state = self.cfg.strategy.initialize_state()
-        elif isinstance(self.cfg.strategy, NRQMStrategy):
+        elif isinstance(self.cfg.strategy, AdaptiveStrategy):
             self.strategy_state = self.cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale,
             )
@@ -512,23 +473,6 @@ class Runner:
                 ),
             ]
 
-        self.generator = None
-        self.generator_optimizer = None
-        self.scene_condition = None
-        if cfg.use_adversarial_views:
-            # self.generator = PoseGeneratorModule(output_dim=9+4).to(self.device)
-            self.generator = ImprovedPoseGeneratorModule(noise_dim=cfg.generator_noise_dim).to(self.device)
-            self.generator_optimizer = torch.optim.AdamW(
-                self.generator.parameters(), lr=cfg.generator_lr
-            )
-            if world_size > 1:
-                self.generator = DDP(self.generator)
-
-            all_poses = torch.from_numpy(self.parser.camtoworlds).float()[:, :3, :].reshape(-1, 12)
-            pose_mean = all_poses.mean(0)
-            pose_std = all_poses.std(0)
-            self.scene_condition = torch.cat([pose_mean, pose_std]).to(self.device)
-
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
@@ -540,40 +484,6 @@ class Runner:
             self.lpips = LearnedPerceptualImagePatchSimilarity(net_type="vgg").to(self.device)
         else:
             raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
-
-        if cfg.use_nrqm:
-            if cfg.nrqm_model == "brisque":
-                self.nrqm_model = piq.BRISQUELoss().to(self.device)
-            elif cfg.nrqm_model == "clipiqa":
-                self.nrqm_model = piq.CLIPIQA().to(self.device)
-
-            candidate_poses_np = generate_interpolated_path(
-                self.parser.camtoworlds, n_interp=5
-            )
-            if candidate_poses_np.shape[1] == 3:
-                print("Padding interpolated poses from 3x4 to 4x4...")
-                bottom_row = np.array([[[0.0, 0.0, 0.0, 1.0]]])
-                repeated_bottom_row = np.repeat(
-                    bottom_row, len(candidate_poses_np), axis=0
-                )
-                candidate_poses_np = np.concatenate(
-                    [candidate_poses_np, repeated_bottom_row], axis=1
-                )
-
-            perturbed_poses_np = generate_novel_views(
-                self.parser.camtoworlds,
-                num_novel_views=cfg.num_novel_poses,
-                translation_perturbation=cfg.novel_view_translation_pertube,
-                rotation_perturbation=cfg.novel_view_rotation_pertube,
-            )
-
-            all_poses_np = np.concatenate(
-                [candidate_poses_np, perturbed_poses_np], axis=0
-            )
-            np.random.shuffle(all_poses_np)
-            self.novel_poses_np = torch.from_numpy(all_poses_np).float().to(self.device)
-
-
 
     def rasterize_splats(
             self,
@@ -705,13 +615,6 @@ class Runner:
                 )
             )
 
-        if cfg.use_adversarial_views:
-            schedulers.append(
-                torch.optim.lr_scheduler.ExponentialLR(
-                    self.generator_optimizer, gamma=0.01 ** (1.0 / max_steps)
-                )
-            )
-
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.batch_size,
@@ -825,211 +728,6 @@ class Runner:
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
-
-            if cfg.use_nrqm:
-                if cfg.use_adversarial_views and (step + 1) % cfg.generator_train_interval != 0:
-                    z = torch.randn(cfg.num_adversarial_views, cfg.generator_noise_dim, device=device)
-                    pose_deltas_raw, intrinsic_deltas_raw = self.generator(z, self.scene_condition)
-
-                    trans_deltas = torch.tanh(pose_deltas_raw[:, :3]) * cfg.gen_trans_limit
-                    rot_deltas_6d = torch.tanh(pose_deltas_raw[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
-
-                    rotation_matrices = rotation_6d_to_matrix(rot_deltas_6d + self.generator.identity_rot)
-
-                    gen_transforms = torch.zeros(cfg.num_adversarial_views, 4, 4, device=device, dtype=torch.float)
-                    gen_transforms[:, :3, :3] = rotation_matrices
-                    gen_transforms[:, :3, 3] = trans_deltas
-                    gen_transforms[:, 3, 3] = 1.0
-
-                    base_camtoworld = torch.from_numpy(self.parser.camtoworlds[np.random.randint(len(self.trainset))]).float().to(device)
-                    base_K = Ks[0]
-
-                    gen_camtoworlds = base_camtoworld.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
-                    gen_camtoworlds = torch.matmul(gen_camtoworlds, gen_transforms)
-
-                    gen_Ks = base_K.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
-                    focal_deltas = torch.tanh(intrinsic_deltas_raw[:, :2]) * cfg.gen_focal_limit
-                    pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:]) * cfg.gen_pp_limit
-                    intrinsic_deltas = torch.cat([focal_deltas, pp_deltas], dim=-1)
-
-                    fx_new = gen_Ks[:, 0, 0] * (1.0 + intrinsic_deltas[:, 0])
-                    fy_new = gen_Ks[:, 1, 1] * (1.0 + intrinsic_deltas[:, 1])
-                    cx_new = gen_Ks[:, 0, 2] + intrinsic_deltas[:, 2]
-                    cy_new = gen_Ks[:, 1, 2] + intrinsic_deltas[:, 3]
-
-                    new_K_rows = [torch.stack([fx_new, torch.zeros_like(fx_new), cx_new], dim=-1),
-                                  torch.stack([torch.zeros_like(fy_new), fy_new, cy_new], dim=-1), torch.stack(
-                            [torch.zeros_like(gen_Ks[:, 2, 2]), torch.zeros_like(gen_Ks[:, 2, 2]), gen_Ks[:, 2, 2]],
-                            dim=-1)]
-                    updated_gen_Ks = torch.stack(new_K_rows, dim=-2)
-
-                    gen_renders, gen_alphas, _ = self.rasterize_splats(
-                        camtoworlds=gen_camtoworlds,
-                        Ks=updated_gen_Ks,
-                        width=width,
-                        height=height,
-                        sh_degree=sh_degree_to_use,
-                        near_plane=cfg.near_plane,
-                        far_plane=cfg.far_plane,
-                    )
-
-                    gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)
-                    # roi_mask = (gen_alphas > cfg.nrqm_roi_threshold).permute(0, 3, 1, 2)
-
-                    nrqm_input = gen_colors.permute(0, 3, 1, 2)
-                    # nrqm_input[~roi_mask.expand(-1, 3, -1, -1)] = 0.5
-                    nrqm_input = torch.nan_to_num(nrqm_input, nan=0.0, posinf=1.0, neginf=0.0)
-                    nrqm_input = nrqm_input.clamp(min=1e-8, max=1.0 - 1e-8)
-
-                    # noise = torch.randn_like(nrqm_input) * 1e-5
-                    # nrqm_input = (nrqm_input + noise).clamp(0.0, 1.0)
-
-                    nrqm_colors = gen_colors
-
-                    try:
-                        generator_loss = self.nrqm_model(nrqm_input).mean()
-                    except AssertionError as e:
-                        print("NRQM model assertion error:", e)
-                        generator_loss = torch.tensor(0.0, device=device)
-
-                    if cfg.nrqm_model == "clipiqa":
-                        generator_loss = -generator_loss
-                    nrqm_loss = generator_loss
-                else:
-                    num_nrqm_poses = min(4, self.novel_poses_np.shape[0])
-                    sampled_pose_indices = torch.randperm(self.novel_poses_np.shape[0])[:num_nrqm_poses]
-                    nrqm_camtoworlds = self.novel_poses_np[sampled_pose_indices]
-
-                    nrqm_Ks = Ks.repeat(num_nrqm_poses, 1, 1)
-                    nrqm_width = width
-                    nrqm_height = height
-
-                    nrqm_renders, nrqm_alphas, _ = self.rasterize_splats(
-                        camtoworlds=nrqm_camtoworlds,
-                        Ks=nrqm_Ks,
-                        width=nrqm_width,
-                        height=nrqm_height,
-                        sh_degree=sh_degree_to_use,
-                        near_plane=cfg.near_plane,
-                        far_plane=cfg.far_plane,
-                    )
-
-                    nrqm_colors = torch.clamp(nrqm_renders[..., 0:3], 0.0, 1.0)
-                    # roi_mask = (nrqm_alphas > cfg.nrqm_roi_threshold).permute(0, 3, 1, 2)
-
-                    nrqm_input = nrqm_colors.permute(0, 3, 1, 2)
-                    # nrqm_input[~roi_mask.expand(-1, 3, -1, -1)] = 0.5
-                    nrqm_input = torch.nan_to_num(nrqm_input, nan=0.0, posinf=1.0, neginf=0.0)
-                    nrqm_input = nrqm_input.clamp(min=1e-8, max=1.0 - 1e-8)
-
-                    # noise = torch.randn_like(nrqm_input) * 1e-5
-                    # nrqm_input = (nrqm_input + noise).clamp(0.0, 1.0)
-
-                    try:
-                        nrqm_loss = self.nrqm_model(nrqm_input).mean()
-                    except AssertionError as e:
-                        print("NRQM model assertion error:", e)
-                        nrqm_loss = torch.tensor(0.0, device=device)
-
-                    if cfg.nrqm_model == "clipiqa":
-                        nrqm_loss = -nrqm_loss
-
-                loss += nrqm_loss * cfg.nrqm_lambda
-
-                if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
-                    self.writer.add_scalar("train/nrqm_loss", nrqm_loss.item(), step)
-                    self.writer.add_images(
-                        "train/nrqm_render",
-                        nrqm_colors.permute(0, 3, 1, 2).detach().cpu().numpy(),
-                        step,
-                    )
-
-            if cfg.use_adversarial_views and (step + 1) % cfg.generator_train_interval == 0:
-                self.generator_optimizer.zero_grad()
-
-                z = torch.randn(cfg.num_adversarial_views, cfg.generator_noise_dim, device=device)
-                pose_deltas_raw, intrinsic_deltas_raw = self.generator(z, self.scene_condition)
-
-                trans_deltas = torch.tanh(pose_deltas_raw[:, :3]) * cfg.gen_trans_limit
-                rot_deltas_6d = torch.tanh(pose_deltas_raw[:, 3:]) * (cfg.gen_rot_limit * math.pi / 180.0)
-
-                rotation_matrices = rotation_6d_to_matrix(rot_deltas_6d + self.generator.identity_rot)
-
-                gen_transforms = torch.zeros(cfg.num_adversarial_views, 4, 4, device=device, dtype=torch.float)
-                gen_transforms[:, :3, :3] = rotation_matrices
-                gen_transforms[:, :3, 3] = trans_deltas
-                gen_transforms[:, 3, 3] = 1.0
-
-                base_camtoworld = torch.from_numpy(self.parser.camtoworlds[np.random.randint(len(self.trainset))]).float().to(device)
-                base_K = Ks[0]
-
-                gen_camtoworlds = base_camtoworld.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
-                gen_camtoworlds = torch.matmul(gen_camtoworlds, gen_transforms)
-
-                gen_Ks = base_K.unsqueeze(0).repeat(cfg.num_adversarial_views, 1, 1)
-                focal_deltas = torch.tanh(intrinsic_deltas_raw[:, :2]) * cfg.gen_focal_limit
-                pp_deltas = torch.tanh(intrinsic_deltas_raw[:, 2:]) * cfg.gen_pp_limit
-                intrinsic_deltas = torch.cat([focal_deltas, pp_deltas], dim=-1)
-
-                fx_new = gen_Ks[:, 0, 0] * (1.0 + intrinsic_deltas[:, 0])
-                fy_new = gen_Ks[:, 1, 1] * (1.0 + intrinsic_deltas[:, 1])
-                cx_new = gen_Ks[:, 0, 2] + intrinsic_deltas[:, 2]
-                cy_new = gen_Ks[:, 1, 2] + intrinsic_deltas[:, 3]
-
-                new_K_rows = [torch.stack([fx_new, torch.zeros_like(fx_new), cx_new], dim=-1),
-                              torch.stack([torch.zeros_like(fy_new), fy_new, cy_new], dim=-1), torch.stack(
-                        [torch.zeros_like(gen_Ks[:, 2, 2]), torch.zeros_like(gen_Ks[:, 2, 2]), gen_Ks[:, 2, 2]],
-                        dim=-1)]
-                updated_gen_Ks = torch.stack(new_K_rows, dim=-2)
-
-                gen_renders, gen_alphas, _ = self.rasterize_splats(
-                    camtoworlds=gen_camtoworlds,
-                    Ks=updated_gen_Ks,
-                    width=width,
-                    height=height,
-                    sh_degree=sh_degree_to_use,
-                    near_plane=cfg.near_plane,
-                    far_plane=cfg.far_plane,
-                )
-
-                gen_colors = torch.clamp(gen_renders[..., 0:3], 0.0, 1.0)
-
-                # roi_mask = (gen_alphas > cfg.nrqm_roi_threshold).permute(0, 3, 1, 2)
-
-                gen_input = gen_colors.permute(0, 3, 1, 2)
-                # gen_input[~roi_mask.expand(-1, 3, -1, -1)] = 0.5
-                gen_input = torch.nan_to_num(gen_input, nan=0.0, posinf=1.0, neginf=0.0)
-                gen_input = gen_input.clamp(min=1e-8, max=1.0 - 1e-8)
-
-                # noise = torch.randn_like(gen_input) * 1e-5
-                # gen_input = (gen_input + noise).clamp(0.0, 1.0)
-
-                try:
-                    generator_loss = -self.nrqm_model(gen_input).mean() * cfg.adversarial_loss_lambda
-                except AssertionError as e:
-                    print("NRQM model assertion error:", e)
-                    generator_loss = torch.tensor(0.0, device=device)
-
-                generator_loss.backward()
-
-                # gen_colors_permuted = gen_colors.permute(0, 3, 1, 2)
-                # gen_colors_permuted = torch.nan_to_num(gen_colors_permuted, nan=0.0, posinf=1.0, neginf=0.0)
-                # gen_colors_permuted = gen_colors_permuted.clamp(min=1e-8, max=1.0 - 1e-8)
-                #
-                # generator_loss = -self.nrqm_model(gen_colors_permuted).mean() * cfg.adversarial_loss_lambda
-                # generator_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), cfg.generator_grad_clip)
-
-                self.generator_optimizer.step()
-
-                if world_rank == 0 and cfg.tb_every > 0 and (step + 1) % cfg.tb_every == 0:
-                    self.writer.add_scalar("train/generator_loss", generator_loss.item(), step)
-                    self.writer.add_images(
-                        "train/gen_render",
-                        gen_colors.permute(0, 3, 1, 2).detach().cpu().numpy(),
-                        step,
-                    )
-
 
             # regularizations
             if cfg.opacity_reg > 0.0:
@@ -1173,7 +871,7 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, NRQMStrategy):
+            if isinstance(self.cfg.strategy, AdaptiveStrategy):
                 info["camtoworlds"] = camtoworlds
                 info["step"] = step
                 info["Ks"] = Ks
@@ -1457,7 +1155,7 @@ if __name__ == "__main__":
         "nrqm": (
             "Gaussian splatting training with NRQM model for quality assessment.",
             Config(
-                strategy=NRQMStrategy(
+                strategy=AdaptiveStrategy(
                     verbose=True,
                     anisotropic_split=True,
                     prune_redundant=True,

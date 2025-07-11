@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="53144da4-b0d3-4019-bbd6-5707b1d043a8" name="Changes" comment="config">
+      <change afterPath="$PROJECT_DIR$/examples/ops.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/examples/NRQMStrategy.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/AdaptiveStrategy.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/examples/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/examples/requirements.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/examples/simple_trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/simple_trainer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/examples/utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/utils.py" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="FileTemplateManagerImpl">
+    <option name="RECENT_TEMPLATES">
+      <list>
+        <option value="Python Script" />
+      </list>
+    </option>
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 6
+}</component>
+  <component name="ProjectId" id="2zj1Ffn4QCihdWoeyfkjkfg3qQt" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.com.insyncwithfoo.pyright.configurations.converters.pyrightls.ConfigurationsConverter": "true",
+    "RunOnceActivity.com.insyncwithfoo.pyright.configurations.converters.v1.ConfigurationsConverter": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "git-widget-placeholder": "learnt-strat",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "vue.rearranger.settings.migration": "true"
+  }
+}]]></component>
+  <component name="SharedIndexes">
+    <attachedChunks>
+      <set>
+        <option value="bundled-js-predefined-d6986cc7102b-6a121458b545-JavaScript-PY-251.25410.159" />
+        <option value="bundled-python-sdk-e0ed3721d81e-36ea0e71a18c-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-251.25410.159" />
+      </set>
+    </attachedChunks>
+  </component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="53144da4-b0d3-4019-bbd6-5707b1d043a8" name="Changes" comment="" />
+      <created>1752229566707</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1752229566707</updated>
+      <workItem from="1752229569086" duration="4072000" />
+      <workItem from="1752239551061" duration="811000" />
+    </task>
+    <task id="LOCAL-00001" summary="exclusion loss">
+      <option name="closed" value="true" />
+      <created>1752230268422</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1752230268422</updated>
+    </task>
+    <task id="LOCAL-00002" summary="exclusion loss">
+      <option name="closed" value="true" />
+      <created>1752230502039</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1752230502039</updated>
+    </task>
+    <task id="LOCAL-00003" summary="exclusion loss">
+      <option name="closed" value="true" />
+      <created>1752230708873</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1752230708873</updated>
+    </task>
+    <task id="LOCAL-00004" summary="exclusion loss">
+      <option name="closed" value="true" />
+      <created>1752235909124</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1752235909124</updated>
+    </task>
+    <task id="LOCAL-00005" summary="exclusion loss">
+      <option name="closed" value="true" />
+      <created>1752236099574</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1752236099575</updated>
+    </task>
+    <task id="LOCAL-00006" summary="removed nrqm">
+      <option name="closed" value="true" />
+      <created>1752236209351</created>
+      <option name="number" value="00006" />
+      <option name="presentableId" value="LOCAL-00006" />
+      <option name="project" value="LOCAL" />
+      <updated>1752236209351</updated>
+    </task>
+    <task id="LOCAL-00007" summary="option to learn exposure">
+      <option name="closed" value="true" />
+      <created>1752236491155</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1752236491155</updated>
+    </task>
+    <task id="LOCAL-00008" summary="no exposure loss">
+      <option name="closed" value="true" />
+      <created>1752237205541</created>
+      <option name="number" value="00008" />
+      <option name="presentableId" value="LOCAL-00008" />
+      <option name="project" value="LOCAL" />
+      <updated>1752237205541</updated>
+    </task>
+    <task id="LOCAL-00009" summary="replicate paddin gmode">
+      <option name="closed" value="true" />
+      <created>1752237477504</created>
+      <option name="number" value="00009" />
+      <option name="presentableId" value="LOCAL-00009" />
+      <option name="project" value="LOCAL" />
+      <updated>1752237477504</updated>
+    </task>
+    <task id="LOCAL-00010" summary="per image contrast">
+      <option name="closed" value="true" />
+      <created>1752237888796</created>
+      <option name="number" value="00010" />
+      <option name="presentableId" value="LOCAL-00010" />
+      <option name="project" value="LOCAL" />
+      <updated>1752237888796</updated>
+    </task>
+    <task id="LOCAL-00011" summary="removed norm">
+      <option name="closed" value="true" />
+      <created>1752238011373</created>
+      <option name="number" value="00011" />
+      <option name="presentableId" value="LOCAL-00011" />
+      <option name="project" value="LOCAL" />
+      <updated>1752238011373</updated>
+    </task>
+    <task id="LOCAL-00012" summary="removed norm">
+      <option name="closed" value="true" />
+      <created>1752238121470</created>
+      <option name="number" value="00012" />
+      <option name="presentableId" value="LOCAL-00012" />
+      <option name="project" value="LOCAL" />
+      <updated>1752238121470</updated>
+    </task>
+    <task id="LOCAL-00013" summary="removed norm">
+      <option name="closed" value="true" />
+      <created>1752238174166</created>
+      <option name="number" value="00013" />
+      <option name="presentableId" value="LOCAL-00013" />
+      <option name="project" value="LOCAL" />
+      <updated>1752238174166</updated>
+    </task>
+    <task id="LOCAL-00014" summary="readded norm">
+      <option name="closed" value="true" />
+      <created>1752238281525</created>
+      <option name="number" value="00014" />
+      <option name="presentableId" value="LOCAL-00014" />
+      <option name="project" value="LOCAL" />
+      <updated>1752238281525</updated>
+    </task>
+    <task id="LOCAL-00015" summary="config">
+      <option name="closed" value="true" />
+      <created>1752238496767</created>
+      <option name="number" value="00015" />
+      <option name="presentableId" value="LOCAL-00015" />
+      <option name="project" value="LOCAL" />
+      <updated>1752238496767</updated>
+    </task>
+    <task id="LOCAL-00016" summary="config">
+      <option name="closed" value="true" />
+      <created>1752238675164</created>
+      <option name="number" value="00016" />
+      <option name="presentableId" value="LOCAL-00016" />
+      <option name="project" value="LOCAL" />
+      <updated>1752238675164</updated>
+    </task>
+    <task id="LOCAL-00017" summary="config">
+      <option name="closed" value="true" />
+      <created>1752238704706</created>
+      <option name="number" value="00017" />
+      <option name="presentableId" value="LOCAL-00017" />
+      <option name="project" value="LOCAL" />
+      <updated>1752238704706</updated>
+    </task>
+    <option name="localTasksCounter" value="18" />
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="exclusion loss" />
+    <MESSAGE value="removed nrqm" />
+    <MESSAGE value="option to learn exposure" />
+    <MESSAGE value="no exposure loss" />
+    <MESSAGE value="replicate paddin gmode" />
+    <MESSAGE value="per image contrast" />
+    <MESSAGE value="removed norm" />
+    <MESSAGE value="readded norm" />
+    <MESSAGE value="config" />
+    <option name="LAST_COMMIT_MESSAGE" value="config" />
+  </component>
+</project>

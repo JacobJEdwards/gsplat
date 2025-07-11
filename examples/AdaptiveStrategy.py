@@ -640,7 +640,7 @@ class AdaptiveStrategy(DefaultStrategy):
         n_dupli = min(len(dupli_indices_in_subset), self.max_duplications_per_step)
         if n_dupli > 0:
             dupli_scores = utility_scores[dupli_indices_in_subset]
-            _, top_indices = topk(dupli_scores, n_dupli)
+            _, top_indices = topk(dupli_scores, n_dupli, dim=-1)
             final_dupli_indices_in_subset = dupli_indices_in_subset[top_indices]
             is_dupli[subset_indices[final_dupli_indices_in_subset]] = True
 
@@ -649,7 +649,7 @@ class AdaptiveStrategy(DefaultStrategy):
         n_split = min(len(split_indices_in_subset), self.max_splits_per_step)
         if n_split > 0:
             split_scores = utility_scores[split_indices_in_subset]
-            _, top_indices = topk(split_scores, n_split)
+            _, top_indices = topk(split_scores, n_split, dim=-1)
             final_split_indices_in_subset = split_indices_in_subset[top_indices]
             is_split[subset_indices[final_split_indices_in_subset]] = True
 

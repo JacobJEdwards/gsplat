@@ -293,38 +293,28 @@ class AdaptiveStrategy(DefaultStrategy):
         width, height = info['width'], info['height']
         sh_degree_to_use = min(step // 1000, 3)
 
-        all_depth_renders = []
-        main_novel_view_idx = -1
+        cam_indices = torch.randint(0, info['n_cameras'], (self.num_uncertainty_views,))
+        main_novel_view_idx = cam_indices[0].item()
 
-        novel_render_for_nrqm = None
-        for i in range(self.num_uncertainty_views):
-            cam_idx = torch.randint(0, info['n_cameras'], (1,)).item()
-            if i == 0:
-                main_novel_view_idx = cam_idx
+        novel_camtoworlds = info['camtoworlds'][cam_indices]
+        novel_Ks = info['Ks'][cam_indices]
 
-            novel_camtoworld = info['camtoworlds'][cam_idx].unsqueeze(0)
-            novel_K = info['Ks'][cam_idx].unsqueeze(0)
+        novel_render_pkg, _, _ = self.rasterizer_fn(
+            means=params["means"],
+            quats=params["quats"],
+            scales=params["scales"],
+            opacities=params["opacities"],
+            colors=torch.cat([params["sh0"], params["shN"]], 1),
+            Ks=novel_Ks,
+            width=width,
+            height=height,
+            sh_degree=sh_degree_to_use,
+            camtoworlds=novel_camtoworlds,
+            render_mode="RGB+ED"
+        )
 
-            novel_render_pkg, _, _ = self.rasterizer_fn(
-                means=params["means"],
-                quats=params["quats"],
-                scales=params["scales"],
-                opacities=params["opacities"],
-                colors=torch.cat([params["sh0"], params["shN"]], 1),
-                Ks=novel_K,
-                width=width,
-                height=height,
-                sh_degree=sh_degree_to_use,
-                camtoworlds=novel_camtoworld,
-                render_mode="RGB+ED"
-            )
-
-            novel_color = novel_render_pkg[..., :3]
-            novel_depth = novel_render_pkg[..., 3].squeeze(0)
-            all_depth_renders.append(novel_depth)
-
-            if i == 0:
-                novel_render_for_nrqm = torch.clamp(novel_color.permute(0, 3, 1, 2), 0.0, 1.0)
+        novel_render_for_nrqm = torch.clamp(novel_render_pkg[0, ..., :3].unsqueeze(0).permute(0, 3, 1, 2), 0.0, 1.0)
+        all_depth_renders = novel_render_pkg[..., 3]
 
         p = self.nrqm_patch_size
         patches = novel_render_for_nrqm.unfold(2, p, p).unfold(3, p, p)
@@ -338,13 +328,13 @@ class AdaptiveStrategy(DefaultStrategy):
             patch_scores[is_flat] = 100.0
 
         valid_patch_indices = torch.where(~is_flat)[0]
-        for idx in valid_patch_indices:
-            patch = patches[idx].unsqueeze(0)
+        if valid_patch_indices.numel() > 0:
+            valid_patches = patches[valid_patch_indices].float()
             try:
-                score = self.nrqm_model(patch.float())
-                patch_scores[idx] = score
+                scores = self.nrqm_model(valid_patches)
+                patch_scores[valid_patch_indices] = scores
             except AssertionError:
-                patch_scores[idx] = 100.0
+                patch_scores[valid_patch_indices] = 100.0
 
         num_patches_h = height // p
         quality_heatmap = patch_scores.view(num_patches_h, -1)
@@ -352,19 +342,15 @@ class AdaptiveStrategy(DefaultStrategy):
             state["quality_heatmap"] = quality_heatmap
         else:
             state["quality_heatmap"] = torch.lerp(
-                quality_heatmap,
-                state["quality_heatmap"],
-                self.nrqm_ema_decay
+                quality_heatmap, state["quality_heatmap"], self.nrqm_ema_decay
             )
 
         if self.use_geom_uncertainty:
-            depth_stack = torch.stack(all_depth_renders)
-
+            depth_stack = all_depth_renders
             min_d = torch.min(depth_stack[depth_stack > 0])
             max_d = torch.max(depth_stack)
             normalized_depth = (depth_stack - min_d) / (max_d - min_d + 1e-8)
             normalized_depth[depth_stack == 0] = 0
-
             geom_uncertainty_map = torch.var(normalized_depth, dim=0)
 
             if state["geom_uncertainty_map"] is None:
@@ -373,23 +359,21 @@ class AdaptiveStrategy(DefaultStrategy):
                 state["geom_uncertainty_map"] = torch.lerp(
                     geom_uncertainty_map, state["geom_uncertainty_map"], self.nrqm_ema_decay)
 
-        main_novel_camtoworld = info['camtoworlds'][main_novel_view_idx].unsqueeze(0)
-        main_novel_K = info['Ks'][main_novel_view_idx].unsqueeze(0)
+        main_novel_camtoworld = novel_camtoworlds[0].unsqueeze(0)
+        main_novel_K = novel_Ks[0].unsqueeze(0)
+
         view_matrix = torch.inverse(main_novel_camtoworld)
 
-        fx = main_novel_K[0, 0, 0]
-        fy = main_novel_K[0, 1, 1]
-        cx = main_novel_K[0, 0, 2]
-        cy = main_novel_K[0, 1, 2]
+        fx, fy = main_novel_K[0, 0, 0], main_novel_K[0, 1, 1]
+        cx, cy = main_novel_K[0, 0, 2], main_novel_K[0, 1, 2]
 
         proj_matrix = torch.zeros(4, 4, device=view_matrix.device)
         proj_matrix[0, 0] = 2 * fx / width
         proj_matrix[1, 1] = 2 * fy / height
         proj_matrix[2, 0] = 1.0 - 2 * cx / width
         proj_matrix[2, 1] = 1.0 - 2 * cy / height
-        proj_matrix[2, 3] = 1.0 
+        proj_matrix[2, 3] = 1.0
         proj_matrix[3, 2] = 1.0
-
         state["view_proj_matrix"] = view_matrix[0] @ proj_matrix
 
         avg_quality = patch_scores.mean()
@@ -397,35 +381,24 @@ class AdaptiveStrategy(DefaultStrategy):
         quality_factor = torch.clamp(1.0 + (normalized_quality - 1.0) * 0.5, 0.5, 1.5).item()
         state["dynamic_grow_grad2d"] = self.grow_grad2d * quality_factor
 
-        gt_image = info["pixels"]  # [B, H, W, C]
-        gt_ids = info["image_ids"]  # [B,]
-        gt_ks = info["Ks"]  # [B, 3, 3]
-        camtoworlds_gt = info["camtoworlds"] # [B, 4, 4]
-
+        gt_image = info["pixels"]
+        gt_ids = info["image_ids"]
+        gt_ks = info["Ks"]
+        camtoworlds_gt = info["camtoworlds"]
         rendered_train_view, _, _ = self.rasterizer_fn(
-            means=params["means"],
-            quats=params["quats"],
-            scales=params["scales"],
-            opacities=params["opacities"],
-            colors=torch.cat([params["sh0"], params["shN"]], 1),
-            Ks=gt_ks,
-            width=width,
-            height=height,
-            sh_degree=sh_degree_to_use,
-            camtoworlds=camtoworlds_gt,
-            image_ids=gt_ids,
+            means=params["means"], quats=params["quats"], scales=params["scales"],
+            opacities=params["opacities"], colors=torch.cat([params["sh0"], params["shN"]], 1),
+            Ks=gt_ks, width=width, height=height, sh_degree=sh_degree_to_use,
+            camtoworlds=camtoworlds_gt, image_ids=gt_ids,
         )
-        photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=-1).squeeze(0) # [H, W]
+        photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=-1).squeeze(0)
 
         if state["photometric_error_map"] is None:
             state["photometric_error_map"] = photometric_error_map
         else:
             state["photometric_error_map"] = torch.lerp(
-                photometric_error_map,
-                state["photometric_error_map"],
-                self.nrqm_ema_decay
+                photometric_error_map, state["photometric_error_map"], self.nrqm_ema_decay
             )
-
 
     @torch.no_grad()
     def _project_to_patch_coords(self, means3d: Tensor, view_proj_matrix: Tensor, h: int, w: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:

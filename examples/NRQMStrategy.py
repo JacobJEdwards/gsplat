@@ -485,9 +485,11 @@ class NRQMStrategy(DefaultStrategy):
             neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
             neighbor_sh0 = params["sh0"][neighbor_idxs].squeeze(-2)
 
+            sh0_subset = params["sh0"][subset_mask]
+
             features[:, 9] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
             features[:, 10] = neighbor_opacities.mean(dim=-1)
-            features[:, 11] = torch.norm(neighbor_sh0 - features[:, 4].unsqueeze(1), dim=-1).mean(dim=-1)
+            features[:, 11] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
 
         current_grad = state["grad2d"][subset_mask] / state["count"][subset_mask].clamp_min(1)
         features[:, 12] = current_grad

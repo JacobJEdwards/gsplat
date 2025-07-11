@@ -8,7 +8,6 @@ from typing_extensions import Literal
 
 from gsplat.cuda._wrapper import (
     RollingShutterType,
-    FThetaCameraDistortionParameters,
     fully_fused_projection,
     fully_fused_projection_with_ut,
     isect_offset_encode,
@@ -58,7 +57,7 @@ def rasterization(
         radial_coeffs: Optional[Tensor] = None,  # [..., C, 6] or [..., C, 4]
         tangential_coeffs: Optional[Tensor] = None,  # [..., C, 2]
         thin_prism_coeffs: Optional[Tensor] = None,  # [..., C, 4]
-        ftheta_coeffs: Optional[FThetaCameraDistortionParameters] = None,
+        ftheta_coeffs = None,
         # rolling shutter
         rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
         viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]

@@ -4,12 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="53144da4-b0d3-4019-bbd6-5707b1d043a8" name="Changes" comment="simple losses">
-      <change afterPath="$PROJECT_DIR$/examples/rendering.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/examples/AdaptiveStrategy.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/AdaptiveStrategy.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/examples/simple_trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/simple_trainer.py" afterDir="false" />
-    </list>
+    <list default="true" id="53144da4-b0d3-4019-bbd6-5707b1d043a8" name="Changes" comment="checking timing" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -203,7 +198,47 @@
       <option name="project" value="LOCAL" />
       <updated>1752238704706</updated>
     </task>
-    <option name="localTasksCounter" value="18" />
+    <task id="LOCAL-00018" summary="checking timing">
+      <option name="closed" value="true" />
+      <created>1752270433822</created>
+      <option name="number" value="00018" />
+      <option name="presentableId" value="LOCAL-00018" />
+      <option name="project" value="LOCAL" />
+      <updated>1752270433822</updated>
+    </task>
+    <task id="LOCAL-00019" summary="checking timing">
+      <option name="closed" value="true" />
+      <created>1752270442795</created>
+      <option name="number" value="00019" />
+      <option name="presentableId" value="LOCAL-00019" />
+      <option name="project" value="LOCAL" />
+      <updated>1752270442795</updated>
+    </task>
+    <task id="LOCAL-00020" summary="checking timing">
+      <option name="closed" value="true" />
+      <created>1752270548590</created>
+      <option name="number" value="00020" />
+      <option name="presentableId" value="LOCAL-00020" />
+      <option name="project" value="LOCAL" />
+      <updated>1752270548590</updated>
+    </task>
+    <task id="LOCAL-00021" summary="checking timing">
+      <option name="closed" value="true" />
+      <created>1752270597758</created>
+      <option name="number" value="00021" />
+      <option name="presentableId" value="LOCAL-00021" />
+      <option name="project" value="LOCAL" />
+      <updated>1752270597758</updated>
+    </task>
+    <task id="LOCAL-00022" summary="checking timing">
+      <option name="closed" value="true" />
+      <created>1752270737310</created>
+      <option name="number" value="00022" />
+      <option name="presentableId" value="LOCAL-00022" />
+      <option name="project" value="LOCAL" />
+      <updated>1752270737310</updated>
+    </task>
+    <option name="localTasksCounter" value="23" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -219,6 +254,8 @@
     <MESSAGE value="removed norm" />
     <MESSAGE value="readded norm" />
     <MESSAGE value="config" />
-    <option name="LAST_COMMIT_MESSAGE" value="config" />
+    <MESSAGE value="expousre loss bak" />
+    <MESSAGE value="checking timing" />
+    <option name="LAST_COMMIT_MESSAGE" value="checking timing" />
   </component>
 </project>

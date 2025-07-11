@@ -156,7 +156,7 @@ class AdaptiveStrategy(DefaultStrategy):
             "geom_uncertainty_map": None,
             "replay_buffer": deque(maxlen=20_000),
             "hindsight_buffer": deque(maxlen=5_000),
-            "pruning_hindsight_buffer": deque(maxlen=20_000),
+            "pruning_replay_buffer": deque(maxlen=20_000),
             "significance": None, # todo
             "prev_grad2d": None,
             "prev_opacity": None

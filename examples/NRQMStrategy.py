@@ -150,8 +150,8 @@ class NRQMStrategy(DefaultStrategy):
     prune_every: int = 400
     nrqm_every: int = 500
 
-    max_splits_per_step: int = 10000
-    max_duplications_per_step: int = 10000
+    max_splits_per_step: int = 20000
+    max_duplications_per_step: int = 20000
     subset_fraction: float = 0.2
 
     nrqm_patch_size: int = 32

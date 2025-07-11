@@ -514,7 +514,7 @@ class NRQMStrategy(DefaultStrategy):
 
         features[:, 16] = step / self.refine_stop_iter
 
-        return (torch.nan_to_num(features, 0.0), pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y, valid_mask[subset_mask])
+        return (torch.nan_to_num(features, 0.0), pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y, valid_mask)
 
     def _process_hindsight_buffer(self, state, current_step):
         if state.get("photometric_error_map") is None:
@@ -617,7 +617,7 @@ class NRQMStrategy(DefaultStrategy):
 
         if self.use_learned_densification:
             for i, original_idx in enumerate(subset_indices):
-                if valid_mask_subset[i]:
+                # if valid_mask_subset[i]:
                     initial_error = state["photometric_error_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean()
                     initial_quality = state["quality_heatmap"][pty[i], ptx[i]]
                     initial_uncertainty = state["geom_uncertainty_map"][py[i], px[i]]

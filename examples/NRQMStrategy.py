@@ -244,7 +244,10 @@ class NRQMStrategy(DefaultStrategy):
         if self.use_learned_densification and self.densification_net is None:
             self._initialize_learning_components(params["means"].device)
 
-        if step % self.nrqm_every == 0 and self.rasterizer_fn is not None:
+        should_update_maps = (state["last_nrqm_step"] == -1 and step > 0) or \
+                             (step % self.nrqm_every == 0)
+
+        if should_update_maps:
             self._update_quality_map(params, state, info)
             state["last_nrqm_step"] = step
 
@@ -449,6 +452,9 @@ class NRQMStrategy(DefaultStrategy):
 
         means3d_subset = params["means"][subset_mask]
         if state.get("photometric_error_map") is None:
+            if self.verbose:
+                print("Skipping feature extraction: photometric error map is not available.")
+                
             return None, None, None, None, None
 
         h, w = state["photometric_error_map"].shape
@@ -588,10 +594,18 @@ class NRQMStrategy(DefaultStrategy):
 
         subset_mask = torch.rand(num_gaussians, device=device) < self.subset_fraction
         subset_indices = torch.where(subset_mask)[0]
-        if subset_indices.numel() == 0: return 0, 0
+        if subset_indices.numel() == 0: 
+            if self.verbose:
+                print("Skipping Gaussian growth: no valid subset indices.")
+                
+            return 0, 0
 
         features_subset, px, py, ptx, pty, valid_mask_subset = self._get_gaussian_features(params, state, subset_mask, step)
-        if features_subset is None: return 0, 0
+        if features_subset is None: 
+            if self.verbose:
+                print("Skipping Gaussian growth: no valid features extracted.")
+                
+            return 0, 0
 
         if self.use_learned_densification and step >= self.bootstrap_steps:
             self.densification_net.eval()
@@ -601,8 +615,10 @@ class NRQMStrategy(DefaultStrategy):
             utility_scores = features_subset[:, 12]
 
         if self.use_learned_densification:
-            print("here")
             for i, original_idx in enumerate(subset_indices):
+                if self.verbose:
+                    print(f"Processing Gaussian {original_idx} at step {step}.")
+                
                 if valid_mask_subset[i]:
                     initial_error = state["photometric_error_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean()
                     initial_quality = state["quality_heatmap"][pty[i], ptx[i]]

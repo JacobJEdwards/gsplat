@@ -382,7 +382,6 @@ class AdaptiveStrategy(DefaultStrategy):
                              (step % self.nrqm_every == 0)
 
         if should_update_maps:
-            t = time.time()
             self._update_quality_map(params, state, info)
             state["last_nrqm_step"] = step
 

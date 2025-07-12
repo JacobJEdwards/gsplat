@@ -147,7 +147,7 @@ class AdaptiveStrategy(DefaultStrategy):
     use_learned_densification: bool = True
     bootstrap_steps: int = 5000
     learn_every: int = 200
-    hindsight_delay: int = 100
+    hindsight_delay: int = 400
 
     actor_loss_weight: float = 1.0
     entropy_loss_weight: float = 0.1
@@ -693,18 +693,23 @@ class AdaptiveStrategy(DefaultStrategy):
         self.ac_net.eval()
         action_logits, _, continuous_params = self.ac_net(graph_embeddings)
 
-        # age_feature_normalized = graph_embeddings[:, 17]
-        # age_in_steps = age_feature_normalized * self.refine_stop_iter
-        # is_too_young_to_prune = age_in_steps < 500
-        # action_logits[is_too_young_to_prune, 0] = -1e9
-
         dist = Categorical(logits=action_logits)
         actions = dist.sample()
 
+        age_in_steps = state["age"][subset_indices]
+        significance = state["significance"][subset_indices]
+
+        is_too_young_to_prune = age_in_steps < 500
+
+        is_too_significant_to_prune = significance > self.prune_significance_threshold
+
+        pruning_forbidden_mask = is_too_young_to_prune | is_too_significant_to_prune
 
         subset_is_prune = (actions == 0)
         subset_is_dupe  = (actions == 2)
         subset_is_split = (actions == 3)
+
+        subset_is_prune[pruning_forbidden_mask] = False
 
         scales = torch.exp(params["scales"])
         subset_scales = scales[subset_indices]

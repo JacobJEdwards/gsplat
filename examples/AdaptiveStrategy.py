@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.distributions import Categorical
 
+from torch_geometric.nn import GATConv, knn_graph
+
 from gsplat.utils import normalized_quat_to_rotmat
 from utils import knn_with_ids
 from gsplat.strategy.ops import (
@@ -18,6 +20,24 @@ from gsplat.strategy.ops import (
 )
 from gsplat.strategy.default import DefaultStrategy
 from ops import split, duplicate
+
+class GaussianGraphNetwork(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int = 2):
+        super().__init__()
+        self.convs = nn.ModuleList()
+        self.convs.append(GATConv(input_dim, hidden_dim, heads=2))
+        for _ in range(num_layers - 2):
+            self.convs.append(GATConv(hidden_dim * 2, hidden_dim, heads=2))
+        self.convs.append(GATConv(hidden_dim * 2, output_dim, concat=False))
+
+        self.prelu = nn.PReLU()
+
+    def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
+        for i, conv in enumerate(self.convs):
+            x = conv(x, edge_index)
+            if i < len(self.convs) - 1:
+                x = self.prelu(x)
+        return x
 
 class ActorCriticNetwork(nn.Module):
     def __init__(self, input_dim: int = 18, mlp_width: int = 64):
@@ -96,6 +116,10 @@ class AdaptiveStrategy(DefaultStrategy):
     prune_every: int = 400
     nrqm_every: int = 1000
 
+    gnn_knn: int = 8
+    gnn_hidden_dim: int = 32
+    gnn_embedding_dim: int = 16
+
     max_splits_per_step: int = 1_000_000
     max_duplications_per_step: int = 1_000_000
 
@@ -149,8 +173,9 @@ class AdaptiveStrategy(DefaultStrategy):
     densification_net: Any = field(default=None, repr=False)
     densification_optimizer: Any = field(default=None, repr=False)
 
+    gnn_net: Any = field(default=None, repr=False)
     ac_net: Any = field(default=None, repr=False)
-    ac_optimizer: Any = field(default=None, repr=False)
+    combined_optimizer: Any = field(default=None, repr=False)
 
     start_asc_grad2d: float = 0.0002
     end_asc_grad2d: float = 0.001
@@ -180,12 +205,114 @@ class AdaptiveStrategy(DefaultStrategy):
 
     def _initialize_learning_components(self, device) -> None:
         if self.use_learned_densification and self.ac_net is None:
-            self.ac_net = ActorCriticNetwork(input_dim=18).to(device)
-            self.ac_optimizer = torch.optim.AdamW(
-                self.ac_net.parameters(), lr=1e-4, weight_decay=1e-5
+            raw_feature_dim = 18
+
+            self.gnn_net = GaussianGraphNetwork(
+                input_dim=raw_feature_dim,
+                hidden_dim=self.gnn_hidden_dim,
+                output_dim=self.gnn_embedding_dim,
+            ).to(device)
+
+            self.ac_net = ActorCriticNetwork(input_dim=self.gnn_embedding_dim).to(device)
+            combined_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
+            self.combined_optimizer = torch.optim.AdamW(
+                combined_params, lr=1e-4, weight_decay=1e-5
             )
             if self.verbose:
-                print("Initialized Actor-Critic Network.")
+                print("Initialized Actor-Critic Network and GNN for learned densification.")
+
+    @torch.no_grad()
+    def _get_raw_features(
+            self, params: dict, state: dict, subset_mask: Tensor, step: int
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        num_subset = subset_mask.sum().item()
+        device = params["means"].device
+
+        means3d_subset = params["means"][subset_mask]
+        if state.get("photometric_error_map") is None:
+            if self.verbose:
+                print("Skipping feature extraction: photometric error map is not available.")
+
+            return None, None, None, None, None
+
+        h, w = state["photometric_error_map"].shape
+        patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask = self._project_to_patch_coords(
+            means3d_subset, state["view_proj_matrix"], h, w
+        )
+
+        feature_dim = 18
+        features = torch.zeros(num_subset, feature_dim, device=device)
+
+        opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
+        features[:, 0] = opacities_subset
+        scales = torch.exp(params["scales"][subset_mask])
+        features[:, 1] = scales.max(dim=-1).values / state["scene_scale"]
+        features[:, 2] = scales.min(dim=-1).values / state["scene_scale"]
+        features[:, 3] = scales.mean(dim=-1) / state["scene_scale"]
+        features[:, 4] = torch.norm(params["sh0"][subset_mask], dim=(-1, -2))
+
+        valid_indices = torch.where(valid_mask)[0]
+        if valid_indices.numel() > 0:
+            features[valid_indices, 5] = state["photometric_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+            if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
+                features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+            if state.get("quality_heatmap") is not None:
+                features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
+
+        if self.knn_fn is not None and len(params["means"]) > self.redundancy_knn:
+            dists, idxs = self.knn_fn(means3d_subset, K=self.redundancy_knn + 1)
+            neighbor_idxs = idxs[:, 1:]
+
+            features[:, 8] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
+
+            neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
+            neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
+            neighbor_sh0 = params["sh0"][neighbor_idxs].squeeze(-2)
+
+            sh0_subset = params["sh0"][subset_mask]
+
+            features[:, 9] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
+            features[:, 10] = neighbor_opacities.mean(dim=-1)
+            features[:, 11] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
+
+        current_grad = state["grad2d"][subset_mask] / state["count"][subset_mask].clamp_min(1)
+        features[:, 12] = current_grad
+
+        if state.get("prev_grad2d") is not None and state.get("prev_opacity") is not None:
+            time_delta = self.refine_every
+            prev_grad_subset = state["prev_grad2d"][subset_mask]
+            prev_opacity_subset = state["prev_opacity"][subset_mask]
+
+            features[:, 13] = (current_grad - prev_grad_subset) / time_delta
+            features[:, 14] = (opacities_subset - prev_opacity_subset) / time_delta
+
+        if state.get("significance") is not None and state["significance"].numel() == len(subset_mask):
+            features[:, 15] = state["significance"][subset_mask]
+
+        features[:, 16] = step / self.refine_stop_iter
+
+        if state.get("age") is not None:
+            features[:, 17] = state["age"][subset_mask].float() / self.refine_stop_iter
+
+        return torch.nan_to_num(features, 0.0), pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y, valid_mask
+
+
+    @torch.no_grad()
+    def _get_graph_representation(
+            self, params: dict, state: dict, subset_mask: Tensor, step: int
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        raw_features, px, py, ptx, pty, valid_mask = self._get_raw_features(params, state, subset_mask, step)
+
+        if raw_features is None:
+            return None, None, None, None, None, None
+
+        subset_means = params["means"][subset_mask]
+        edge_index = knn_graph(subset_means, k=self.gnn_knn, loop=True)
+
+        self.gnn_net.eval()
+        graph_embeddings = self.gnn_net(raw_features, edge_index)
+
+        return graph_embeddings, px, py, ptx, pty, valid_mask
 
     def step_post_backward(
             self,
@@ -483,80 +610,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         return patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask
 
-    @torch.no_grad()
-    def _get_gaussian_features(
-            self, params: dict, state: dict, subset_mask: Tensor, step: int
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        num_subset = subset_mask.sum().item()
-        device = params["means"].device
-
-        means3d_subset = params["means"][subset_mask]
-        if state.get("photometric_error_map") is None:
-            if self.verbose:
-                print("Skipping feature extraction: photometric error map is not available.")
-
-            return None, None, None, None, None
-
-        h, w = state["photometric_error_map"].shape
-        patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask = self._project_to_patch_coords(
-            means3d_subset, state["view_proj_matrix"], h, w
-        )
-
-        feature_dim = 18
-        features = torch.zeros(num_subset, feature_dim, device=device)
-
-        opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
-        features[:, 0] = opacities_subset
-        scales = torch.exp(params["scales"][subset_mask])
-        features[:, 1] = scales.max(dim=-1).values / state["scene_scale"]
-        features[:, 2] = scales.min(dim=-1).values / state["scene_scale"]
-        features[:, 3] = scales.mean(dim=-1) / state["scene_scale"]
-        features[:, 4] = torch.norm(params["sh0"][subset_mask], dim=(-1, -2))
-
-        valid_indices = torch.where(valid_mask)[0]
-        if valid_indices.numel() > 0:
-            features[valid_indices, 5] = state["photometric_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
-            if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
-                features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
-            if state.get("quality_heatmap") is not None:
-                features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
-
-        if self.knn_fn is not None and len(params["means"]) > self.redundancy_knn:
-            dists, idxs = self.knn_fn(means3d_subset, K=self.redundancy_knn + 1)
-            neighbor_idxs = idxs[:, 1:]
-
-            features[:, 8] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
-
-            neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
-            neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
-            neighbor_sh0 = params["sh0"][neighbor_idxs].squeeze(-2)
-
-            sh0_subset = params["sh0"][subset_mask]
-
-            features[:, 9] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
-            features[:, 10] = neighbor_opacities.mean(dim=-1)
-            features[:, 11] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
-
-        current_grad = state["grad2d"][subset_mask] / state["count"][subset_mask].clamp_min(1)
-        features[:, 12] = current_grad
-
-        if state.get("prev_grad2d") is not None and state.get("prev_opacity") is not None:
-            time_delta = self.refine_every
-            prev_grad_subset = state["prev_grad2d"][subset_mask]
-            prev_opacity_subset = state["prev_opacity"][subset_mask]
-
-            features[:, 13] = (current_grad - prev_grad_subset) / time_delta
-            features[:, 14] = (opacities_subset - prev_opacity_subset) / time_delta
-
-        if state.get("significance") is not None and state["significance"].numel() == len(subset_mask):
-            features[:, 15] = state["significance"][subset_mask]
-
-        features[:, 16] = step / self.refine_stop_iter
-
-        if state.get("age") is not None:
-            features[:, 17] = state["age"][subset_mask].float() / self.refine_stop_iter
-
-        return torch.nan_to_num(features, 0.0), pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y, valid_mask
 
     def _process_hindsight_buffer(self, state, current_step):
         if state.get("photometric_error_map") is None:
@@ -598,25 +651,23 @@ class AdaptiveStrategy(DefaultStrategy):
         if len(state["replay_buffer"]) < 256:
             return
 
+        self.gnn_net.train()
         self.ac_net.train()
         device = next(self.ac_net.parameters()).device
 
         batch_indices = torch.randint(0, len(state["replay_buffer"]), (256,))
         batch = [state["replay_buffer"][i] for i in batch_indices]
 
-        features = torch.stack([x[0] for x in batch]).to(device)
+        graph_embeddings = torch.stack([x[0] for x in batch]).to(device)
         actions_taken = torch.stack([x[1] for x in batch]).to(device)
         rewards = torch.stack([x[2] for x in batch]).to(device)
 
-        action_logits, predicted_values, _ = self.ac_net(features)
+        action_logits, predicted_values, _ = self.ac_net(graph_embeddings)
 
         critic_loss = F.mse_loss(predicted_values, rewards)
-
         advantage = (rewards - predicted_values).detach()
-
         log_probs = F.log_softmax(action_logits, dim=-1)
         log_prob_for_action = log_probs.gather(1, actions_taken.unsqueeze(-1)).squeeze(-1)
-
         policy_gradient_loss = -(log_prob_for_action * advantage).mean()
 
         probs = F.softmax(action_logits, dim=-1)
@@ -625,10 +676,11 @@ class AdaptiveStrategy(DefaultStrategy):
 
         loss = critic_loss + self.actor_loss_weight * policy_gradient_loss + entropy_loss
 
-        self.ac_optimizer.zero_grad()
+        self.combined_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
-        self.ac_optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
+        self.combined_optimizer.step()
 
         if self.verbose:
             print(f"AC Loss: {loss.item():.4f} (Critic: {critic_loss.item():.4f}, PG: {policy_gradient_loss.item():.4f})")
@@ -644,18 +696,18 @@ class AdaptiveStrategy(DefaultStrategy):
 
         subset_indices = torch.where(subset_mask)[0]
 
-        features, px, py, ptx, pty, valid_mask_subset = self._get_gaussian_features(params, state, subset_mask, step)
-        if features is None:
+        graph_embeddings, px, py, ptx, pty, valid_mask_subset = self._get_graph_representation(params, state,
+                                                                                             subset_mask, step)
+        if graph_embeddings is None:
             return 0,0,0
 
         self.ac_net.eval()
-        action_logits, _, continuous_params = self.ac_net(features)
+        action_logits, _, continuous_params = self.ac_net(graph_embeddings)
 
-        age_feature_normalized = features[:, 17]
-        age_in_steps = age_feature_normalized * self.refine_stop_iter
-        is_too_young_to_prune = age_in_steps < 500
-        action_logits[is_too_young_to_prune, 0] = -1e9
-
+        # age_feature_normalized = graph_embeddings[:, 17]
+        # age_in_steps = age_feature_normalized * self.refine_stop_iter
+        # is_too_young_to_prune = age_in_steps < 500
+        # action_logits[is_too_young_to_prune, 0] = -1e9
 
         dist = Categorical(logits=action_logits)
         actions = dist.sample()

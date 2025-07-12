@@ -456,7 +456,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
             photometric_error_map = feats_render
         else:
-            photometric_error_map = F.l1_loss(rendered_train_view, gt_image)
+            photometric_error_map = F.l1_loss(rendered_train_view, gt_image).squeeze()
 
         if state["photometric_error_map"] is None:
             state["photometric_error_map"] = photometric_error_map

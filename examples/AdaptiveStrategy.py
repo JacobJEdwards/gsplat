@@ -53,38 +53,6 @@ class ActorCriticNetwork(nn.Module):
 
         return action_logits, value, processed_continuous_params
 
-class DensificationNetwork(nn.Module):
-    def __init__(self, input_dim: int = 18, mlp_width: int = 64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, mlp_width),
-            nn.LayerNorm(mlp_width),
-            nn.PReLU(),
-            nn.Linear(mlp_width, mlp_width),
-            nn.LayerNorm(mlp_width),
-            nn.PReLU(),
-            nn.Linear(mlp_width, 1)
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.net(x)
-
-class PruningNetwork(nn.Module):
-    def __init__(self, input_dim: int = 18, mlp_width: int = 64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, mlp_width),
-            nn.LayerNorm(mlp_width),
-            nn.PReLU(),
-            nn.Linear(mlp_width, mlp_width),
-            nn.LayerNorm(mlp_width),
-            nn.PReLU(),
-            nn.Linear(mlp_width, 1)
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.net(x)
-
 class PatchBasedNRQM(nn.Module):
     def __init__(self):
         super().__init__()
@@ -128,11 +96,11 @@ class AdaptiveStrategy(DefaultStrategy):
     prune_every: int = 400
     nrqm_every: int = 1000
 
-    max_splits_per_step: int = 50000
-    max_duplications_per_step: int = 50000
+    max_splits_per_step: int = 1_000_000
+    max_duplications_per_step: int = 1_000_000
 
-    subset_fraction: float = 1.0
-    max_densification_subset: int = 200_000
+    subset_fraction: float = 0.2
+    max_densification_subset: int = 1_000_000
 
     nrqm_patch_size: int = 32
     nrqm_stagnation_threshold: float = 0.3
@@ -158,7 +126,7 @@ class AdaptiveStrategy(DefaultStrategy):
     hindsight_delay: int = 100
 
     actor_loss_weight: float = 1.0
-    entropy_loss_weight: float = 0.05
+    entropy_loss_weight: float = 0.1
     continuous_loss_weight: float = 0.5
 
     use_learned_pruning: bool = True
@@ -170,7 +138,7 @@ class AdaptiveStrategy(DefaultStrategy):
     pruning_optimizer: Any = field(default=None, repr=False)
 
     w_photometric: float = 1.0
-    w_quality: float = -0.5
+    w_quality: float = -1.0
     w_uncertainty: float = 1.0
 
     rasterizer_fn: Any = field(default=None, repr=False)
@@ -684,6 +652,12 @@ class AdaptiveStrategy(DefaultStrategy):
 
         self.ac_net.eval()
         action_logits, _, continuous_params = self.ac_net(features)
+
+        age_feature_normalized = features[:, 17]
+        age_in_steps = age_feature_normalized * self.refine_stop_iter
+        is_too_young_to_prune = age_in_steps < 500
+        action_logits[is_too_young_to_prune, 0] = -1e9
+
 
         dist = Categorical(logits=action_logits)
         actions = dist.sample()

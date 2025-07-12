@@ -628,14 +628,6 @@ class AdaptiveStrategy(DefaultStrategy):
                             self.w_quality * reward_quality +
                             self.w_uncertainty * reward_uncertainty)
 
-            action = experience["action"]
-
-            if action == 0:
-                final_reward -= 0.01
-
-            elif action == 2 or action == 3:
-                final_reward += 0.01
-
             if len(state["replay_buffer"]) < state["replay_buffer"].maxlen:
                 state["replay_buffer"].append((experience["features"], experience["action"], final_reward.clone().detach()))
 

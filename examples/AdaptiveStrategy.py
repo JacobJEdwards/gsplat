@@ -18,6 +18,40 @@ from gsplat.strategy.ops import (
 from gsplat.strategy.default import DefaultStrategy
 from ops import split
 
+class ActorCriticNetwork(nn.Module):
+    def __init__(self, input_dim: int = 18, mlp_width: int = 64):
+        super().__init__()
+        self.base_net = nn.Sequential(
+            nn.Linear(input_dim, mlp_width),
+            nn.LayerNorm(mlp_width),
+            nn.PReLU(),
+            nn.Linear(mlp_width, mlp_width),
+            nn.LayerNorm(mlp_width),
+            nn.PReLU(),
+        )
+
+        self.critic_head = nn.Linear(mlp_width, 1)
+
+        self.actor_discrete_head = nn.Linear(mlp_width, 4)
+
+        self.actor_continuous_head = nn.Linear(mlp_width, 2)
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        base_features = self.base_net(x)
+
+        value = self.critic_head(base_features).squeeze(-1)
+
+        action_logits = self.actor_discrete_head(base_features)
+
+        continuous_params = self.actor_continuous_head(base_features)
+
+        split_ratio = 1.2 + 2.0 * torch.sigmoid(continuous_params[:, 0])
+        dupe_offset_mag = torch.sigmoid(continuous_params[:, 1])
+
+        processed_continuous_params = torch.stack([split_ratio, dupe_offset_mag], dim=-1)
+
+        return action_logits, value, processed_continuous_params
+
 class DensificationNetwork(nn.Module):
     def __init__(self, input_dim: int = 18, mlp_width: int = 64):
         super().__init__()
@@ -750,11 +784,12 @@ class AdaptiveStrategy(DefaultStrategy):
             if self.verbose:
                 print(f"Split {n_split} Gaussians in {time.time() - t:.2f} seconds.")
 
-        if n_dupli > 0 or n_split > 0:
-            if n_dupli > 0:
-                state_to_densify["age"][-n_dupli:] = 0
 
         state.update(state_to_densify)
+
+        if n_dupli > 0 or n_split > 0:
+            if n_dupli > 0:
+                state["age"][-n_dupli:] = 0
 
         state["prev_grad2d"] = state["grad2d"] / state["count"].clamp_min(1)
         state["prev_opacity"] = torch.sigmoid(params["opacities"].flatten())

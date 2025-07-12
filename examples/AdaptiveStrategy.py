@@ -318,23 +318,22 @@ class AdaptiveStrategy(DefaultStrategy):
         return state
 
     def _initialize_learning_components(self, device) -> None:
-        if self.use_learned_densification and self.ac_net is None:
-            raw_feature_dim = 18
+        raw_feature_dim = 18
 
-            self.gnn_net = GaussianGraphNetwork(
-                input_dim=raw_feature_dim,
-                hidden_dim=self.gnn_hidden_dim,
-                output_dim=self.gnn_embedding_dim,
-            ).to(device)
+        self.gnn_net = GaussianGraphNetwork(
+            input_dim=raw_feature_dim,
+            hidden_dim=self.gnn_hidden_dim,
+            output_dim=self.gnn_embedding_dim,
+        ).to(device)
 
-            ac_input_dim = self.gnn_embedding_dim + self.num_global_features
+        ac_input_dim = self.gnn_embedding_dim + self.num_global_features
 
-            self.ac_net = ActorCriticNetwork(input_dim=ac_input_dim).to(device)
+        self.ac_net = ActorCriticNetwork(input_dim=ac_input_dim).to(device)
 
-            combined_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
-            self.combined_optimizer = torch.optim.AdamW(
-                combined_params, lr=1e-4, weight_decay=1e-5
-            )
+        combined_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
+        self.combined_optimizer = torch.optim.AdamW(
+            combined_params, lr=1e-4, weight_decay=1e-5
+        )
 
     @torch.no_grad()
     def _get_raw_features(
@@ -455,12 +454,10 @@ class AdaptiveStrategy(DefaultStrategy):
             state["significance"] = torch.zeros(params["means"].shape[0], device=params["means"].device)
 
 
-        if self.use_learned_densification and self.densification_net is None:
+        if self.use_learned_densification and self.ac_net is None:
             self._initialize_learning_components(params["means"].device)
         if self.nrqm_model is None:
             self.nrqm_model = PatchBasedNRQM().to(params["means"].device)
-        if self.knn_fn is None:
-            self.knn_fn = knn_with_ids
 
         if "gaussian_contribution" in info:
             current_significance = info["gaussian_contribution"]

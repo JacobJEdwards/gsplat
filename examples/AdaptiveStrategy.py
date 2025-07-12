@@ -3,15 +3,14 @@ from dataclasses import dataclass, field
 import time
 from typing import Any
 from approx_topk import topk
-import numpy as np
 
 import piq
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Normal, Bernoulli
 
-from torch_geometric.nn import GATConv, knn_graph
+from torch_geometric.nn import GATConv, knn_graph, TransformerConv
 
 from gsplat.utils import normalized_quat_to_rotmat
 from utils import PrioritizedReplayBuffer
@@ -22,21 +21,19 @@ from gsplat.strategy.ops import (
 from gsplat.strategy.default import DefaultStrategy
 from ops import split, duplicate, merge
 
-
 class GaussianGraphNetwork(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int = 2):
+    def __init__(self, input_dim: int, edge_dim: int, hidden_dim: int, output_dim: int, num_layers: int = 2):
         super().__init__()
         self.convs = nn.ModuleList()
-        self.convs.append(GATConv(input_dim, hidden_dim, heads=2))
+        self.convs.append(TransformerConv(input_dim, hidden_dim, heads=2, edge_dim=edge_dim))
         for _ in range(num_layers - 2):
-            self.convs.append(GATConv(hidden_dim * 2, hidden_dim, heads=2))
-        self.convs.append(GATConv(hidden_dim * 2, output_dim, concat=False))
-
+            self.convs.append(TransformerConv(hidden_dim * 2, hidden_dim, heads=2, edge_dim=edge_dim))
+        self.convs.append(TransformerConv(hidden_dim * 2, output_dim, concat=False, edge_dim=edge_dim))
         self.prelu = nn.PReLU()
 
-    def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
+    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
         for i, conv in enumerate(self.convs):
-            x = conv(x, edge_index)
+            x = conv(x, edge_index, edge_attr)
             if i < len(self.convs) - 1:
                 x = self.prelu(x)
         return x
@@ -54,26 +51,63 @@ class ActorCriticNetwork(nn.Module):
         )
 
         self.critic_head = nn.Linear(mlp_width, 1)
-
-        self.actor_discrete_head = nn.Linear(mlp_width, 5)
-
-        self.actor_continuous_head = nn.Linear(mlp_width, 2)
+        self.actor_discrete_head = nn.Linear(mlp_width, 4)
+        self.actor_continuous_head = nn.Linear(mlp_width, 8)
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         base_features = self.base_net(x)
-
         value = self.critic_head(base_features).squeeze(-1)
-
         action_logits = self.actor_discrete_head(base_features)
 
         continuous_params = self.actor_continuous_head(base_features)
-
         split_ratio = 1.2 + 2.0 * torch.sigmoid(continuous_params[:, 0])
         dupe_offset_mag = torch.sigmoid(continuous_params[:, 1])
+        split_dir = F.normalize(continuous_params[:, 2:5], dim=-1)
+        dupe_dir = F.normalize(continuous_params[:, 5:8], dim=-1)
 
-        processed_continuous_params = torch.stack([split_ratio, dupe_offset_mag], dim=-1)
-
+        processed_continuous_params = torch.cat([
+            split_ratio.unsqueeze(-1), dupe_offset_mag.unsqueeze(-1), split_dir, dupe_dir
+        ], dim=-1)
         return action_logits, value, processed_continuous_params
+
+class PruningActorCritic(nn.Module):
+    """A dedicated agent for the binary decision of pruning a Gaussian."""
+    def __init__(self, input_dim: int = 18, mlp_width: int = 64):
+        super().__init__()
+        self.base_net = nn.Sequential(
+            nn.Linear(input_dim, mlp_width),
+            nn.LayerNorm(mlp_width), nn.SELU(),
+            nn.Linear(mlp_width, mlp_width),
+            nn.LayerNorm(mlp_width), nn.SELU(),
+        )
+        self.critic_head = nn.Linear(mlp_width, 1)
+        self.actor_head = nn.Linear(mlp_width, 1)
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        base_features = self.base_net(x)
+        value = self.critic_head(base_features).squeeze(-1)
+        action_logit = self.actor_head(base_features).squeeze(-1)
+        return action_logit, value
+
+class ICMModule(nn.Module):
+    """Intrinsic Curiosity Module to encourage exploration."""
+    def __init__(self, feature_dim: int, action_dim: int, mlp_width: int = 64):
+        super().__init__()
+        # s_t, s_{t+1} -> a_t
+        self.inverse_model = nn.Sequential(
+            nn.Linear(feature_dim * 2, mlp_width), nn.SELU(),
+            nn.Linear(mlp_width, action_dim)
+        )
+        # s_t, a_t -> s_{t+1}
+        self.forward_model = nn.Sequential(
+            nn.Linear(feature_dim + action_dim, mlp_width), nn.SELU(),
+            nn.Linear(mlp_width, feature_dim)
+        )
+
+    def forward(self, state, next_state, action_one_hot):
+        pred_next_state = self.forward_model(torch.cat([state, action_one_hot], dim=-1))
+        pred_action_logits = self.inverse_model(torch.cat([state, next_state], dim=-1))
+        return pred_next_state, pred_action_logits
 
 class PatchBasedNRQM(nn.Module):
     def __init__(self, model_name: str = "clipiqa"):
@@ -132,23 +166,57 @@ class AdaptiveStrategy(DefaultStrategy):
     prune_every: int = 400
     nrqm_every: int = 1000
 
-    gnn_knn: int = 8
+    gnn_knn: int = 10
+    gnn_edge_dim: int = 4
     gnn_hidden_dim: int = 32
     gnn_embedding_dim: int = 16
+    num_global_features: int = 5
+    use_learned_strategy: bool = True
+    bootstrap_steps: int = 5000
 
-    num_global_features: int = 3
+    densify_learn_every: int = 200
+    densify_hindsight_delay: int = 400
+    actor_loss_weight: float = 1.0
+    entropy_loss_weight: float = 0.1
+    start_exploration_epsilon: float = 0.3
+    end_exploration_epsilon: float = 0.05
+    exploration_decay_steps: int = 15000
 
-    max_splits_per_step: int = 1_000_000
-    max_duplications_per_step: int = 1_000_000
+    use_learned_pruning: bool = True
+    pruning_learn_every: int = 500
+    pruning_hindsight_delay: int = 800
+    prune_threshold: float = 0.6
+
+    use_curiosity: bool = True
+    curiosity_weight: float = 0.05
+    icm_action_dim: int = 4
 
     subset_fraction: float = 0.2
     max_densification_subset: int = 1_000_000
+    prune_significance_threshold: float = 0.01
+    action_cost_weight: float = 0.001
+    w_photometric: float = 1.0
+    w_quality: float = -1.0
+    w_uncertainty: float = 1.0
+    ppo_clip_epsilon: float = 0.2
+
+    gnn_net: Any = field(default=None, repr=False)
+    ac_net: Any = field(default=None, repr=False)
+    pruning_ac_net: Any = field(default=None, repr=False)
+    icm_module: Any = field(default=None, repr=False)
+
+    densify_optimizer: Any = field(default=None, repr=False)
+    pruning_optimizer: Any = field(default=None, repr=False)
+    icm_optimizer: Any = field(default=None, repr=False)
+
+    rasterizer_fn: Any = field(default=None, repr=False)
+    nrqm_model: Any = field(default=None, repr=False)
+
 
     nrqm_patch_size: int = 32
     nrqm_stagnation_threshold: float = 0.3
     nrqm_prune_stagnant_after: int = 15
     nrqm_ema_decay: float = 0.9
-    prune_significance_threshold: float = 0.01
 
     anisotropic_split: bool = True
     prune_redundant: bool = True
@@ -162,61 +230,35 @@ class AdaptiveStrategy(DefaultStrategy):
 
     photometric_error_thresh: float = 0.1
 
-    use_learned_densification: bool = True
-    bootstrap_steps: int = 5000
     learn_every: int = 200
     hindsight_delay: int = 400
 
-    actor_loss_weight: float = 1.0
-    entropy_loss_weight: float = 0.1
     continuous_loss_weight: float = 0.5
 
-    action_cost_weight: float = 0.001
-
-    start_exploration_epsilon: float = 0.3
-    end_exploration_epsilon: float = 0.05
-    exploration_decay_steps: int = 15000
-
-    use_learned_pruning: bool = True
     pruning_bootstrap_steps: int = 5000
-    pruning_learn_every: int = 500
     learned_prune_threshold: float = 0.5
 
     pruning_net: Any = field(default=None, repr=False)
-    pruning_optimizer: Any = field(default=None, repr=False)
 
-    w_photometric: float = 1.0
-    w_quality: float = -1.0
-    w_uncertainty: float = 1.0
-
-    rasterizer_fn: Any = field(default=None, repr=False)
-    nrqm_model: Any = field(default=None, repr=False)
     knn_fn: Any = field(default=None, repr=False)
     lpips_metric: Any = field(default=None, repr=False)
 
-    gnn_net: Any = field(default=None, repr=False)
-    ac_net: Any = field(default=None, repr=False)
     combined_optimizer: Any = field(default=None, repr=False)
 
     start_asc_grad2d: float = 0.0002
     end_asc_grad2d: float = 0.001
-
-    ppo_clip_epsilon: float = 0.2
 
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
         state.update({
             "quality_heatmap": None,
             "view_proj_matrix": None,
-            "stagnation_count": None,
-            "last_nrqm_step": -1,
-            "last_prune_count": -1,
-            "dynamic_grow_grad2d": self.grow_grad2d,
             "photometric_error_map": None,
             "geom_uncertainty_map": None,
-            "replay_buffer": PrioritizedReplayBuffer(capacity=20_000),
-            "hindsight_buffer": deque(maxlen=5_000),
-            "pruning_replay_buffer": deque(maxlen=20_000),
+            "densify_replay_buffer": PrioritizedReplayBuffer(capacity=20_000),
+            "densify_hindsight_buffer": deque(maxlen=5_000),
+            "pruning_replay_buffer": PrioritizedReplayBuffer(capacity=10_000),
+            "pruning_hindsight_buffer": deque(maxlen=2_500),
             "significance": None,
             "prev_grad2d": None,
             "prev_opacity": None,
@@ -228,21 +270,28 @@ class AdaptiveStrategy(DefaultStrategy):
 
     def _initialize_learning_components(self, device) -> None:
         raw_feature_dim = 18
-
-        self.gnn_net = GaussianGraphNetwork(
-            input_dim=raw_feature_dim,
-            hidden_dim=self.gnn_hidden_dim,
-            output_dim=self.gnn_embedding_dim,
-        ).to(device)
-
         ac_input_dim = self.gnn_embedding_dim + self.num_global_features
 
-        self.ac_net = ActorCriticNetwork(input_dim=ac_input_dim).to(device)
+        self.gnn_net = GaussianGraphNetwork(
+            input_dim=raw_feature_dim, edge_dim=self.gnn_edge_dim,
+            hidden_dim=self.gnn_hidden_dim, output_dim=self.gnn_embedding_dim,
+        ).to(device)
 
-        combined_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
-        self.combined_optimizer = torch.optim.AdamW(
-            combined_params, lr=1e-4, weight_decay=1e-5
-        )
+        self.ac_net = ActorCriticNetwork(input_dim=ac_input_dim).to(device)
+        densify_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
+        self.densify_optimizer = torch.optim.AdamW(densify_params, lr=1e-4, weight_decay=1e-5)
+
+        if self.use_learned_pruning:
+            self.pruning_ac_net = PruningActorCritic(input_dim=ac_input_dim).to(device)
+            pruning_params = list(self.gnn_net.parameters()) + list(self.pruning_ac_net.parameters())
+            self.pruning_optimizer = torch.optim.AdamW(pruning_params, lr=5e-5, weight_decay=1e-5)
+
+        if self.use_curiosity:
+            self.icm_module = ICMModule(
+                feature_dim=ac_input_dim, action_dim=self.icm_action_dim
+            ).to(device)
+            self.icm_optimizer = torch.optim.AdamW(self.icm_module.parameters(), lr=1e-4)
+
 
     @torch.no_grad()
     def _get_raw_features(
@@ -328,19 +377,39 @@ class AdaptiveStrategy(DefaultStrategy):
     @torch.no_grad()
     def _get_graph_representation(
             self, params: dict, state: dict, subset_mask: Tensor, step: int
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, tuple, Tensor]:
         raw_features, px, py, ptx, pty, valid_mask = self._get_raw_features(params, state, subset_mask, step)
 
         if raw_features is None:
-            return None, None, None, None, None, None
+            return None, None, None
 
         subset_means = params["means"][subset_mask]
         edge_index = knn_graph(subset_means, k=self.gnn_knn, loop=True)
 
-        self.gnn_net.eval()
-        graph_embeddings = self.gnn_net(raw_features, edge_index)
+        row, col = edge_index
+        means_i, means_j = subset_means[row], subset_means[col]
 
-        return graph_embeddings, px, py, ptx, pty, valid_mask
+        rel_dist = torch.norm(means_i - means_j, dim=-1) / state["scene_scale"]
+
+        scales_i = torch.exp(params["scales"][subset_mask][row]).mean(dim=-1)
+        scales_j = torch.exp(params["scales"][subset_mask][col]).mean(dim=-1)
+        scale_diff = torch.abs(scales_i - scales_j) / state["scene_scale"]
+
+        opacities_i = torch.sigmoid(params["opacities"][subset_mask][row].flatten())
+        opacities_j = torch.sigmoid(params["opacities"][subset_mask][col].flatten())
+        opacity_diff = torch.abs(opacities_i - opacities_j)
+
+        sh0_i = params["sh0"][subset_mask][row].squeeze(-2)
+        sh0_j = params["sh0"][subset_mask][col].squeeze(-2)
+        color_diff = torch.norm(sh0_i - sh0_j, dim=-1)
+
+        edge_attr = torch.stack([rel_dist, scale_diff, opacity_diff, color_diff], dim=-1)
+        edge_attr = torch.nan_to_num(edge_attr, 0.0)
+
+        self.gnn_net.eval()
+        graph_embeddings = self.gnn_net(raw_features, edge_index, edge_attr)
+
+        return graph_embeddings, (px, py, ptx, pty, valid_mask), raw_features
 
     def step_post_backward(
             self,
@@ -354,19 +423,16 @@ class AdaptiveStrategy(DefaultStrategy):
         if step >= self.refine_stop_iter:
             return
 
-        state["l1_loss_map"] = info.get("l1_loss_map")
-
+        if self.ac_net is None and self.use_learned_strategy:
+            self._initialize_learning_components(params["means"].device)
         if state.get("age") is None:
             state["age"] = torch.zeros(params["means"].shape[0], dtype=torch.int32, device=params["means"].device)
-
         if state.get("significance") is None:
             state["significance"] = torch.zeros(params["means"].shape[0], device=params["means"].device)
-
-
-        if self.use_learned_densification and self.ac_net is None:
-            self._initialize_learning_components(params["means"].device)
         if self.nrqm_model is None:
             self.nrqm_model = PatchBasedNRQM().to(params["means"].device)
+
+        state["l1_loss_map"] = info.get("l1_loss_map")
 
         if "gaussian_contribution" in info:
             current_significance = info["gaussian_contribution"]
@@ -379,21 +445,18 @@ class AdaptiveStrategy(DefaultStrategy):
 
             state["significance"] = 0.9 * state["significance"] + 0.1 * current_significance
 
+        if step > self.refine_start_iter:
+            state["age"] += 1
 
-        should_update_maps = (state["last_nrqm_step"] == -1 and step > 0) or \
-                             (step % self.nrqm_every == 0)
-
-        if should_update_maps:
+        if (state.get("view_proj_matrix") is None and step > 0) or (step % self.nrqm_every == 0):
             self._update_quality_map(params, state, info)
             state["last_nrqm_step"] = step
 
-        if self.use_learned_densification:
-            self._process_hindsight_buffer(state, step)
+
+        self._process_hindsight_buffer(state, step)
 
         self._update_state(params, state, info, packed=packed)
 
-        if step > self.refine_start_iter:
-            state["age"] += 1
 
         if step > self.refine_start_iter:
             if step % self.refine_every == 0:
@@ -405,21 +468,17 @@ class AdaptiveStrategy(DefaultStrategy):
                     print(
                         f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split, {n_prune} GSs pruned, {n_merge} GSs merged."
                     )
-                # n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
-                # if self.verbose:
-                #     print(
-                #         f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
-                #         f"Now having {len(params['means'])} GSs."
-                #         f"Took {time.time() - t:.2f} seconds."
-                #     )
 
+        if step > self.bootstrap_steps:
+            if step % self.densify_learn_every == 0:
+                self._train_densification_agent(state)
+            if self.use_learned_pruning and step % self.pruning_learn_every == 0:
+                self._train_pruning_agent(state)
 
         if step % self.reset_every == 0 and step > 0:
             reset_opa(params=params, optimizers=optimizers, state=state, value=self.prune_opa * 2.0)
 
 
-        if self.use_learned_densification and step > 1000 and step % self.learn_every == 0:
-            self._train_actor_critic(state)
 
     def _update_state(
             self,
@@ -638,7 +697,7 @@ class AdaptiveStrategy(DefaultStrategy):
         if state.get("photometric_error_map") is None:
             return
 
-        while state["hindsight_buffer"] and (current_step - state["hindsight_buffer"][0]["step"]) >= self.hindsight_delay:
+        while state["densify_hindsight_buffer"] and (current_step - state["densify_hindsight_buffer"][0]["step"]) >= self.densify_hindsight_delay:
             experience = state["hindsight_buffer"].popleft()
             px, py = experience["pixel_coords"]
             patch_x, patch_y = experience["patch_coords"]
@@ -665,25 +724,29 @@ class AdaptiveStrategy(DefaultStrategy):
                             + action_reward
                             )
 
-            if len(state["replay_buffer"]) < state["replay_buffer"].capacity:
-                exp_tuple = (
-                    experience["features"],
-                    experience["action"],
-                    final_reward.clone().detach(),
-                    experience["log_prob"]
-                )
-                state["replay_buffer"].add(exp_tuple)
+            if self.use_curiosity:
+                pass # todo: do this
+
+            state["densify_replay_buffer"].add((experience["features"], experience["action"], final_reward,
+                                                experience["log_prob"]))
+
+        if self.use_learned_pruning:
+            while state["pruning_hindsight_buffer"] and (current_step - state["pruning_hindsight_buffer"][0]["step"]) >= self.pruning_hindsight_delay:
+                # todo: improve
+                exp = state["pruning_hindsight_buffer"].popleft()
+                current_error = state["l1_loss_map"][max(0, exp["py"]-2):exp["py"]+3, max(0, exp["px"]-2):exp["px"]+3].mean()
+                pruning_reward = exp["initial_error"] - current_error
+                state["pruning_replay_buffer"].add((exp["features"], exp["action"], pruning_reward, exp["log_prob"]))
 
 
-    def _train_actor_critic(self, state: dict[str, Any]):
-        if len(state["replay_buffer"]) < 256:
-            return
+    def _train_densification_agent(self, state: dict[str, Any]):
+        if len(state["densify_replay_buffer"]) < 256: return
 
         self.gnn_net.train()
         self.ac_net.train()
         device = next(self.ac_net.parameters()).device
 
-        batch, tree_idxs, is_weights = state["replay_buffer"].sample(256)
+        batch, tree_idxs, is_weights = state["densify_replay_buffer"].sample(256)
         is_weights = torch.tensor(is_weights, device=device, dtype=torch.float32)
 
         ac_inputs = torch.stack([x[0] for x in batch]).to(device)
@@ -693,13 +756,14 @@ class AdaptiveStrategy(DefaultStrategy):
 
         action_logits, predicted_values, _ = self.ac_net(ac_inputs)
 
-        critic_loss_unreduced = F.mse_loss(predicted_values, rewards, reduction="none")
+        # --- PPO Loss Calculation ---
+        advantage = rewards - predicted_values.detach()
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
-        advantage = (rewards - predicted_values).detach()
+        critic_loss_unreduced = F.mse_loss(predicted_values, rewards, reduction="none")
 
         new_dist = Categorical(logits=action_logits)
         new_log_probs = new_dist.log_prob(actions_taken)
-
         ratio = torch.exp(new_log_probs - old_log_probs)
 
         surr1 = ratio * advantage
@@ -716,191 +780,204 @@ class AdaptiveStrategy(DefaultStrategy):
 
         loss = (total_loss_unreduced * is_weights).mean()
 
-        self.combined_optimizer.zero_grad()
+        self.densify_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
-        self.combined_optimizer.step()
+        self.densify_optimizer.step()
 
-        td_errors = advantage.detach().cpu().numpy()
-        state["replay_buffer"].update_priorities(tree_idxs, td_errors)
+        # Update priorities in the replay buffer
+        td_errors = (rewards - predicted_values).abs().detach().cpu().numpy()
+        state["densify_replay_buffer"].update_priorities(tree_idxs, td_errors)
+
+    def _train_pruning_agent(self, state: dict[str, Any]):
+        if len(state["pruning_replay_buffer"]) < 128: return
+
+        self.gnn_net.train()
+        self.pruning_ac_net.train()
+        device = next(self.pruning_ac_net.parameters()).device
+
+        batch, tree_idxs, is_weights = state["pruning_replay_buffer"].sample(128)
+        is_weights = torch.tensor(is_weights, device=device, dtype=torch.float32)
+
+        ac_inputs = torch.stack([x[0] for x in batch]).to(device)
+        actions_taken = torch.tensor([x[1] for x in batch], device=device, dtype=torch.float32) # Bernoulli actions are float
+        rewards = torch.stack([x[2] for x in batch]).to(device)
+        old_log_probs = torch.stack([x[3] for x in batch]).to(device)
+
+        action_logits, predicted_values = self.pruning_ac_net(ac_inputs)
+
+        # --- PPO Loss Calculation ---
+        advantage = rewards - predicted_values.detach()
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+
+        critic_loss_unreduced = F.mse_loss(predicted_values, rewards, reduction="none")
+
+        new_dist = Bernoulli(logits=action_logits)
+        new_log_probs = new_dist.log_prob(actions_taken)
+        ratio = torch.exp(new_log_probs - old_log_probs)
+
+        surr1 = ratio * advantage
+        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantage
+        actor_loss_unreduced = -torch.min(surr1, surr2)
+
+        entropy_loss_unreduced = -self.entropy_loss_weight * new_dist.entropy()
+
+        total_loss_unreduced = (
+                critic_loss_unreduced +
+                self.actor_loss_weight * actor_loss_unreduced +
+                entropy_loss_unreduced
+        )
+
+        loss = (total_loss_unreduced * is_weights).mean()
+
+        # We only update the pruning head and the shared GNN.
+        # Zero grad both optimizers to be safe, but only step the relevant one.
+        self.densify_optimizer.zero_grad()
+        self.pruning_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.pruning_ac_net.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
+        self.densify_optimizer.step() # Step the main optimizer to update GNN
+        self.pruning_optimizer.step() # Step the pruning optimizer to update its heads
+
+        # Update priorities
+        td_errors = (rewards - predicted_values).abs().detach().cpu().numpy()
+        state["pruning_replay_buffer"].update_priorities(tree_idxs, td_errors)
+
 
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> tuple[int, int, int, int]:
-        num_gaussians = len(params["means"])
+        initial_num_gaussians = len(params["means"])
         device = params["means"].device
+        n_dupli, n_split, n_prune, n_merge = 0, 0, 0, 0
 
-        subset_mask = torch.rand(num_gaussians, device=device) < self.subset_fraction
-        if subset_mask.sum() == 0:
-            return 0,0,0,0
+        subset_mask = torch.rand(initial_num_gaussians, device=device) < self.subset_fraction
+        if subset_mask.sum() == 0: return 0, 0, 0, 0
 
         subset_indices = torch.where(subset_mask)[0]
 
-        graph_embeddings, px, py, ptx, pty, valid_mask_subset = self._get_graph_representation(params, state,
-                                                                                               subset_mask, step)
-        if graph_embeddings is None:
-            return 0,0,0,0
+        graph_embeddings, coords, _ = self._get_graph_representation(params, state, subset_mask, step)
+        if graph_embeddings is None: return 0, 0, 0, 0
+        px, py, ptx, pty, valid_mask_subset = coords
 
-        norm_num_gaussians = min(num_gaussians / 500_000.0, 1.0)
-        avg_quality = state["quality_heatmap"].mean() if state.get("quality_heatmap") is not None else torch.tensor(0.0)
-        avg_significance = state["significance"].mean() if state.get("significance") is not None else torch.tensor(0.0)
-
-        global_context = torch.tensor(
-            [norm_num_gaussians, avg_quality, avg_significance],
-            device=device
-        ).float()
-
+        avg_scale = torch.exp(params['scales']).mean() / state['scene_scale']
+        std_scale = torch.exp(params['scales']).std() / state['scene_scale']
+        global_context = torch.tensor([
+            min(initial_num_gaussians / 500_000.0, 1.0),
+            state.get("quality_heatmap", torch.zeros(1, device=device)).mean(),
+            state.get("significance", torch.zeros(1, device=device)).mean(),
+            avg_scale, std_scale
+        ], device=device).float()
         expanded_global_context = global_context.unsqueeze(0).expand(graph_embeddings.shape[0], -1)
         ac_input = torch.cat([graph_embeddings, expanded_global_context], dim=-1)
+
+        prune_candidate_mask = torch.zeros(len(subset_indices), dtype=torch.bool, device=device)
+        if self.use_learned_pruning:
+            self.pruning_ac_net.eval()
+            prune_logits, _ = self.pruning_ac_net(ac_input)
+            prune_dist = Bernoulli(logits=prune_logits)
+            prune_actions = prune_dist.sample()
+
+            age_in_steps = state["age"][subset_indices]
+            significance = state["significance"][subset_indices]
+            is_too_young = age_in_steps < 800
+            is_too_significant = significance > self.prune_significance_threshold
+
+            prune_candidate_mask = (prune_actions == 1) & ~is_too_young & ~is_too_significant
+
+            for i, original_idx in enumerate(subset_indices):
+                if valid_mask_subset[i] and prune_candidate_mask[i]:
+                    exp = {"step": step, "features": ac_input[i].detach().cpu(), "action": 1,
+                           "log_prob": prune_dist.log_prob(prune_actions[i]).detach().cpu(),
+                           "px": px[i], "py": py[i],
+                           "initial_error": state["l1_loss_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean()}
+                    state["pruning_hindsight_buffer"].append(exp)
 
         self.ac_net.eval()
         action_logits, _, continuous_params = self.ac_net(ac_input)
 
-        dist = Categorical(logits=action_logits)
-
         progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
-        current_epsilon = max(
-            self.end_exploration_epsilon,
-            self.start_exploration_epsilon - (self.start_exploration_epsilon - self.end_exploration_epsilon) * progress
-        )
+        epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)
 
-        if torch.rand(1).item() < current_epsilon:
-            actions = torch.randint_like(subset_indices, 0, 4)
+        densify_dist = Categorical(logits=action_logits)
+        if torch.rand(1).item() < epsilon:
+            densify_actions = torch.randint_like(action_logits[:, 0].long(), 0, 4)
         else:
-            actions = dist.sample()
-
-        log_probs = dist.log_prob(actions)
-
-        age_in_steps = state["age"][subset_indices]
-        significance = state["significance"][subset_indices]
-        is_too_young_to_prune = age_in_steps < 500
-        is_too_significant_to_prune = significance > self.prune_significance_threshold
-        pruning_forbidden_mask = is_too_young_to_prune | is_too_significant_to_prune
-
-        subset_is_prune = (actions == 0)
-        subset_is_dupe  = (actions == 2)
-        subset_is_split = (actions == 3)
-        subset_is_merge = (actions == 4)
-
-        subset_is_prune[pruning_forbidden_mask] = False
-        subset_is_merge[pruning_forbidden_mask] = False
-
-        pruned_mask_on_subset = subset_is_prune
-        final_subset_is_merge = subset_is_merge & ~pruned_mask_on_subset
-        final_subset_is_dupe = subset_is_dupe & ~pruned_mask_on_subset
-        final_subset_is_split = subset_is_split & ~pruned_mask_on_subset
-
-        scales = torch.exp(params["scales"])
-        subset_scales = scales[subset_indices]
-        is_too_small_to_split = subset_scales.max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]
-        is_too_big_to_dupe = ~is_too_small_to_split
-
-        final_subset_is_split[is_too_small_to_split] = False
-        final_subset_is_dupe[is_too_big_to_dupe] = False
-
-        final_split_ratios = continuous_params[final_subset_is_split, 0]
-        final_dupe_offset_mags = continuous_params[final_subset_is_dupe, 1]
+            densify_actions = densify_dist.sample()
 
         for i, original_idx in enumerate(subset_indices):
             if valid_mask_subset[i]:
-                experience = {
-                    "step": step, "features": ac_input[i].detach().cpu(),
-                    "action": actions[i].detach().cpu(),
-                    "log_prob": log_probs[i].detach().cpu(),
-                    "continuous_params": continuous_params[i].detach().cpu(),
-                    "pixel_coords": (px[i], py[i]), "patch_coords": (ptx[i], pty[i]),
-                    "initial_error": state["photometric_error_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean(),
-                    "initial_quality": state["quality_heatmap"][pty[i], ptx[i]],
-                    "initial_uncertainty": state["geom_uncertainty_map"][py[i], px[i]]
-                }
-                state["hindsight_buffer"].append(experience)
+                exp = {"step": step, "features": ac_input[i].detach().cpu(), "action": densify_actions[i].detach().cpu(),
+                       "log_prob": densify_dist.log_prob(densify_actions[i]).detach().cpu(),
+                       "px": px[i], "py": py[i], "ptx": ptx[i], "pty": pty[i],
+                       "original_index": original_idx.item(),
+                       "initial_error": state["l1_loss_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean(),
+                       "initial_quality": state["quality_heatmap"][pty[i], ptx[i]],
+                       "initial_uncertainty": state["geom_uncertainty_map"][py[i], px[i]]}
+                state["densify_hindsight_buffer"].append(exp)
 
-        per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance", "age"]
-        state_to_modify = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
-
-        current_subset_indices = subset_indices
-
-        global_is_merge = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
-        global_is_merge[current_subset_indices[final_subset_is_merge]] = True
-        n_merge_pairs = 0
-
-        if global_is_merge.any():
-            removed_by_merge_mask, n_merge_pairs = merge(params, optimizers, state_to_modify, global_is_merge)
-
-            num_gaussians_before_merge = num_gaussians
-            num_gaussians = len(params["means"])
-
-            orig_to_post_merge_map = torch.full((num_gaussians_before_merge,), -1, dtype=torch.long, device=device)
-            orig_to_post_merge_map[~removed_by_merge_mask] = torch.arange((~removed_by_merge_mask).sum(), device=device)
-
-            post_merge_subset_indices = orig_to_post_merge_map[current_subset_indices]
-            valid_after_merge = post_merge_subset_indices != -1
-
-            current_subset_indices = post_merge_subset_indices[valid_after_merge]
-            pruned_mask_on_subset = pruned_mask_on_subset[valid_after_merge]
-            final_subset_is_dupe = final_subset_is_dupe[valid_after_merge]
-            final_subset_is_split = final_subset_is_split[valid_after_merge]
-            continuous_params = continuous_params[valid_after_merge]
-
-            final_split_ratios = continuous_params[final_subset_is_split, 0]
-            final_dupe_offset_mags = continuous_params[final_subset_is_dupe, 1]
-
-        global_is_prune = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
-        global_is_prune[current_subset_indices[pruned_mask_on_subset]] = True
-        n_prune = global_is_prune.sum().item()
+        global_prune_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=device)
+        global_prune_mask[subset_indices] = prune_candidate_mask
+        n_prune = global_prune_mask.sum().item()
 
         if n_prune > 0:
-            remove(params, optimizers, state_to_modify, global_is_prune)
+            remove(params, optimizers, state, global_prune_mask)
 
-        post_prune_indices = torch.arange(num_gaussians, device=device)[~global_is_prune]
-        orig_to_post_prune_map = torch.full((num_gaussians,), -1, dtype=torch.long, device=device)
-        orig_to_post_prune_map[post_prune_indices] = torch.arange(len(post_prune_indices), device=device)
+        post_prune_indices = torch.arange(initial_num_gaussians, device=device)[~global_prune_mask]
 
-        post_prune_subset_indices = orig_to_post_prune_map[current_subset_indices]
+        valid_after_prune = ~prune_candidate_mask
+        subset_indices_post_prune = torch.cumsum(valid_after_prune, dim=0)[valid_after_prune] - 1
+        densify_actions_post_prune = densify_actions[valid_after_prune]
 
-        valid_after_prune = post_prune_subset_indices != -1
-        dupe_mask_after_prune = final_subset_is_dupe[valid_after_prune]
-        split_mask_after_prune = final_subset_is_split[valid_after_prune]
-        dupe_split_continuous_params = continuous_params[valid_after_prune]
+        num_gaussians_post_prune = len(params["means"])
+        merge_mask_on_subset = (densify_actions_post_prune == 3)
+        global_merge_mask = torch.zeros(num_gaussians_post_prune, dtype=torch.bool, device=device)
+        global_merge_mask[subset_indices_post_prune] = merge_mask_on_subset
 
-        dupe_indices_in_new_space = post_prune_subset_indices[valid_after_prune][dupe_mask_after_prune]
-        split_indices_in_new_space = post_prune_subset_indices[valid_after_prune][split_mask_after_prune]
+        if global_merge_mask.any():
+            removed_by_merge_mask, n_merge_pairs = merge(params, optimizers, state, global_merge_mask)
+            n_merge = removed_by_merge_mask.sum().item()
+        else:
+            removed_by_merge_mask = torch.zeros(num_gaussians_post_prune, dtype=torch.bool, device=device)
+            n_merge_pairs = 0
 
-        final_dupe_offset_mags = dupe_split_continuous_params[dupe_mask_after_prune, 1]
-        final_split_ratios = dupe_split_continuous_params[split_mask_after_prune, 0]
+        post_merge_indices = torch.arange(num_gaussians_post_prune, device=device)[~removed_by_merge_mask]
 
-        num_after_prune = len(params["means"])
+        valid_after_merge = ~merge_mask_on_subset
+        subset_indices_post_merge = torch.cumsum(valid_after_merge, dim=0)[valid_after_merge] - 1
+        densify_actions_post_merge = densify_actions_post_prune[valid_after_merge]
+        continuous_params_post_merge = continuous_params[valid_after_prune][valid_after_merge]
 
-        global_is_dupe_after_prune = torch.zeros(num_after_prune, dtype=torch.bool, device=device)
-        global_is_dupe_after_prune[dupe_indices_in_new_space] = True
-        n_dupli = global_is_dupe_after_prune.sum().item()
+        num_gaussians_post_merge = len(params["means"])
 
-        if n_dupli > 0:
-            dupe_scales = torch.exp(params["scales"][dupe_indices_in_new_space])
-            dupe_quats = F.normalize(params["quats"][dupe_indices_in_new_space], dim=-1)
-            dupe_rotmats = normalized_quat_to_rotmat(dupe_quats)
-
-            largest_scale_idx = torch.argmax(dupe_scales, dim=1)
-            direction_vectors = dupe_rotmats[torch.arange(n_dupli), :, largest_scale_idx]
-
-            offset_magnitudes = dupe_scales.max(dim=-1).values * final_dupe_offset_mags
-            duplication_offsets = direction_vectors * offset_magnitudes.unsqueeze(-1)
-
-            duplicate(params, optimizers, state_to_modify, global_is_dupe_after_prune, offsets=duplication_offsets)
-
-        global_is_split_after_prune = torch.zeros(num_after_prune, dtype=torch.bool, device=device)
-        global_is_split_after_prune[split_indices_in_new_space] = True
-        is_split_after_dup = torch.cat([global_is_split_after_prune, torch.zeros(n_dupli, dtype=torch.bool, device=device)])
-        n_split = is_split_after_dup.sum().item()
+        split_mask_on_subset = (densify_actions_post_merge == 1)
+        global_split_mask = torch.zeros(num_gaussians_post_merge, dtype=torch.bool, device=device)
+        global_split_mask[subset_indices_post_merge] = split_mask_on_subset
+        n_split = global_split_mask.sum().item()
 
         if n_split > 0:
-            split(params, optimizers, state_to_modify, is_split_after_dup,
-                  anisotropic=self.anisotropic_split, revised_opacity=self.revised_opacity,
-                  split_ratios=final_split_ratios)
+            split_ratios = continuous_params_post_merge[split_mask_on_subset, 0]
+            split_directions = continuous_params_post_merge[split_mask_on_subset, 2:5]
+            split(params, optimizers, state, global_split_mask, split_ratios=split_ratios, directions=split_directions)
 
+        num_gaussians_post_split = len(params["means"])
+
+        dupe_mask_on_subset = (densify_actions_post_merge == 2)
+        global_dupe_mask = torch.zeros(num_gaussians_post_merge, dtype=torch.bool, device=device)
+        global_dupe_mask[subset_indices_post_merge] = dupe_mask_on_subset
+        global_dupe_mask_expanded = torch.cat([global_dupe_mask, torch.zeros(n_split * 2 - n_split, dtype=torch.bool, device=device)])
+
+        n_dupli = dupe_mask_on_subset.sum().item()
         if n_dupli > 0:
-            state["age"][-n_dupli:] = 0
+            dupe_offset_mags = continuous_params_post_merge[dupe_mask_on_subset, 1]
+            dupe_directions = continuous_params_post_merge[dupe_mask_on_subset, 5:8]
 
-        state.update(state_to_modify)
+            dupe_indices = torch.where(global_dupe_mask)[0]
+            dupe_scales = torch.exp(params["scales"][dupe_indices])
+            offset_magnitudes = dupe_scales.max(dim=-1).values * dupe_offset_mags
+            duplication_offsets = dupe_directions * offset_magnitudes.unsqueeze(-1)
+
+            duplicate(params, optimizers, state, global_dupe_mask_expanded, offsets=duplication_offsets)
 
         return n_dupli, n_split, n_prune, n_merge_pairs

@@ -1,8 +1,9 @@
 from collections import deque
 from dataclasses import dataclass, field
 import time
-from typing import Any, Dict, Union
+from typing import Any
 from approx_topk import topk
+import numpy as np
 
 import piq
 import torch
@@ -20,6 +21,98 @@ from gsplat.strategy.ops import (
 )
 from gsplat.strategy.default import DefaultStrategy
 from ops import split, duplicate
+
+class SumTree:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity - 1)
+        self.data = np.zeros(capacity, dtype=object)
+        self.data_pointer = 0
+        self.size = 0
+
+    def _propagate(self, idx: int, change: float):
+        parent = (idx - 1) // 2
+        self.tree[parent] += change
+        if parent != 0:
+            self._propagate(parent, change)
+
+    def _retrieve(self, idx: int, s: float) -> int:
+        left = 2 * idx + 1
+        right = left + 1
+        if left >= len(self.tree):
+            return idx
+        if s <= self.tree[left]:
+            return self._retrieve(left, s)
+        else:
+            return self._retrieve(right, s - self.tree[left])
+
+    def total(self) -> float:
+        return self.tree[0]
+
+    def add(self, p: float, data: object):
+        idx = self.data_pointer + self.capacity - 1
+        self.data[self.data_pointer] = data
+        self.update(idx, p)
+        self.data_pointer += 1
+        if self.data_pointer >= self.capacity:
+            self.data_pointer = 0
+        if self.size < self.capacity:
+            self.size += 1
+
+    def update(self, idx: int, p: float):
+        change = p - self.tree[idx]
+        self.tree[idx] = p
+        self._propagate(idx, change)
+
+    def get(self, s: float) -> tuple[int, float, object]:
+        idx = self._retrieve(0, s)
+        data_idx = idx - self.capacity + 1
+        return idx, self.tree[idx], self.data[data_idx]
+
+
+class PrioritizedReplayBuffer:
+    """A Replay Buffer that uses a SumTree to sample experiences based on priority."""
+    def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4, beta_increment_per_sampling: float = 0.001):
+        self.tree = SumTree(capacity)
+        self.capacity = capacity
+        self.alpha = alpha
+        self.beta = beta
+        self.beta_increment_per_sampling = beta_increment_per_sampling
+        self.epsilon = 1e-5
+        self.max_priority = 1.0
+
+    def add(self, experience: object):
+        self.tree.add(self.max_priority, experience)
+
+    def sample(self, batch_size: int) -> tuple[list, np.ndarray, np.ndarray]:
+        batch, idxs, priorities = [], [], []
+        segment = self.tree.total() / batch_size
+        self.beta = np.min([1., self.beta + self.beta_increment_per_sampling])
+
+        for i in range(batch_size):
+            a, b = segment * i, segment * (i + 1)
+            s = np.random.uniform(a, b)
+            (idx, p, data) = self.tree.get(s)
+            if data is not 0:
+                priorities.append(p)
+                batch.append(data)
+                idxs.append(idx)
+
+        sampling_probabilities = np.array(priorities) / self.tree.total()
+        is_weights = np.power(self.tree.size * sampling_probabilities, -self.beta)
+        is_weights /= is_weights.max()
+
+        return batch, np.array(idxs), is_weights
+
+    def update_priorities(self, tree_idxs: np.ndarray, td_errors: np.ndarray):
+        priorities = (np.abs(td_errors) + self.epsilon) ** self.alpha
+        self.max_priority = max(self.max_priority, np.max(priorities))
+        for i, idx in enumerate(tree_idxs):
+            self.tree.update(int(idx), priorities[i])
+
+    def __len__(self):
+        return self.tree.size
+
 
 class GaussianGraphNetwork(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int = 2):
@@ -192,15 +285,14 @@ class AdaptiveStrategy(DefaultStrategy):
     knn_fn: Any = field(default=None, repr=False)
     lpips_metric: Any = field(default=None, repr=False)
 
-    densification_net: Any = field(default=None, repr=False)
-    densification_optimizer: Any = field(default=None, repr=False)
-
     gnn_net: Any = field(default=None, repr=False)
     ac_net: Any = field(default=None, repr=False)
     combined_optimizer: Any = field(default=None, repr=False)
 
     start_asc_grad2d: float = 0.0002
     end_asc_grad2d: float = 0.001
+
+    ppo_clip_epsilon: float = 0.2
 
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
@@ -213,7 +305,7 @@ class AdaptiveStrategy(DefaultStrategy):
             "dynamic_grow_grad2d": self.grow_grad2d,
             "photometric_error_map": None,
             "geom_uncertainty_map": None,
-            "replay_buffer": deque(maxlen=20_000),
+            "replay_buffer": PrioritizedReplayBuffer(capacity=20_000),
             "hindsight_buffer": deque(maxlen=5_000),
             "pruning_replay_buffer": deque(maxlen=20_000),
             "significance": None,
@@ -427,7 +519,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     def _update_state(
             self,
-            params: Union[dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+            params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
             state: dict[str, Any],
             info: dict[str, Any],
             packed: bool = False,
@@ -669,9 +761,15 @@ class AdaptiveStrategy(DefaultStrategy):
                             + action_reward
                             )
 
+            if len(state["replay_buffer"]) < state["replay_buffer"].capacity:
+                exp_tuple = (
+                    experience["features"],
+                    experience["action"],
+                    final_reward.clone().detach(),
+                    experience["log_prob"]
+                )
+                state["replay_buffer"].add(exp_tuple)
 
-            if len(state["replay_buffer"]) < state["replay_buffer"].maxlen:
-                state["replay_buffer"].append((experience["features"], experience["action"], final_reward.clone().detach()))
 
     def _train_actor_critic(self, state: dict[str, Any]):
         if len(state["replay_buffer"]) < 256:
@@ -681,32 +779,47 @@ class AdaptiveStrategy(DefaultStrategy):
         self.ac_net.train()
         device = next(self.ac_net.parameters()).device
 
-        batch_indices = torch.randint(0, len(state["replay_buffer"]), (256,))
-        batch = [state["replay_buffer"][i] for i in batch_indices]
+        batch, tree_idxs, is_weights = state["replay_buffer"].sample(256)
+        is_weights = torch.tensor(is_weights, device=device, dtype=torch.float32)
 
-        graph_embeddings = torch.stack([x[0] for x in batch]).to(device)
-        actions_taken = torch.stack([x[1] for x in batch]).to(device)
+        ac_inputs = torch.stack([x[0] for x in batch]).to(device)
+        actions_taken = torch.tensor([x[1] for x in batch], device=device, dtype=torch.int64)
         rewards = torch.stack([x[2] for x in batch]).to(device)
+        old_log_probs = torch.stack([x[3] for x in batch]).to(device)
 
-        action_logits, predicted_values, _ = self.ac_net(graph_embeddings)
+        action_logits, predicted_values, _ = self.ac_net(ac_inputs)
 
-        critic_loss = F.mse_loss(predicted_values, rewards)
+        critic_loss_unreduced = F.mse_loss(predicted_values, rewards, reduction="none")
+
         advantage = (rewards - predicted_values).detach()
-        log_probs = F.log_softmax(action_logits, dim=-1)
-        log_prob_for_action = log_probs.gather(1, actions_taken.unsqueeze(-1)).squeeze(-1)
-        policy_gradient_loss = -(log_prob_for_action * advantage).mean()
 
-        probs = F.softmax(action_logits, dim=-1)
-        entropy = -(probs * log_probs).sum(dim=-1).mean()
-        entropy_loss = -self.entropy_loss_weight * entropy
+        new_dist = Categorical(logits=action_logits)
+        new_log_probs = new_dist.log_prob(actions_taken)
 
-        loss = critic_loss + self.actor_loss_weight * policy_gradient_loss + entropy_loss
+        ratio = torch.exp(new_log_probs - old_log_probs)
+
+        surr1 = ratio * advantage
+        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantage
+        actor_loss_unreduced = -torch.min(surr1, surr2)
+
+        entropy_loss_unreduced = -self.entropy_loss_weight * new_dist.entropy()
+
+        total_loss_unreduced = (
+                critic_loss_unreduced +
+                self.actor_loss_weight * actor_loss_unreduced +
+                entropy_loss_unreduced
+        )
+
+        loss = (total_loss_unreduced * is_weights).mean()
 
         self.combined_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
         self.combined_optimizer.step()
+
+        td_errors = advantage.detach().cpu().numpy()
+        state["replay_buffer"].update_priorities(tree_idxs, td_errors)
 
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> tuple[int, int, int]:
@@ -752,6 +865,8 @@ class AdaptiveStrategy(DefaultStrategy):
         else:
             actions = dist.sample()
 
+        log_probs = dist.log_prob(actions)
+
         age_in_steps = state["age"][subset_indices]
         significance = state["significance"][subset_indices]
 
@@ -791,6 +906,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 experience = {
                     "step": step, "features": ac_input[i].detach().cpu(),
                     "action": actions[i].detach().cpu(),
+                    "log_prob": log_probs[i].detach().cpu(),
                     "continuous_params": continuous_params[i].detach().cpu(),
                     "pixel_coords": (px[i], py[i]), "patch_coords": (ptx[i], pty[i]),
                     "initial_error": state["photometric_error_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean(),

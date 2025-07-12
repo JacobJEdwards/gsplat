@@ -693,51 +693,71 @@ class AdaptiveStrategy(DefaultStrategy):
         return patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask
 
 
-    def _process_hindsight_buffer(self, state, current_step):
-        if state.get("photometric_error_map") is None:
-            return
+    def _process_hindsight_buffers(self, state: dict, current_step: int):
+        while state["densify_hindsight_buffer"] and \
+                (current_step - state["densify_hindsight_buffer"][0]["step"]) >= self.densify_hindsight_delay:
 
-        while state["densify_hindsight_buffer"] and (current_step - state["densify_hindsight_buffer"][0]["step"]) >= self.densify_hindsight_delay:
-            experience = state["hindsight_buffer"].popleft()
-            px, py = experience["pixel_coords"]
-            patch_x, patch_y = experience["patch_coords"]
+            exp = state["densify_hindsight_buffer"].popleft()
 
-            current_error = state["photometric_error_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
-            reward_photo = experience["initial_error"] - current_error
+            if state.get("l1_loss_map") is None or \
+                    state.get("quality_heatmap") is None or \
+                    state.get("geom_uncertainty_map") is None:
+                continue
 
-            current_quality = state["quality_heatmap"][patch_y, patch_x]
-            reward_quality = experience["initial_quality"] - current_quality
+            px, py = exp["px"], exp["py"]
+            ptx, pty = exp["ptx"], exp["pty"]
+            action = exp["action"]
+
+            current_error = state["l1_loss_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
+            reward_photo = exp["initial_error"] - current_error # Positive reward if error decreased
+
+            current_quality = state["quality_heatmap"][pty, ptx]
+            reward_quality = exp["initial_quality"] - current_quality # Positive if NRQM score improved (i.e., raw score decreased)
 
             current_uncertainty = state["geom_uncertainty_map"][py, px]
-            reward_uncertainty = experience["initial_uncertainty"] - current_uncertainty
+            reward_uncertainty = exp["initial_uncertainty"] - current_uncertainty # Positive if uncertainty decreased
 
-            action = experience["action"]
-            action_reward = 0.0
-            if action == 0 or action == 4:
-                action_reward = self.action_cost_weight
-            elif action == 2 or action == 3:
-                action_reward = -self.action_cost_weight
+            action_cost = 0.0
+            if action == 1 or action == 2:
+                action_cost = -self.action_cost_weight
+            elif action == 3:
+                action_cost = self.action_cost_weight
 
             final_reward = (self.w_photometric * reward_photo +
                             self.w_quality * reward_quality +
-                            self.w_uncertainty * reward_uncertainty
-                            + action_reward
-                            )
+                            self.w_uncertainty * reward_uncertainty +
+                            action_cost)
 
-            if self.use_curiosity:
-                pass # todo: do this
-
-            state["densify_replay_buffer"].add((experience["features"], experience["action"], final_reward,
-                                                experience["log_prob"]))
+            if len(state["densify_replay_buffer"]) < state["densify_replay_buffer"].capacity:
+                state["densify_replay_buffer"].add((
+                    exp["features"],
+                    exp["action"],
+                    final_reward.clone().detach(),
+                    exp["log_prob"]
+                ))
 
         if self.use_learned_pruning:
-            while state["pruning_hindsight_buffer"] and (current_step - state["pruning_hindsight_buffer"][0]["step"]) >= self.pruning_hindsight_delay:
-                # todo: improve
-                exp = state["pruning_hindsight_buffer"].popleft()
-                current_error = state["l1_loss_map"][max(0, exp["py"]-2):exp["py"]+3, max(0, exp["px"]-2):exp["px"]+3].mean()
-                pruning_reward = exp["initial_error"] - current_error
-                state["pruning_replay_buffer"].add((exp["features"], exp["action"], pruning_reward, exp["log_prob"]))
+            while state["pruning_hindsight_buffer"] and \
+                    (current_step - state["pruning_hindsight_buffer"][0]["step"]) >= self.pruning_hindsight_delay:
 
+                exp = state["pruning_hindsight_buffer"].popleft()
+
+                if state.get("l1_loss_map") is None:
+                    continue
+
+                px, py = exp["px"], exp["py"]
+
+                current_error = state["l1_loss_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
+
+                pruning_reward = exp["initial_error"] - current_error
+
+                if len(state["pruning_replay_buffer"]) < state["pruning_replay_buffer"].capacity:
+                    state["pruning_replay_buffer"].add((
+                        exp["features"],
+                        exp["action"],
+                        pruning_reward.clone().detach(),
+                        exp["log_prob"]
+                    ))
 
     def _train_densification_agent(self, state: dict[str, Any]):
         if len(state["densify_replay_buffer"]) < 256: return
@@ -756,7 +776,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         action_logits, predicted_values, _ = self.ac_net(ac_inputs)
 
-        # --- PPO Loss Calculation ---
         advantage = rewards - predicted_values.detach()
         advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
@@ -786,7 +805,6 @@ class AdaptiveStrategy(DefaultStrategy):
         torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
         self.densify_optimizer.step()
 
-        # Update priorities in the replay buffer
         td_errors = (rewards - predicted_values).abs().detach().cpu().numpy()
         state["densify_replay_buffer"].update_priorities(tree_idxs, td_errors)
 
@@ -807,7 +825,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         action_logits, predicted_values = self.pruning_ac_net(ac_inputs)
 
-        # --- PPO Loss Calculation ---
         advantage = rewards - predicted_values.detach()
         advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
@@ -831,17 +848,14 @@ class AdaptiveStrategy(DefaultStrategy):
 
         loss = (total_loss_unreduced * is_weights).mean()
 
-        # We only update the pruning head and the shared GNN.
-        # Zero grad both optimizers to be safe, but only step the relevant one.
         self.densify_optimizer.zero_grad()
         self.pruning_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.pruning_ac_net.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
-        self.densify_optimizer.step() # Step the main optimizer to update GNN
-        self.pruning_optimizer.step() # Step the pruning optimizer to update its heads
+        self.densify_optimizer.step()
+        self.pruning_optimizer.step()
 
-        # Update priorities
         td_errors = (rewards - predicted_values).abs().detach().cpu().numpy()
         state["pruning_replay_buffer"].update_priorities(tree_idxs, td_errors)
 
@@ -850,12 +864,11 @@ class AdaptiveStrategy(DefaultStrategy):
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> tuple[int, int, int, int]:
         initial_num_gaussians = len(params["means"])
         device = params["means"].device
-        n_dupli, n_split, n_prune, n_merge = 0, 0, 0, 0
 
         subset_mask = torch.rand(initial_num_gaussians, device=device) < self.subset_fraction
         if subset_mask.sum() == 0: return 0, 0, 0, 0
 
-        subset_indices = torch.where(subset_mask)[0]
+        original_subset_indices = torch.where(subset_mask)[0]
 
         graph_embeddings, coords, _ = self._get_graph_representation(params, state, subset_mask, step)
         if graph_embeddings is None: return 0, 0, 0, 0
@@ -872,22 +885,22 @@ class AdaptiveStrategy(DefaultStrategy):
         expanded_global_context = global_context.unsqueeze(0).expand(graph_embeddings.shape[0], -1)
         ac_input = torch.cat([graph_embeddings, expanded_global_context], dim=-1)
 
-        prune_candidate_mask = torch.zeros(len(subset_indices), dtype=torch.bool, device=device)
+        prune_candidate_mask = torch.zeros(len(original_subset_indices), dtype=torch.bool, device=device)
         if self.use_learned_pruning:
             self.pruning_ac_net.eval()
             prune_logits, _ = self.pruning_ac_net(ac_input)
             prune_dist = Bernoulli(logits=prune_logits)
             prune_actions = prune_dist.sample()
 
-            age_in_steps = state["age"][subset_indices]
-            significance = state["significance"][subset_indices]
+            age_in_steps = state["age"][original_subset_indices]
+            significance = state["significance"][original_subset_indices]
             is_too_young = age_in_steps < 800
             is_too_significant = significance > self.prune_significance_threshold
 
-            prune_candidate_mask = (prune_actions == 1) & ~is_too_young & ~is_too_significant
+            prune_mask_on_subset = (prune_actions == 1) & ~is_too_young & ~is_too_significant
 
-            for i, original_idx in enumerate(subset_indices):
-                if valid_mask_subset[i] and prune_candidate_mask[i]:
+            for i, is_valid in enumerate(valid_mask_subset):
+                if is_valid and prune_mask_on_subset[i]:
                     exp = {"step": step, "features": ac_input[i].detach().cpu(), "action": 1,
                            "log_prob": prune_dist.log_prob(prune_actions[i]).detach().cpu(),
                            "px": px[i], "py": py[i],
@@ -902,82 +915,102 @@ class AdaptiveStrategy(DefaultStrategy):
 
         densify_dist = Categorical(logits=action_logits)
         if torch.rand(1).item() < epsilon:
-            densify_actions = torch.randint_like(action_logits[:, 0].long(), 0, 4)
+            densify_actions_on_subset = torch.randint_like(action_logits[:, 0].long(), 0, 4)
         else:
-            densify_actions = densify_dist.sample()
+            densify_actions_on_subset = densify_dist.sample()
 
-        for i, original_idx in enumerate(subset_indices):
-            if valid_mask_subset[i]:
-                exp = {"step": step, "features": ac_input[i].detach().cpu(), "action": densify_actions[i].detach().cpu(),
-                       "log_prob": densify_dist.log_prob(densify_actions[i]).detach().cpu(),
+        for i, is_valid in enumerate(valid_mask_subset):
+            if is_valid:
+                exp = {"step": step, "features": ac_input[i].detach().cpu(), "action": densify_actions_on_subset[i].detach().cpu(),
+                       "log_prob": densify_dist.log_prob(densify_actions_on_subset[i]).detach().cpu(),
                        "px": px[i], "py": py[i], "ptx": ptx[i], "pty": pty[i],
-                       "original_index": original_idx.item(),
                        "initial_error": state["l1_loss_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean(),
-                       "initial_quality": state["quality_heatmap"][pty[i], ptx[i]],
-                       "initial_uncertainty": state["geom_uncertainty_map"][py[i], px[i]]}
+                       "initial_quality": state.get("quality_heatmap", torch.zeros(1,1,device=device))[pty[i], ptx[i]],
+                       "initial_uncertainty": state.get("geom_uncertainty_map", torch.zeros(1,1,device=device))[py[i], px[i]]}
                 state["densify_hindsight_buffer"].append(exp)
 
         global_prune_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=device)
-        global_prune_mask[subset_indices] = prune_candidate_mask
+        global_prune_mask[original_subset_indices] = prune_mask_on_subset
         n_prune = global_prune_mask.sum().item()
 
         if n_prune > 0:
             remove(params, optimizers, state, global_prune_mask)
 
-        post_prune_indices = torch.arange(initial_num_gaussians, device=device)[~global_prune_mask]
-
-        valid_after_prune = ~prune_candidate_mask
-        subset_indices_post_prune = torch.cumsum(valid_after_prune, dim=0)[valid_after_prune] - 1
-        densify_actions_post_prune = densify_actions[valid_after_prune]
-
+        prune_map = torch.full((initial_num_gaussians,), -1, dtype=torch.long, device=device)
+        prune_map[~global_prune_mask] = torch.arange((~global_prune_mask).sum(), device=device)
         num_gaussians_post_prune = len(params["means"])
-        merge_mask_on_subset = (densify_actions_post_prune == 3)
-        global_merge_mask = torch.zeros(num_gaussians_post_prune, dtype=torch.bool, device=device)
-        global_merge_mask[subset_indices_post_prune] = merge_mask_on_subset
 
+        active_after_prune_mask = ~prune_mask_on_subset
+        subset_indices_for_merge = original_subset_indices[active_after_prune_mask]
+        actions_for_merge = densify_actions_on_subset[active_after_prune_mask]
+        remapped_indices_for_merge = prune_map[subset_indices_for_merge]
+
+        merge_mask_on_active_subset = (actions_for_merge == 3)
+        global_merge_mask = torch.zeros(num_gaussians_post_prune, dtype=torch.bool, device=device)
+        global_merge_mask[remapped_indices_for_merge] = merge_mask_on_active_subset
+
+        n_merge_pairs = 0
         if global_merge_mask.any():
             removed_by_merge_mask, n_merge_pairs = merge(params, optimizers, state, global_merge_mask)
-            n_merge = removed_by_merge_mask.sum().item()
         else:
             removed_by_merge_mask = torch.zeros(num_gaussians_post_prune, dtype=torch.bool, device=device)
-            n_merge_pairs = 0
 
-        post_merge_indices = torch.arange(num_gaussians_post_prune, device=device)[~removed_by_merge_mask]
-
-        valid_after_merge = ~merge_mask_on_subset
-        subset_indices_post_merge = torch.cumsum(valid_after_merge, dim=0)[valid_after_merge] - 1
-        densify_actions_post_merge = densify_actions_post_prune[valid_after_merge]
-        continuous_params_post_merge = continuous_params[valid_after_prune][valid_after_merge]
-
+        merge_map = torch.full((num_gaussians_post_prune,), -1, dtype=torch.long, device=device)
+        merge_map[~removed_by_merge_mask] = torch.arange((~removed_by_merge_mask).sum(), device=device)
         num_gaussians_post_merge = len(params["means"])
 
-        split_mask_on_subset = (densify_actions_post_merge == 1)
+        active_after_merge_mask = ~merge_mask_on_active_subset
+        subset_indices_for_split = remapped_indices_for_merge[active_after_merge_mask]
+        actions_for_split = actions_for_merge[active_after_merge_mask]
+        continuous_params_for_split = continuous_params[active_after_prune_mask][active_after_merge_mask]
+
+        remapped_indices_for_split = merge_map[subset_indices_for_split]
+        valid_split_mask = remapped_indices_for_split != -1
+        remapped_indices_for_split = remapped_indices_for_split[valid_split_mask]
+        actions_for_split = actions_for_split[valid_split_mask]
+        continuous_params_for_split = continuous_params_for_split[valid_split_mask]
+
+        split_mask_on_active_subset = (actions_for_split == 1)
         global_split_mask = torch.zeros(num_gaussians_post_merge, dtype=torch.bool, device=device)
-        global_split_mask[subset_indices_post_merge] = split_mask_on_subset
+        global_split_mask[remapped_indices_for_split] = split_mask_on_active_subset
         n_split = global_split_mask.sum().item()
 
         if n_split > 0:
-            split_ratios = continuous_params_post_merge[split_mask_on_subset, 0]
-            split_directions = continuous_params_post_merge[split_mask_on_subset, 2:5]
+            split_ratios = continuous_params_for_split[split_mask_on_active_subset, 0]
+            split_directions = continuous_params_for_split[split_mask_on_active_subset, 2:5]
             split(params, optimizers, state, global_split_mask, split_ratios=split_ratios, directions=split_directions)
 
+        split_map = torch.full((num_gaussians_post_merge,), -1, dtype=torch.long, device=device)
+        split_map[~global_split_mask] = torch.arange((~global_split_mask).sum(), device=device)
+        split_indices = torch.where(global_split_mask)[0]
+        split_map[split_indices] = torch.arange((~global_split_mask).sum(), (~global_split_mask).sum() + n_split)
         num_gaussians_post_split = len(params["means"])
 
-        dupe_mask_on_subset = (densify_actions_post_merge == 2)
-        global_dupe_mask = torch.zeros(num_gaussians_post_merge, dtype=torch.bool, device=device)
-        global_dupe_mask[subset_indices_post_merge] = dupe_mask_on_subset
-        global_dupe_mask_expanded = torch.cat([global_dupe_mask, torch.zeros(n_split * 2 - n_split, dtype=torch.bool, device=device)])
+        active_after_split_mask = ~split_mask_on_active_subset
+        subset_indices_for_dupe = remapped_indices_for_split[active_after_split_mask]
+        actions_for_dupe = actions_for_split[active_after_split_mask]
+        continuous_params_for_dupe = continuous_params_for_split[active_after_split_mask]
 
-        n_dupli = dupe_mask_on_subset.sum().item()
+        remapped_indices_for_dupe = split_map[subset_indices_for_dupe]
+        valid_dupe_mask = remapped_indices_for_dupe != -1
+        remapped_indices_for_dupe = remapped_indices_for_dupe[valid_dupe_mask]
+        actions_for_dupe = actions_for_dupe[valid_dupe_mask]
+        continuous_params_for_dupe = continuous_params_for_dupe[valid_dupe_mask]
+
+        dupe_mask_on_active_subset = (actions_for_dupe == 2)
+        global_dupe_mask = torch.zeros(num_gaussians_post_split, dtype=torch.bool, device=device)
+        global_dupe_mask[remapped_indices_for_dupe] = dupe_mask_on_active_subset
+        n_dupli = global_dupe_mask.sum().item()
+
         if n_dupli > 0:
-            dupe_offset_mags = continuous_params_post_merge[dupe_mask_on_subset, 1]
-            dupe_directions = continuous_params_post_merge[dupe_mask_on_subset, 5:8]
+            dupe_offset_mags = continuous_params_for_dupe[dupe_mask_on_active_subset, 1]
+            dupe_directions = continuous_params_for_dupe[dupe_mask_on_active_subset, 5:8]
 
             dupe_indices = torch.where(global_dupe_mask)[0]
             dupe_scales = torch.exp(params["scales"][dupe_indices])
             offset_magnitudes = dupe_scales.max(dim=-1).values * dupe_offset_mags
             duplication_offsets = dupe_directions * offset_magnitudes.unsqueeze(-1)
 
-            duplicate(params, optimizers, state, global_dupe_mask_expanded, offsets=duplication_offsets)
+            duplicate(params, optimizers, state, global_dupe_mask, offsets=duplication_offsets)
 
         return n_dupli, n_split, n_prune, n_merge_pairs

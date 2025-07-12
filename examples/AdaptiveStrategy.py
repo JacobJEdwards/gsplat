@@ -187,13 +187,6 @@ class AdaptiveStrategy(DefaultStrategy):
             if self.verbose:
                 print("Initialized Actor-Critic Network.")
 
-    def _initialize_pruning_components(self, device) -> None:
-        if self.use_learned_pruning and self.pruning_net is None:
-            self.pruning_net = PruningNetwork().to(device)
-            self.pruning_optimizer = torch.optim.AdamW(
-                self.pruning_net.parameters(), lr=1e-4, weight_decay=1e-5
-            )
-
     def step_post_backward(
             self,
             params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
@@ -215,8 +208,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         if self.use_learned_densification and self.densification_net is None:
             self._initialize_learning_components(params["means"].device)
-        if self.use_learned_pruning and self.pruning_net is None:
-            self._initialize_pruning_components(params["means"].device)
         if self.nrqm_model is None:
             self.nrqm_model = PatchBasedNRQM().to(params["means"].device)
         if self.knn_fn is None:
@@ -352,7 +343,6 @@ class AdaptiveStrategy(DefaultStrategy):
         sh_degree_to_use = min(step // 1000, 3)
 
         cam_indices = torch.randint(0, info['n_cameras'], (self.num_uncertainty_views,))
-        main_novel_view_idx = cam_indices[0].item()
 
         novel_camtoworlds = info['camtoworlds'][cam_indices]
         novel_Ks = info['Ks'][cam_indices]
@@ -592,6 +582,14 @@ class AdaptiveStrategy(DefaultStrategy):
             final_reward = (self.w_photometric * reward_photo +
                             self.w_quality * reward_quality +
                             self.w_uncertainty * reward_uncertainty)
+
+            action = experience["action"]
+
+            if action == 0:
+                final_reward -= 0.01
+
+            elif action == 2 or action == 3:
+                final_reward += 0.01
 
             if len(state["replay_buffer"]) < state["replay_buffer"].maxlen:
                 state["replay_buffer"].append((experience["features"], experience["action"], final_reward.clone().detach()))

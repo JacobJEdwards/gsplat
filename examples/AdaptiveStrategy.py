@@ -398,12 +398,12 @@ class AdaptiveStrategy(DefaultStrategy):
         if step > self.refine_start_iter:
             if step % self.refine_every == 0:
                 t = time.time()
-                n_dupli, n_split, n_prune = self._update_geometry(params, optimizers, state, step)
+                n_dupli, n_split, n_prune, n_merge = self._update_geometry(params, optimizers, state, step)
 
                 if self.verbose:
                     print(f"Geometry updated at step {step}. Now having {len(params['means'])} GSs. Took {time.time() - t:.2f}s.")
                     print(
-                        f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split, {n_prune} GSs pruned."
+                        f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split, {n_prune} GSs pruned, {n_merge} GSs merged."
                     )
                 # n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
                 # if self.verbose:
@@ -726,20 +726,20 @@ class AdaptiveStrategy(DefaultStrategy):
         state["replay_buffer"].update_priorities(tree_idxs, td_errors)
 
     @torch.no_grad()
-    def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> tuple[int, int, int]:
+    def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> tuple[int, int, int, int]:
         num_gaussians = len(params["means"])
         device = params["means"].device
 
         subset_mask = torch.rand(num_gaussians, device=device) < self.subset_fraction
         if subset_mask.sum() == 0:
-            return 0,0,0
+            return 0,0,0,0
 
         subset_indices = torch.where(subset_mask)[0]
 
         graph_embeddings, px, py, ptx, pty, valid_mask_subset = self._get_graph_representation(params, state,
                                                                                                subset_mask, step)
         if graph_embeddings is None:
-            return 0,0,0
+            return 0,0,0,0
 
         norm_num_gaussians = min(num_gaussians / 500_000.0, 1.0)
         avg_quality = state["quality_heatmap"].mean() if state.get("quality_heatmap") is not None else torch.tensor(0.0)
@@ -785,7 +785,6 @@ class AdaptiveStrategy(DefaultStrategy):
         subset_is_prune[pruning_forbidden_mask] = False
         subset_is_merge[pruning_forbidden_mask] = False
 
-        # Establish action priority: Prune > Merge > Dupe/Split
         pruned_mask_on_subset = subset_is_prune
         final_subset_is_merge = subset_is_merge & ~pruned_mask_on_subset
         final_subset_is_dupe = subset_is_dupe & ~pruned_mask_on_subset
@@ -821,7 +820,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         current_subset_indices = subset_indices
 
-        # --- 1. MERGE ---
         global_is_merge = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
         global_is_merge[current_subset_indices[final_subset_is_merge]] = True
         n_merge_pairs = 0
@@ -905,4 +903,4 @@ class AdaptiveStrategy(DefaultStrategy):
 
         state.update(state_to_modify)
 
-        return n_dupli, n_split, n_prune
+        return n_dupli, n_split, n_prune, n_merge_pairs

@@ -19,7 +19,7 @@ from gsplat.strategy.default import DefaultStrategy
 from ops import split
 
 class DensificationNetwork(nn.Module):
-    def __init__(self, input_dim: int = 10, mlp_width: int = 64):
+    def __init__(self, input_dim: int = 18, mlp_width: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, mlp_width),
@@ -35,7 +35,7 @@ class DensificationNetwork(nn.Module):
         return self.net(x)
 
 class PruningNetwork(nn.Module):
-    def __init__(self, input_dim: int = 17, mlp_width: int = 64):
+    def __init__(self, input_dim: int = 18, mlp_width: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, mlp_width),
@@ -53,7 +53,7 @@ class PruningNetwork(nn.Module):
 class PatchBasedNRQM(nn.Module):
     def __init__(self):
         super().__init__()
-        self.brisque = piq.BRISQUELoss(reduction='none', data_range=1.0)
+        self.brisque = piq.BRISQUELoss(reduction='none', data_range=1.)
 
     def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
         return self.brisque(image_patches)
@@ -93,10 +93,10 @@ class AdaptiveStrategy(DefaultStrategy):
     prune_every: int = 400
     nrqm_every: int = 1000
 
-    max_splits_per_step: int = 100_000
-    max_duplications_per_step: int = 100_000
+    max_splits_per_step: int = 20000
+    max_duplications_per_step: int = 20000
     subset_fraction: float = 0.2
-    max_densification_subset: int = 200_000
+    max_densification_subset: int = 50_000
 
 
     nrqm_patch_size: int = 32
@@ -137,6 +137,7 @@ class AdaptiveStrategy(DefaultStrategy):
     rasterizer_fn: Any = field(default=None, repr=False)
     nrqm_model: Any = field(default=None, repr=False)
     knn_fn: Any = field(default=None, repr=False)
+    lpips_metric: Any = field(default=None, repr=False)
 
     densification_net: Any = field(default=None, repr=False)
     densification_optimizer: Any = field(default=None, repr=False)
@@ -158,9 +159,10 @@ class AdaptiveStrategy(DefaultStrategy):
             "replay_buffer": deque(maxlen=20_000),
             "hindsight_buffer": deque(maxlen=5_000),
             "pruning_replay_buffer": deque(maxlen=20_000),
-            "significance": None, # todo
+            "significance": None,
             "prev_grad2d": None,
-            "prev_opacity": None
+            "prev_opacity": None,
+            "age": None,
 
         })
 
@@ -168,7 +170,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     def _initialize_learning_components(self, device) -> None:
         if self.use_learned_densification and self.densification_net is None:
-            self.densification_net = DensificationNetwork(input_dim=17).to(device)
+            self.densification_net = DensificationNetwork().to(device)
             self.densification_optimizer = torch.optim.AdamW(
                 self.densification_net.parameters(), lr=1e-4, weight_decay=1e-5
             )
@@ -192,8 +194,12 @@ class AdaptiveStrategy(DefaultStrategy):
         if step >= self.refine_stop_iter:
             return
 
+        if state.get("age") is None:
+            state["age"] = torch.zeros(params["means"].shape[0], dtype=torch.int32, device=params["means"].device)
+
         if state.get("significance") is None:
             state["significance"] = torch.zeros(params["means"].shape[0], device=params["means"].device)
+
 
         if self.use_learned_densification and self.densification_net is None:
             self._initialize_learning_components(params["means"].device)
@@ -229,6 +235,9 @@ class AdaptiveStrategy(DefaultStrategy):
             self._process_hindsight_buffer(state, step)
 
         self._update_state(params, state, info, packed=packed)
+
+        if step > self.refine_start_iter:
+            state["age"] += 1
 
         if step > self.refine_start_iter:
             if step % self.refine_every == 0:
@@ -437,7 +446,24 @@ class AdaptiveStrategy(DefaultStrategy):
             Ks=gt_ks, width=width, height=height, sh_degree=sh_degree_to_use,
             camtoworlds=camtoworlds_gt, image_ids=gt_ids,
         )
-        photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=-1).squeeze(0)
+
+        if self.lpips_metric is not None:
+            rendered_p = rendered_train_view.permute(0, 3, 1, 2)
+            gt_p = gt_image.permute(0, 3, 1, 2)
+
+            with torch.no_grad():
+                feats_render = self.lpips_metric.net(rendered_p)
+                feats_gt = self.lpips_metric.net(gt_p)
+
+            error_maps = []
+            for feat_r, feat_g in zip(feats_render, feats_gt):
+                error_map_layer = (feat_r - feat_g).abs().mean(dim=1, keepdim=True)
+                error_map_resized = F.interpolate(error_map_layer, size=(height, width), mode='bilinear', align_corners=False)
+                error_maps.append(error_map_resized)
+
+            photometric_error_map = torch.stack(error_maps).mean(dim=0).squeeze()
+        else:
+            photometric_error_map = F.l1_loss(rendered_train_view, gt_image)
 
         if state["photometric_error_map"] is None:
             state["photometric_error_map"] = photometric_error_map
@@ -474,7 +500,6 @@ class AdaptiveStrategy(DefaultStrategy):
     def _get_gaussian_features(
             self, params: dict, state: dict, subset_mask: Tensor, step: int
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Extracts feature vectors and projection info for a subset of Gaussians."""
         num_subset = subset_mask.sum().item()
         device = params["means"].device
 
@@ -490,7 +515,7 @@ class AdaptiveStrategy(DefaultStrategy):
             means3d_subset, state["view_proj_matrix"], h, w
         )
 
-        feature_dim = 17
+        feature_dim = 18
         features = torch.zeros(num_subset, feature_dim, device=device)
 
         opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
@@ -540,6 +565,9 @@ class AdaptiveStrategy(DefaultStrategy):
             features[:, 15] = state["significance"][subset_mask]
 
         features[:, 16] = step / self.refine_stop_iter
+
+        if state.get("age") is not None:
+            features[:, 17] = state["age"][subset_mask].float() / self.refine_stop_iter
 
         return torch.nan_to_num(features, 0.0), pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y, valid_mask
 
@@ -728,6 +756,10 @@ class AdaptiveStrategy(DefaultStrategy):
             if self.verbose:
                 print(f"Split {n_split} Gaussians in {time.time() - t:.2f} seconds.")
 
+        if n_dupli > 0 or n_split > 0:
+            if n_dupli > 0:
+                state_to_densify["age"][-n_dupli:] = 0
+
         state.update(state_to_densify)
 
         state["prev_grad2d"] = state["grad2d"] / state["count"].clamp_min(1)
@@ -839,7 +871,6 @@ class AdaptiveStrategy(DefaultStrategy):
         if self.use_learned_pruning and step > self.pruning_bootstrap_steps and "photometric_error_map" in state:
             self.pruning_net.eval()
 
-            # probably only call once
             t = time.time()
             all_features, _, _, _, _, _ = self._get_gaussian_features(params, state, torch.ones_like(is_prune_original), step)
             if self.verbose:
@@ -848,7 +879,7 @@ class AdaptiveStrategy(DefaultStrategy):
             if all_features is not None:
                 pruning_logits = self.pruning_net(all_features).squeeze(-1)
                 pruning_probs = torch.sigmoid(pruning_logits)
-                is_prune_learned = pruning_probs > self.learned_prune_threshold
+                is_prune_learned = torch.rand_like(pruning_probs) < pruning_probs
 
         is_prune = is_prune_original | is_prune_stagnant | is_prune_redundant | is_prune_significant | is_prune_learned
 

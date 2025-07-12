@@ -8,9 +8,9 @@ import piq
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.distributions import Categorical, Normal, Bernoulli
+from torch.distributions import Categorical, Bernoulli
 
-from torch_geometric.nn import GATConv, knn_graph, TransformerConv
+from torch_geometric.nn import knn_graph, TransformerConv
 
 from gsplat.utils import normalized_quat_to_rotmat
 from utils import PrioritizedReplayBuffer
@@ -453,7 +453,7 @@ class AdaptiveStrategy(DefaultStrategy):
             state["last_nrqm_step"] = step
 
 
-        self._process_hindsight_buffer(state, step)
+        self._process_hindsight_buffers(state, step)
 
         self._update_state(params, state, info, packed=packed)
 

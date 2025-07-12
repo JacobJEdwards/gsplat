@@ -456,9 +456,10 @@ class AdaptiveStrategy(DefaultStrategy):
 
             photometric_error_map = feats_render
         else:
-            photometric_error_map = F.l1_loss(rendered_train_view, gt_image).squeeze()
+            photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=-1).squeeze(0)
 
-        if state["photometric_error_map"] is None:
+
+    if state["photometric_error_map"] is None:
             state["photometric_error_map"] = photometric_error_map
         else:
             state["photometric_error_map"] = torch.lerp(

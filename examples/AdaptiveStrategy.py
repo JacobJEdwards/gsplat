@@ -937,12 +937,15 @@ class AdaptiveStrategy(DefaultStrategy):
         # 4. Execute Operations Sequentially with Simple Remapping
         n_prune, n_merge_pairs, n_split, n_dupli = 0, 0, 0, 0
 
+        per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance", "age"]
+        state_to_modify = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
+
         # A. PRUNE
         global_prune_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=device)
         global_prune_mask[original_subset_indices[final_prune_mask_on_subset]] = True
         n_prune = global_prune_mask.sum().item()
         if n_prune > 0:
-            remove(params, optimizers, state, global_prune_mask)
+            remove(params, optimizers, state_to_modify, global_prune_mask)
         prune_map = torch.full((initial_num_gaussians,), -1, dtype=torch.long, device=device)
         prune_map[~global_prune_mask] = torch.arange(initial_num_gaussians - n_prune, device=device)
 
@@ -954,7 +957,7 @@ class AdaptiveStrategy(DefaultStrategy):
             remapped_merge_indices = prune_map[merge_orig_indices]
             global_merge_mask[remapped_merge_indices[remapped_merge_indices != -1]] = True
         if global_merge_mask.any():
-            removed_by_merge_mask, n_merge_pairs = merge(params, optimizers, state, global_merge_mask)
+            removed_by_merge_mask, n_merge_pairs = merge(params, optimizers, state_to_modify, global_merge_mask)
         else:
             removed_by_merge_mask = torch.zeros(num_gaussians_post_prune, dtype=torch.bool, device=device)
 
@@ -976,7 +979,8 @@ class AdaptiveStrategy(DefaultStrategy):
                 split_ratios = split_continuous_params[valid_mask, 0]
                 split_directions = split_continuous_params[valid_mask, 2:5]
                 assert n_split == len(split_directions), "Internal logic error: split mismatch"
-                split(params, optimizers, state, global_split_mask, split_ratios=split_ratios, directions=split_directions)
+                split(params, optimizers, state_to_modify, global_split_mask, split_ratios=split_ratios,
+                      directions=split_directions)
 
         # D. DUPLICATE
         num_gaussians_post_split = len(params["means"])
@@ -1009,6 +1013,12 @@ class AdaptiveStrategy(DefaultStrategy):
                 offset_magnitudes = dupe_scales.max(dim=-1).values * dupe_offset_mags
                 duplication_offsets = dupe_directions * offset_magnitudes.unsqueeze(-1)
 
-                duplicate(params, optimizers, state, global_dupe_mask, offsets=duplication_offsets)
+                duplicate(params, optimizers, state_to_modify, global_dupe_mask, offsets=duplication_offsets)
+
+        # 5. Update State
+        state.update(state_to_modify)
+
+        if n_dupli > 0:
+            state["age"][-n_dupli:] = 0
 
         return n_dupli, n_split, n_prune, n_merge_pairs

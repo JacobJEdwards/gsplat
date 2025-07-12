@@ -940,6 +940,7 @@ class AdaptiveStrategy(DefaultStrategy):
         per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance", "age"]
         state_to_modify = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
 
+
         # A. PRUNE
         global_prune_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=device)
         global_prune_mask[original_subset_indices[final_prune_mask_on_subset]] = True
@@ -1015,9 +1016,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
                 duplicate(params, optimizers, state_to_modify, global_dupe_mask, offsets=duplication_offsets)
 
-        # 5. Update State
         state.update(state_to_modify)
-
         if n_dupli > 0:
             state["age"][-n_dupli:] = 0
 

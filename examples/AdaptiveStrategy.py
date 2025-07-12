@@ -219,8 +219,6 @@ class AdaptiveStrategy(DefaultStrategy):
             self.combined_optimizer = torch.optim.AdamW(
                 combined_params, lr=1e-4, weight_decay=1e-5
             )
-            if self.verbose:
-                print("Initialized Actor-Critic Network and GNN for learned densification.")
 
     @torch.no_grad()
     def _get_raw_features(
@@ -231,8 +229,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         means3d_subset = params["means"][subset_mask]
         if state.get("photometric_error_map") is None:
-            if self.verbose:
-                print("Skipping feature extraction: photometric error map is not available.")
 
             return None, None, None, None, None
 
@@ -360,8 +356,6 @@ class AdaptiveStrategy(DefaultStrategy):
             # loss_map = info["l1_loss_map"].squeeze(0) # todo: use
             t = time.time()
             self._update_quality_map(params, state, info)
-            if self.verbose:
-                print(f"Updated quality maps in {time.time() - t:.2f} seconds.")
             state["last_nrqm_step"] = step
 
         if self.use_learned_densification:
@@ -398,8 +392,6 @@ class AdaptiveStrategy(DefaultStrategy):
         if self.use_learned_densification and step > 1000 and step % self.learn_every == 0:
             t = time.time()
             self._train_actor_critic(state)
-            if self.verbose:
-                print(f"Trained Densification Network at step {step} in {time.time() - t:.2f} seconds.")
 
     def _update_state(
             self,
@@ -616,9 +608,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
     def _process_hindsight_buffer(self, state, current_step):
         if state.get("photometric_error_map") is None:
-            if self.verbose:
-                print("Skipping hindsight processing: photometric error map is not available.")
-
             return
 
         while state["hindsight_buffer"] and (current_step - state["hindsight_buffer"][0]["step"]) >= self.hindsight_delay:
@@ -684,9 +673,6 @@ class AdaptiveStrategy(DefaultStrategy):
         torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
         self.combined_optimizer.step()
-
-        if self.verbose:
-            print(f"AC Loss: {loss.item():.4f} (Critic: {critic_loss.item():.4f}, PG: {policy_gradient_loss.item():.4f})")
 
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> tuple[int, int, int]:

@@ -93,10 +93,10 @@ class AdaptiveStrategy(DefaultStrategy):
     prune_every: int = 400
     nrqm_every: int = 1000
 
-    max_splits_per_step: int = 20000
-    max_duplications_per_step: int = 20000
+    max_splits_per_step: int = 100_000
+    max_duplications_per_step: int = 100_000
     subset_fraction: float = 0.2
-    max_densification_subset: int = 50_000
+    max_densification_subset: int = 200_000
 
 
     nrqm_patch_size: int = 32

@@ -454,7 +454,7 @@ class AdaptiveStrategy(DefaultStrategy):
             with torch.no_grad():
                 feats_render = self.lpips_metric(rendered_p, gt_p)
 
-            photometric_error_map = torch.stack(feats_render)
+            photometric_error_map = feats_render
         else:
             photometric_error_map = F.l1_loss(rendered_train_view, gt_image)
 

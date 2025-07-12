@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from examples.utils import knn_with_ids
 from gsplat.strategy.ops import (
     duplicate,
     remove,
@@ -198,6 +199,10 @@ class AdaptiveStrategy(DefaultStrategy):
             self._initialize_learning_components(params["means"].device)
         if self.use_learned_pruning and self.pruning_net is None:
             self._initialize_pruning_components(params["means"].device)
+        if self.nrqm_model is None:
+            self.nrqm_model = PatchBasedNRQM().to(params["means"].device)
+        if self.knn_fn is None:
+            self.knn_fn = knn_with_ids
 
         should_update_maps = (state["last_nrqm_step"] == -1 and step > 0) or \
                              (step % self.nrqm_every == 0)

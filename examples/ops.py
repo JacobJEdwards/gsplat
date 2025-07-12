@@ -91,3 +91,49 @@ def split(
             repeats = [2] + [1] * (v.dim() - 1)
             v_new = v[sel].repeat(repeats)
             state[k] = torch.cat((v[rest], v_new))
+
+@torch.no_grad()
+def duplicate(
+        params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
+        optimizers: dict[str, torch.optim.Optimizer],
+        state: dict[str, Tensor],
+        mask: Tensor,
+        offsets: Tensor | None = None,
+):
+    """
+    Inplace duplicate the Gaussian with the given mask, with optional displacement.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        mask: A boolean mask to duplicate the Gaussians.
+        offsets (Optional[Tensor]): A tensor of shape [N_dupe, 3] containing the
+          displacement vectors for the new Gaussians. If None, duplicates
+          are placed at the original location.
+    """
+    device = mask.device
+    sel = torch.where(mask)[0]
+
+    if offsets is not None:
+        assert len(sel) == len(offsets), "Number of offsets must match number of Gaussians to duplicate."
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        # If we are modifying the means and offsets are provided, apply them.
+        if name == "means" and offsets is not None:
+            new_params = p[sel] + offsets
+        # For all other parameters, or if offsets are not provided, just clone.
+        else:
+            new_params = p[sel]
+
+        return torch.nn.Parameter(torch.cat([p, new_params]), requires_grad=p.requires_grad)
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        # Initialize optimizer state for new params as zeros.
+        return torch.cat([v, torch.zeros((len(sel), *v.shape[1:]), device=device)])
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    # update the extra running state
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            state[k] = torch.cat((v, v[sel]))

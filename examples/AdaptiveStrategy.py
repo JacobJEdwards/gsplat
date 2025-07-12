@@ -12,12 +12,11 @@ from torch.distributions import Categorical
 
 from utils import knn_with_ids
 from gsplat.strategy.ops import (
-    duplicate,
     remove,
     reset_opa,
 )
 from gsplat.strategy.default import DefaultStrategy
-from ops import split
+from ops import split, duplicate
 
 class ActorCriticNetwork(nn.Module):
     def __init__(self, input_dim: int = 18, mlp_width: int = 64):
@@ -128,10 +127,10 @@ class AdaptiveStrategy(DefaultStrategy):
     prune_every: int = 400
     nrqm_every: int = 1000
 
-    max_splits_per_step: int = 20000
-    max_duplications_per_step: int = 20000
+    max_splits_per_step: int = 50000
+    max_duplications_per_step: int = 50000
 
-    subset_fraction: float = 0.2
+    subset_fraction: float = 1.0
     max_densification_subset: int = 200_000
 
     nrqm_patch_size: int = 32

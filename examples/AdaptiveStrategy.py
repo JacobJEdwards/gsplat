@@ -74,12 +74,26 @@ class ActorCriticNetwork(nn.Module):
         return action_logits, value, processed_continuous_params
 
 class PatchBasedNRQM(nn.Module):
-    def __init__(self):
+    def __init__(self, model_name: str = "clipiqa"):
         super().__init__()
-        self.brisque = piq.BRISQUELoss(reduction='none', data_range=1.)
+        self.model_name = model_name
+        if self.model_name == "brisque":
+            self.model = piq.BRISQUELoss(reduction='none')
+        elif self.model_name == "clipiqa":
+            self.model = piq.CLIPIQA()
+        else:
+            raise ValueError(f"Unknown NRQM model: {self.model_name}. Supported models are 'brisque' and 'clipiqa'.")
+
 
     def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
-        return self.brisque(image_patches)
+        if self.model_name == "brisque":
+            scores = self.model(image_patches)
+            return scores.view(scores.shape[0])
+        elif self.model_name == "clipiqa":
+            scores = self.model(image_patches)
+            return -scores.view(scores.shape[0])
+
+        raise ValueError(f"Unknown NRQM model: {self.model_name}. Supported models are 'brisque' and 'clipiqa'.")
 
 
 @dataclass

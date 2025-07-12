@@ -180,8 +180,8 @@ class Parser:
             image_dir_suffix = f"_{factor}"
         else:
             image_dir_suffix = ""
-        colmap_image_dir = os.path.join(data_dir, "images_8")
-        image_dir = os.path.join(data_dir, "images_8" + image_dir_suffix)
+        colmap_image_dir = os.path.join(data_dir, "images")
+        image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
         for d in [image_dir, colmap_image_dir]:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
@@ -371,7 +371,7 @@ class Dataset:
     def __len__(self):
         return len(self.indices)
 
-    def __getitem__(self, item: int) -> Dict[str, Any]:
+    def __getitem__(self, item: int) -> dict[str, Any]:
         index = self.indices[item]
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
         camera_id = self.parser.camera_ids[index]

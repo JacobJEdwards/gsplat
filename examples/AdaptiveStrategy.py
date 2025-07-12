@@ -134,6 +134,8 @@ class AdaptiveStrategy(DefaultStrategy):
     gnn_hidden_dim: int = 32
     gnn_embedding_dim: int = 16
 
+    num_global_features: int = 3
+
     max_splits_per_step: int = 1_000_000
     max_duplications_per_step: int = 1_000_000
 
@@ -167,6 +169,12 @@ class AdaptiveStrategy(DefaultStrategy):
     entropy_loss_weight: float = 0.1
     continuous_loss_weight: float = 0.5
 
+    action_cost_weight: float = 0.001
+
+    start_exploration_epsilon: float = 0.3
+    end_exploration_epsilon: float = 0.05
+    exploration_decay_steps: int = 15000
+
     use_learned_pruning: bool = True
     pruning_bootstrap_steps: int = 5000
     pruning_learn_every: int = 500
@@ -197,7 +205,6 @@ class AdaptiveStrategy(DefaultStrategy):
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
         state.update({
-            "loss_map": None,
             "quality_heatmap": None,
             "view_proj_matrix": None,
             "stagnation_count": None,
@@ -213,7 +220,7 @@ class AdaptiveStrategy(DefaultStrategy):
             "prev_grad2d": None,
             "prev_opacity": None,
             "age": None,
-
+            "l1_loss_map": None,
         })
 
         return state
@@ -228,7 +235,10 @@ class AdaptiveStrategy(DefaultStrategy):
                 output_dim=self.gnn_embedding_dim,
             ).to(device)
 
-            self.ac_net = ActorCriticNetwork(input_dim=self.gnn_embedding_dim).to(device)
+            ac_input_dim = self.gnn_embedding_dim + self.num_global_features
+
+            self.ac_net = ActorCriticNetwork(input_dim=ac_input_dim).to(device)
+
             combined_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
             self.combined_optimizer = torch.optim.AdamW(
                 combined_params, lr=1e-4, weight_decay=1e-5
@@ -242,11 +252,14 @@ class AdaptiveStrategy(DefaultStrategy):
         device = params["means"].device
 
         means3d_subset = params["means"][subset_mask]
-        if state.get("photometric_error_map") is None:
-
+        if state.get("photometric_error_map") is None and state.get("l1_loss_map") is None:
             return None, None, None, None, None
 
-        h, w = state["photometric_error_map"].shape
+        if state.get("l1_loss_map") is not None:
+            h, w = state["l1_loss_map"].shape
+        else:
+            h, w = state["photometric_error_map"].shape
+
         patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask = self._project_to_patch_coords(
             means3d_subset, state["view_proj_matrix"], h, w
         )
@@ -264,7 +277,11 @@ class AdaptiveStrategy(DefaultStrategy):
 
         valid_indices = torch.where(valid_mask)[0]
         if valid_indices.numel() > 0:
-            features[valid_indices, 5] = state["photometric_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+            if state.get("l1_loss_map") is not None:
+                features[valid_indices, 5] = state["l1_loss_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+            elif state.get("photometric_error_map") is not None:
+                features[valid_indices, 5] = state["photometric_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+
             if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
                 features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
             if state.get("quality_heatmap") is not None:
@@ -337,6 +354,8 @@ class AdaptiveStrategy(DefaultStrategy):
         if step >= self.refine_stop_iter:
             return
 
+        state["l1_loss_map"] = info.get("l1_loss_map")
+
         if state.get("age") is None:
             state["age"] = torch.zeros(params["means"].shape[0], dtype=torch.int32, device=params["means"].device)
 
@@ -367,7 +386,6 @@ class AdaptiveStrategy(DefaultStrategy):
                              (step % self.nrqm_every == 0)
 
         if should_update_maps:
-            # loss_map = info["l1_loss_map"].squeeze(0) # todo: use
             t = time.time()
             self._update_quality_map(params, state, info)
             state["last_nrqm_step"] = step
@@ -638,9 +656,19 @@ class AdaptiveStrategy(DefaultStrategy):
             current_uncertainty = state["geom_uncertainty_map"][py, px]
             reward_uncertainty = experience["initial_uncertainty"] - current_uncertainty
 
+            action = experience["action"]
+            action_reward = 0.0
+            if action == 0:
+                action_reward = self.action_cost_weight
+            elif action == 2 or action == 3:
+                action_reward = -self.action_cost_weight
+
             final_reward = (self.w_photometric * reward_photo +
                             self.w_quality * reward_quality +
-                            self.w_uncertainty * reward_uncertainty)
+                            self.w_uncertainty * reward_uncertainty
+                            + action_reward
+                            )
+
 
             if len(state["replay_buffer"]) < state["replay_buffer"].maxlen:
                 state["replay_buffer"].append((experience["features"], experience["action"], final_reward.clone().detach()))
@@ -696,11 +724,33 @@ class AdaptiveStrategy(DefaultStrategy):
         if graph_embeddings is None:
             return 0,0,0
 
+        norm_num_gaussians = min(num_gaussians / 500_000.0, 1.0)
+        avg_quality = state["quality_heatmap"].mean() if state.get("quality_heatmap") is not None else torch.tensor(0.0)
+        avg_significance = state["significance"].mean() if state.get("significance") is not None else torch.tensor(0.0)
+
+        global_context = torch.tensor(
+            [norm_num_gaussians, avg_quality, avg_significance],
+            device=device
+        ).float()
+
+        expanded_global_context = global_context.unsqueeze(0).expand(graph_embeddings.shape[0], -1)
+        ac_input = torch.cat([graph_embeddings, expanded_global_context], dim=-1)
+
         self.ac_net.eval()
-        action_logits, _, continuous_params = self.ac_net(graph_embeddings)
+        action_logits, _, continuous_params = self.ac_net(ac_input)
 
         dist = Categorical(logits=action_logits)
-        actions = dist.sample()
+
+        progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
+        current_epsilon = max(
+            self.end_exploration_epsilon,
+            self.start_exploration_epsilon - (self.start_exploration_epsilon - self.end_exploration_epsilon) * progress
+        )
+
+        if torch.rand(1).item() < current_epsilon:
+            actions = torch.randint_like(subset_indices, 0, 4)
+        else:
+            actions = dist.sample()
 
         age_in_steps = state["age"][subset_indices]
         significance = state["significance"][subset_indices]

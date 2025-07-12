@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.distributions import Categorical
 
+from gsplat.utils import normalized_quat_to_rotmat
 from utils import knn_with_ids
 from gsplat.strategy.ops import (
     remove,
@@ -672,13 +673,13 @@ class AdaptiveStrategy(DefaultStrategy):
 
         subset_mask = torch.rand(num_gaussians, device=device) < self.subset_fraction
         if subset_mask.sum() == 0:
-            return
+            return 0,0,0
 
         subset_indices = torch.where(subset_mask)[0]
 
         features, px, py, ptx, pty, valid_mask_subset = self._get_gaussian_features(params, state, subset_mask, step)
         if features is None:
-            return
+            return 0,0,0
 
         self.ac_net.eval()
         action_logits, _, continuous_params = self.ac_net(features)
@@ -691,23 +692,24 @@ class AdaptiveStrategy(DefaultStrategy):
         subset_is_dupe  = (actions == 2)
         subset_is_split = (actions == 3)
 
-        subset_scales = torch.exp(params["scales"][subset_indices])
+        scales = torch.exp(params["scales"])
+        subset_scales = scales[subset_indices]
         is_too_small_to_split = subset_scales.max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]
         is_too_big_to_dupe = ~is_too_small_to_split
 
         subset_is_split[is_too_small_to_split] = False
         subset_is_dupe[is_too_big_to_dupe] = False
 
-        global_is_prune = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
-        global_is_prune[subset_indices[subset_is_prune]] = True
-
-        pruned_mask_on_subset = torch.zeros(len(subset_indices), dtype=torch.bool, device=device)
-        pruned_mask_on_subset[subset_is_prune] = True
+        pruned_mask_on_subset = subset_is_prune
 
         final_subset_is_dupe = subset_is_dupe & ~pruned_mask_on_subset
         final_subset_is_split = subset_is_split & ~pruned_mask_on_subset
 
         final_split_ratios = continuous_params[final_subset_is_split, 0]
+        final_dupe_offset_mags = continuous_params[final_subset_is_dupe, 1]
+
+        global_is_prune = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
+        global_is_prune[subset_indices[pruned_mask_on_subset]] = True
 
         for i, original_idx in enumerate(subset_indices):
             if valid_mask_subset[i]:
@@ -739,6 +741,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
 
         num_after_prune = len(params["means"])
+
         global_is_dupe_after_prune = torch.zeros(num_after_prune, dtype=torch.bool, device=device)
         global_is_split_after_prune = torch.zeros(num_after_prune, dtype=torch.bool, device=device)
 
@@ -750,7 +753,19 @@ class AdaptiveStrategy(DefaultStrategy):
 
         n_dupli = global_is_dupe_after_prune.sum().item()
         if n_dupli > 0:
-            duplicate(params, optimizers, state_to_modify, global_is_dupe_after_prune)
+            dupe_indices_in_new_space = torch.where(global_is_dupe_after_prune)[0]
+
+            dupe_scales = torch.exp(params["scales"][dupe_indices_in_new_space])
+            dupe_quats = F.normalize(params["quats"][dupe_indices_in_new_space], dim=-1)
+            dupe_rotmats = normalized_quat_to_rotmat(dupe_quats)
+
+            largest_scale_idx = torch.argmax(dupe_scales, dim=1)
+            direction_vectors = dupe_rotmats[torch.arange(n_dupli), :, largest_scale_idx]
+
+            offset_magnitudes = dupe_scales.max(dim=-1).values * final_dupe_offset_mags
+            duplication_offsets = direction_vectors * offset_magnitudes.unsqueeze(-1)
+
+            duplicate(params, optimizers, state_to_modify, global_is_dupe_after_prune, offsets=duplication_offsets)
 
         n_split = global_is_split_after_prune.sum().item()
         if n_split > 0:

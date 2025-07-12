@@ -623,8 +623,7 @@ class AdaptiveStrategy(DefaultStrategy):
             optimizers: dict[str, torch.optim.Optimizer],
             state: dict[str, Any],
             step: int,
-    ) -> Tuple[int, int]:
-        """Performs stochastic, budgeted, and policy-driven densification."""
+    ) -> tuple[int, int]:
         num_gaussians = len(params["means"])
         device = params["means"].device
 
@@ -655,11 +654,16 @@ class AdaptiveStrategy(DefaultStrategy):
         if self.use_learned_densification and step >= self.bootstrap_steps:
             self.densification_net.eval()
             with torch.no_grad():
+                t = time.time()
                 utility_scores = self.densification_net(features_subset).squeeze()
+                if self.verbose:
+                    print(f"Computed utility scores for {len(subset_indices)} Gaussians in {time.time() - t:.2f} seconds.")
         else:
             utility_scores = features_subset[:, 12]
 
         if self.use_learned_densification:
+            if self.verbose:
+                print(f"Appending {len(subset_indices)} Gaussians to hindsight buffer.")
             for i, original_idx in enumerate(subset_indices):
                 if valid_mask_subset[i]:
                     initial_error = state["photometric_error_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean()
@@ -683,29 +687,41 @@ class AdaptiveStrategy(DefaultStrategy):
         dupli_indices_in_subset = torch.where(dupli_candidates_mask)[0]
         n_dupli = min(len(dupli_indices_in_subset), self.max_duplications_per_step)
         if n_dupli > 0:
+            t = time.time()
             dupli_scores = utility_scores[dupli_indices_in_subset]
             _, top_indices = topk(dupli_scores, n_dupli, dim=-1)
             final_dupli_indices_in_subset = dupli_indices_in_subset[top_indices]
             is_dupli[subset_indices[final_dupli_indices_in_subset]] = True
+            if self.verbose:
+                print(f"Selected {n_dupli} Gaussians for duplication in {time.time() - t:.2f} seconds.")
 
         is_split = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
         split_indices_in_subset = torch.where(split_candidates_mask)[0]
         n_split = min(len(split_indices_in_subset), self.max_splits_per_step)
         if n_split > 0:
+            t = time.time()
             split_scores = utility_scores[split_indices_in_subset]
             _, top_indices = topk(split_scores, n_split, dim=-1)
             final_split_indices_in_subset = split_indices_in_subset[top_indices]
             is_split[subset_indices[final_split_indices_in_subset]] = True
+            if self.verbose:
+                print(f"Selected {n_split} Gaussians for splitting in {time.time() - t:.2f} seconds.")
 
         per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance"]
         state_to_densify = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
 
         if n_dupli > 0:
+            t = time.time()
             duplicate(params, optimizers, state_to_densify, is_dupli)
+            if self.verbose:
+                print(f"Duplicated {n_dupli} Gaussians in {time.time() - t:.2f} seconds.")
         if n_split > 0:
+            t = time.time()
             is_split_after_dup = torch.cat([is_split, torch.zeros(n_dupli, dtype=torch.bool, device=device)])
             split(params, optimizers, state_to_densify, is_split_after_dup, anisotropic=self.anisotropic_split,
                   revised_opacity=self.revised_opacity)
+            if self.verbose:
+                print(f"Split {n_split} Gaussians in {time.time() - t:.2f} seconds.")
 
         state.update(state_to_densify)
 

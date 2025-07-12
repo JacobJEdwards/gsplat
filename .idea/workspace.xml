@@ -321,7 +321,23 @@
       <option name="project" value="LOCAL" />
       <updated>1752273458070</updated>
     </task>
-    <option name="localTasksCounter" value="33" />
+    <task id="LOCAL-00033" summary="pruning network">
+      <option name="closed" value="true" />
+      <created>1752273534622</created>
+      <option name="number" value="00033" />
+      <option name="presentableId" value="LOCAL-00033" />
+      <option name="project" value="LOCAL" />
+      <updated>1752273534622</updated>
+    </task>
+    <task id="LOCAL-00034" summary="pruning network">
+      <option name="closed" value="true" />
+      <created>1752273653179</created>
+      <option name="number" value="00034" />
+      <option name="presentableId" value="LOCAL-00034" />
+      <option name="project" value="LOCAL" />
+      <updated>1752273653179</updated>
+    </task>
+    <option name="localTasksCounter" value="35" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">

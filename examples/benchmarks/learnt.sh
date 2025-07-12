@@ -14,7 +14,7 @@ do
     echo "Running $SCENE"
 
     # train without eval
-    CUDA_VISIBLE_DEVICES=0 python simple_trainer.py nrqm --eval_steps -1 --disable_viewer --data_factor $DATA_FACTOR \
+    CUDA_VISIBLE_DEVICES=0 python simple_trainer.py nrqm --eval_steps -1 --data_factor $DATA_FACTOR \
         --render_traj_path $RENDER_TRAJ_PATH \
         --data_dir $SCENE_DIR/"$SCENE"/ \
         --result_dir $RESULT_DIR/"$SCENE"/
@@ -22,7 +22,7 @@ do
     # run eval and render
     for CKPT in "$RESULT_DIR"/"$SCENE"/ckpts/*;
     do
-        CUDA_VISIBLE_DEVICES=0 python simple_trainer.py nrqm --disable_viewer --data_factor $DATA_FACTOR \
+        CUDA_VISIBLE_DEVICES=0 python simple_trainer.py nrqm --data_factor $DATA_FACTOR \
             --strategy.cap-max "$CAP_MAX" \
             --render_traj_path $RENDER_TRAJ_PATH \
             --data_dir $SCENE_DIR/"$SCENE"/ \

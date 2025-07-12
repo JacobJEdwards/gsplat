@@ -941,19 +941,25 @@ class AdaptiveStrategy(DefaultStrategy):
         # B. MERGE
         merge_orig_indices = original_subset_indices[final_merge_mask_subset]
         global_merge_mask = torch.zeros(num_gaussians_post_prune, dtype=torch.bool, device=device)
+        removed_by_merge_mask = torch.zeros(num_gaussians_post_prune, dtype=torch.bool, device=device)
+        n_merge_pairs = 0
         if len(merge_orig_indices) > 0:
             remapped_indices = prune_map[merge_orig_indices]
-            global_merge_mask[remapped_indices[remapped_indices != -1]] = True
+            valid_merge_mask = remapped_indices != -1
+            if valid_merge_mask.any():
+                global_merge_mask[remapped_indices[valid_merge_mask]] = True
 
-        n_merge_pairs = 0
         if global_merge_mask.any():
             removed_by_merge_mask, n_merge_pairs = merge(params, optimizers, state_to_modify, global_merge_mask)
-        else:
-            removed_by_merge_mask = torch.zeros(num_gaussians_post_prune, dtype=torch.bool, device=device)
 
-        merge_map = torch.full((num_gaussians_post_prune,), -1, dtype=torch.long, device=device)
-        merge_map[~removed_by_merge_mask] = torch.arange(num_gaussians_post_prune - removed_by_merge_mask.sum(), device=device)
         num_gaussians_post_merge = len(params["means"])
+        merge_map = torch.full((num_gaussians_post_prune,), -1, dtype=torch.long, device=device)
+        if removed_by_merge_mask.any():
+            merge_map[~removed_by_merge_mask] = torch.arange(num_gaussians_post_merge - n_merge_pairs, device=device)
+        else:
+            # If nothing was merged, it's an identity map for the survivors of prune
+            merge_map[prune_map != -1] = torch.arange(num_gaussians_post_prune, device=device)
+
 
         # C. SPLIT
         split_orig_indices = original_subset_indices[final_split_mask_subset]
@@ -980,16 +986,20 @@ class AdaptiveStrategy(DefaultStrategy):
         dupe_orig_indices = original_subset_indices[final_dupe_mask_subset]
         dupe_continuous_params = continuous_params[final_dupe_mask_subset]
 
+        unsplit_map = torch.full((num_gaussians_post_merge,), -1, dtype=torch.long, device=device)
+        unsplit_indices = torch.where(~global_split_mask)[0]
+        unsplit_map[unsplit_indices] = torch.arange(len(unsplit_indices), device=device)
+
         global_dupe_mask = torch.zeros(num_gaussians_post_split, dtype=torch.bool, device=device)
         if len(dupe_orig_indices) > 0:
-            split_map = torch.full((num_gaussians_post_merge,), -1, dtype=torch.long, device=device)
-            split_map[~global_split_mask] = torch.arange(num_gaussians_post_merge - n_split, device=device)
-
-            remapped_indices = split_map[merge_map[prune_map[dupe_orig_indices]]]
+            remapped_indices = unsplit_map[merge_map[prune_map[dupe_orig_indices]]]
             valid_mask = remapped_indices != -1
+
             if valid_mask.any():
-                global_dupe_mask[remapped_indices[valid_mask]] = True
+                final_dupe_indices = remapped_indices[valid_mask]
+                global_dupe_mask[final_dupe_indices] = True
                 dupe_continuous_params = dupe_continuous_params[valid_mask]
+
 
         n_dupli = global_dupe_mask.sum().item()
         if n_dupli > 0:
@@ -1004,5 +1014,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         state.update(state_to_modify)
         if n_dupli > 0: state["age"][-n_dupli:] = 0
+        if n_split > 0: state["age"][-n_split:] = 0 # Also reset age for newly split gaussians
 
-        return n_dupli, n_split, n_prune, n_merge_pairs
+        # The number of merged gaussians is the number of pairs times two.
+        return n_dupli, n_split, n_prune, removed_by_merge_mask.sum().item()

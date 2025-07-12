@@ -76,7 +76,7 @@ class ActorCriticNetwork(nn.Module):
 class PatchBasedNRQM(nn.Module):
     def __init__(self):
         super().__init__()
-        self.brisque = piq.BRISQUELoss(reduction='none')
+        self.brisque = piq.BRISQUELoss(reduction='none', data_range=1.)
 
     def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
         return self.brisque(image_patches)
@@ -357,9 +357,9 @@ class AdaptiveStrategy(DefaultStrategy):
                              (step % self.nrqm_every == 0)
 
         if should_update_maps:
-            loss_map = info["l1_loss_map"].squeeze(0)
+            # loss_map = info["l1_loss_map"].squeeze(0) # todo: use
             t = time.time()
-            self._update_quality_map(params, state, info, loss_map)
+            self._update_quality_map(params, state, info)
             if self.verbose:
                 print(f"Updated quality maps in {time.time() - t:.2f} seconds.")
             state["last_nrqm_step"] = step
@@ -467,15 +467,7 @@ class AdaptiveStrategy(DefaultStrategy):
             params: dict[str, torch.nn.Parameter],
             state: dict[str, Any],
             info: dict[str, Any],
-            l1_loss_map: Tensor,
     ):
-        if state["photometric_error_map"] is None:
-            state["photometric_error_map"] = l1_loss_map
-        else:
-            state["photometric_error_map"] = torch.lerp(
-                l1_loss_map, state["photometric_error_map"], self.nrqm_ema_decay
-            )
-
         step = info["step"]
         width, height = info['width'], info['height']
         sh_degree_to_use = min(step // 1000, 3)
@@ -567,6 +559,35 @@ class AdaptiveStrategy(DefaultStrategy):
         quality_factor = torch.clamp(1.0 + (normalized_quality - 1.0) * 0.5, 0.5, 1.5).item()
         state["dynamic_grow_grad2d"] = self.grow_grad2d * quality_factor
 
+        gt_image = info["pixels"]
+        gt_ids = info["image_ids"]
+        gt_ks = info["Ks"]
+        camtoworlds_gt = info["camtoworlds"]
+        rendered_train_view, _, _ = self.rasterizer_fn(
+            means=params["means"], quats=params["quats"], scales=params["scales"],
+            opacities=params["opacities"], colors=torch.cat([params["sh0"], params["shN"]], 1),
+            Ks=gt_ks, width=width, height=height, sh_degree=sh_degree_to_use,
+            camtoworlds=camtoworlds_gt, image_ids=gt_ids,
+        )
+
+        if self.lpips_metric is not None:
+            rendered_p = rendered_train_view.permute(0, 3, 1, 2)
+            gt_p = gt_image.permute(0, 3, 1, 2)
+
+            with torch.no_grad():
+                feats_render = self.lpips_metric(rendered_p, gt_p)
+
+            photometric_error_map = feats_render
+        else:
+            photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=-1).squeeze(0)
+
+
+        if state["photometric_error_map"] is None:
+            state["photometric_error_map"] = photometric_error_map
+        else:
+            state["photometric_error_map"] = torch.lerp(
+                photometric_error_map, state["photometric_error_map"], self.nrqm_ema_decay
+            )
 
     @torch.no_grad()
     def _project_to_patch_coords(self, means3d: Tensor, view_proj_matrix: Tensor, h: int, w: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:

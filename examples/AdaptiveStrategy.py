@@ -789,7 +789,7 @@ class AdaptiveStrategy(DefaultStrategy):
         for i, original_idx in enumerate(subset_indices):
             if valid_mask_subset[i]:
                 experience = {
-                    "step": step, "features": graph_embeddings[i].detach().cpu(),
+                    "step": step, "features": ac_input[i].detach().cpu(),
                     "action": actions[i].detach().cpu(),
                     "continuous_params": continuous_params[i].detach().cpu(),
                     "pixel_coords": (px[i], py[i]), "patch_coords": (ptx[i], pty[i]),

@@ -286,10 +286,13 @@ class AdaptiveStrategy(DefaultStrategy):
         if step > self.refine_start_iter:
             if step % self.refine_every == 0:
                 t = time.time()
-                self._update_geometry(params, optimizers, state, step)
+                n_dupli, n_split, n_prune = self._update_geometry(params, optimizers, state, step)
 
                 if self.verbose:
                     print(f"Geometry updated at step {step}. Now having {len(params['means'])} GSs. Took {time.time() - t:.2f}s.")
+                    print(
+                        f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split, {n_prune} GSs pruned."
+                    )
                 # n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
                 # if self.verbose:
                 #     print(
@@ -664,7 +667,7 @@ class AdaptiveStrategy(DefaultStrategy):
             print(f"AC Loss: {loss.item():.4f} (Critic: {critic_loss.item():.4f}, PG: {policy_gradient_loss.item():.4f})")
 
     @torch.no_grad()
-    def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int):
+    def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> tuple[int, int, int]:
         num_gaussians = len(params["means"])
         device = params["means"].device
 
@@ -723,6 +726,8 @@ class AdaptiveStrategy(DefaultStrategy):
         per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance", "age"]
         state_to_modify = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
 
+        n_prune = global_is_prune.sum().item()
+
         if global_is_prune.any():
             remove(params, optimizers, state_to_modify, global_is_prune)
 
@@ -732,6 +737,7 @@ class AdaptiveStrategy(DefaultStrategy):
         orig_to_post_prune_map[post_prune_indices] = torch.arange(len(post_prune_indices), device=device)
 
         post_prune_subset_indices = orig_to_post_prune_map[subset_indices]
+
 
         num_after_prune = len(params["means"])
         global_is_dupe_after_prune = torch.zeros(num_after_prune, dtype=torch.bool, device=device)
@@ -754,11 +760,12 @@ class AdaptiveStrategy(DefaultStrategy):
                   anisotropic=self.anisotropic_split, revised_opacity=self.revised_opacity,
                   split_ratios=final_split_ratios)
 
-
         if n_dupli > 0:
             state["age"][-n_dupli:] = 0
 
         state.update(state_to_modify)
+
+        return n_dupli, n_split, n_prune
 
 
     @torch.no_grad()

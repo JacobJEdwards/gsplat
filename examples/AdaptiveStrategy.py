@@ -1,7 +1,7 @@
 from collections import deque
 from dataclasses import dataclass, field
 import time
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Union
 from approx_topk import topk
 
 import piq
@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from examples.utils import knn_with_ids
+from utils import knn_with_ids
 from gsplat.strategy.ops import (
     duplicate,
     remove,

@@ -140,6 +140,27 @@ def rotation_6d_to_matrix(d6: Tensor) -> Tensor:
 def knn(x: Tensor, K: int = 4, batch_size: int = 1000) -> Tensor:
     return knn_with_ids(x, K, batch_size)[0]
 
+def knn_with_ids_two_tensor(x: Tensor, y: Tensor, K: int = 4, batch_size: int = 2000) -> tuple[Tensor, Tensor]:
+    N = x.size(0)
+    all_distances = torch.zeros((N, K), device=x.device, dtype=x.dtype)
+    all_indices = torch.zeros((N, K), device=x.device, dtype=torch.long)
+
+    for i in range(0, N, batch_size):
+        end = min(i + batch_size, N)
+        batch_x = x[i:end]
+
+        dist_matrix = torch.cdist(batch_x, y, p=2)
+
+        distances, indices = torch.topk(dist_matrix, k=K, largest=False, sorted=True)
+
+        all_distances[i:end] = distances
+        all_indices[i:end] = indices
+
+        del dist_matrix
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return all_distances, all_indices
 
 def knn_with_ids(x: Tensor, K: int = 4, batch_size: int = 2000) -> tuple[Tensor, Tensor]:
     N = x.size(0)
@@ -262,4 +283,96 @@ def apply_depth_colormap(
     if acc is not None:
         img = img * acc + (1.0 - acc)
     return img
+
+
+class SumTree:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity - 1)
+        self.data = np.zeros(capacity, dtype=object)
+        self.data_pointer = 0
+        self.size = 0
+
+    def _propagate(self, idx: int, change: float):
+        parent = (idx - 1) // 2
+        self.tree[parent] += change
+        if parent != 0:
+            self._propagate(parent, change)
+
+    def _retrieve(self, idx: int, s: float) -> int:
+        left = 2 * idx + 1
+        right = left + 1
+        if left >= len(self.tree):
+            return idx
+        if s <= self.tree[left]:
+            return self._retrieve(left, s)
+        else:
+            return self._retrieve(right, s - self.tree[left])
+
+    def total(self) -> float:
+        return self.tree[0]
+
+    def add(self, p: float, data: object):
+        idx = self.data_pointer + self.capacity - 1
+        self.data[self.data_pointer] = data
+        self.update(idx, p)
+        self.data_pointer += 1
+        if self.data_pointer >= self.capacity:
+            self.data_pointer = 0
+        if self.size < self.capacity:
+            self.size += 1
+
+    def update(self, idx: int, p: float):
+        change = p - self.tree[idx]
+        self.tree[idx] = p
+        self._propagate(idx, change)
+
+    def get(self, s: float) -> tuple[int, float, object]:
+        idx = self._retrieve(0, s)
+        data_idx = idx - self.capacity + 1
+        return idx, self.tree[idx], self.data[data_idx]
+
+
+class PrioritizedReplayBuffer:
+    """A Replay Buffer that uses a SumTree to sample experiences based on priority."""
+    def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4, beta_increment_per_sampling: float = 0.001):
+        self.tree = SumTree(capacity)
+        self.capacity = capacity
+        self.alpha = alpha
+        self.beta = beta
+        self.beta_increment_per_sampling = beta_increment_per_sampling
+        self.epsilon = 1e-5
+        self.max_priority = 1.0
+
+    def add(self, experience: object):
+        self.tree.add(self.max_priority, experience)
+
+    def sample(self, batch_size: int) -> tuple[list, np.ndarray, np.ndarray]:
+        batch, idxs, priorities = [], [], []
+        segment = self.tree.total() / batch_size
+        self.beta = np.min([1., self.beta + self.beta_increment_per_sampling])
+
+        for i in range(batch_size):
+            a, b = segment * i, segment * (i + 1)
+            s = np.random.uniform(a, b)
+            (idx, p, data) = self.tree.get(s)
+            if data != 0 and data is not None:
+                priorities.append(p)
+                batch.append(data)
+                idxs.append(idx)
+
+        sampling_probabilities = np.array(priorities) / self.tree.total()
+        is_weights = np.power(self.tree.size * sampling_probabilities, -self.beta)
+        is_weights /= is_weights.max()
+
+        return batch, np.array(idxs), is_weights
+
+    def update_priorities(self, tree_idxs: np.ndarray, td_errors: np.ndarray):
+        priorities = (np.abs(td_errors) + self.epsilon) ** self.alpha
+        self.max_priority = max(self.max_priority, np.max(priorities))
+        for i, idx in enumerate(tree_idxs):
+            self.tree.update(int(idx), priorities[i])
+
+    def __len__(self):
+        return self.tree.size
 

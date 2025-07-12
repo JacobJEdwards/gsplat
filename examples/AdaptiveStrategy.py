@@ -14,104 +14,13 @@ from torch.distributions import Categorical
 from torch_geometric.nn import GATConv, knn_graph
 
 from gsplat.utils import normalized_quat_to_rotmat
-from utils import knn_with_ids
+from utils import PrioritizedReplayBuffer
 from gsplat.strategy.ops import (
     remove,
     reset_opa,
 )
 from gsplat.strategy.default import DefaultStrategy
-from ops import split, duplicate
-
-class SumTree:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.tree = np.zeros(2 * capacity - 1)
-        self.data = np.zeros(capacity, dtype=object)
-        self.data_pointer = 0
-        self.size = 0
-
-    def _propagate(self, idx: int, change: float):
-        parent = (idx - 1) // 2
-        self.tree[parent] += change
-        if parent != 0:
-            self._propagate(parent, change)
-
-    def _retrieve(self, idx: int, s: float) -> int:
-        left = 2 * idx + 1
-        right = left + 1
-        if left >= len(self.tree):
-            return idx
-        if s <= self.tree[left]:
-            return self._retrieve(left, s)
-        else:
-            return self._retrieve(right, s - self.tree[left])
-
-    def total(self) -> float:
-        return self.tree[0]
-
-    def add(self, p: float, data: object):
-        idx = self.data_pointer + self.capacity - 1
-        self.data[self.data_pointer] = data
-        self.update(idx, p)
-        self.data_pointer += 1
-        if self.data_pointer >= self.capacity:
-            self.data_pointer = 0
-        if self.size < self.capacity:
-            self.size += 1
-
-    def update(self, idx: int, p: float):
-        change = p - self.tree[idx]
-        self.tree[idx] = p
-        self._propagate(idx, change)
-
-    def get(self, s: float) -> tuple[int, float, object]:
-        idx = self._retrieve(0, s)
-        data_idx = idx - self.capacity + 1
-        return idx, self.tree[idx], self.data[data_idx]
-
-
-class PrioritizedReplayBuffer:
-    """A Replay Buffer that uses a SumTree to sample experiences based on priority."""
-    def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4, beta_increment_per_sampling: float = 0.001):
-        self.tree = SumTree(capacity)
-        self.capacity = capacity
-        self.alpha = alpha
-        self.beta = beta
-        self.beta_increment_per_sampling = beta_increment_per_sampling
-        self.epsilon = 1e-5
-        self.max_priority = 1.0
-
-    def add(self, experience: object):
-        self.tree.add(self.max_priority, experience)
-
-    def sample(self, batch_size: int) -> tuple[list, np.ndarray, np.ndarray]:
-        batch, idxs, priorities = [], [], []
-        segment = self.tree.total() / batch_size
-        self.beta = np.min([1., self.beta + self.beta_increment_per_sampling])
-
-        for i in range(batch_size):
-            a, b = segment * i, segment * (i + 1)
-            s = np.random.uniform(a, b)
-            (idx, p, data) = self.tree.get(s)
-            if data != 0 and data is not None:
-                priorities.append(p)
-                batch.append(data)
-                idxs.append(idx)
-
-        sampling_probabilities = np.array(priorities) / self.tree.total()
-        is_weights = np.power(self.tree.size * sampling_probabilities, -self.beta)
-        is_weights /= is_weights.max()
-
-        return batch, np.array(idxs), is_weights
-
-    def update_priorities(self, tree_idxs: np.ndarray, td_errors: np.ndarray):
-        priorities = (np.abs(td_errors) + self.epsilon) ** self.alpha
-        self.max_priority = max(self.max_priority, np.max(priorities))
-        for i, idx in enumerate(tree_idxs):
-            self.tree.update(int(idx), priorities[i])
-
-    def __len__(self):
-        return self.tree.size
+from ops import split, duplicate, merge
 
 
 class GaussianGraphNetwork(nn.Module):
@@ -138,15 +47,15 @@ class ActorCriticNetwork(nn.Module):
         self.base_net = nn.Sequential(
             nn.Linear(input_dim, mlp_width),
             nn.LayerNorm(mlp_width),
-            nn.PReLU(),
+            nn.SELU(),
             nn.Linear(mlp_width, mlp_width),
             nn.LayerNorm(mlp_width),
-            nn.PReLU(),
+            nn.SELU(),
         )
 
         self.critic_head = nn.Linear(mlp_width, 1)
 
-        self.actor_discrete_head = nn.Linear(mlp_width, 4)
+        self.actor_discrete_head = nn.Linear(mlp_width, 5)
 
         self.actor_continuous_head = nn.Linear(mlp_width, 2)
 
@@ -475,7 +384,6 @@ class AdaptiveStrategy(DefaultStrategy):
                              (step % self.nrqm_every == 0)
 
         if should_update_maps:
-            t = time.time()
             self._update_quality_map(params, state, info)
             state["last_nrqm_step"] = step
 
@@ -511,7 +419,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
 
         if self.use_learned_densification and step > 1000 and step % self.learn_every == 0:
-            t = time.time()
             self._train_actor_critic(state)
 
     def _update_state(
@@ -747,7 +654,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
             action = experience["action"]
             action_reward = 0.0
-            if action == 0:
+            if action == 0 or action == 4:
                 action_reward = self.action_cost_weight
             elif action == 2 or action == 3:
                 action_reward = -self.action_cost_weight
@@ -830,7 +737,7 @@ class AdaptiveStrategy(DefaultStrategy):
         subset_indices = torch.where(subset_mask)[0]
 
         graph_embeddings, px, py, ptx, pty, valid_mask_subset = self._get_graph_representation(params, state,
-                                                                                             subset_mask, step)
+                                                                                               subset_mask, step)
         if graph_embeddings is None:
             return 0,0,0
 
@@ -866,37 +773,34 @@ class AdaptiveStrategy(DefaultStrategy):
 
         age_in_steps = state["age"][subset_indices]
         significance = state["significance"][subset_indices]
-
         is_too_young_to_prune = age_in_steps < 500
-
         is_too_significant_to_prune = significance > self.prune_significance_threshold
-
         pruning_forbidden_mask = is_too_young_to_prune | is_too_significant_to_prune
 
         subset_is_prune = (actions == 0)
         subset_is_dupe  = (actions == 2)
         subset_is_split = (actions == 3)
+        subset_is_merge = (actions == 4)
 
         subset_is_prune[pruning_forbidden_mask] = False
+        subset_is_merge[pruning_forbidden_mask] = False
+
+        # Establish action priority: Prune > Merge > Dupe/Split
+        pruned_mask_on_subset = subset_is_prune
+        final_subset_is_merge = subset_is_merge & ~pruned_mask_on_subset
+        final_subset_is_dupe = subset_is_dupe & ~pruned_mask_on_subset
+        final_subset_is_split = subset_is_split & ~pruned_mask_on_subset
 
         scales = torch.exp(params["scales"])
         subset_scales = scales[subset_indices]
         is_too_small_to_split = subset_scales.max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]
         is_too_big_to_dupe = ~is_too_small_to_split
 
-        subset_is_split[is_too_small_to_split] = False
-        subset_is_dupe[is_too_big_to_dupe] = False
-
-        pruned_mask_on_subset = subset_is_prune
-
-        final_subset_is_dupe = subset_is_dupe & ~pruned_mask_on_subset
-        final_subset_is_split = subset_is_split & ~pruned_mask_on_subset
+        final_subset_is_split[is_too_small_to_split] = False
+        final_subset_is_dupe[is_too_big_to_dupe] = False
 
         final_split_ratios = continuous_params[final_subset_is_split, 0]
         final_dupe_offset_mags = continuous_params[final_subset_is_dupe, 1]
-
-        global_is_prune = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
-        global_is_prune[subset_indices[pruned_mask_on_subset]] = True
 
         for i, original_idx in enumerate(subset_indices):
             if valid_mask_subset[i]:
@@ -915,34 +819,65 @@ class AdaptiveStrategy(DefaultStrategy):
         per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance", "age"]
         state_to_modify = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
 
+        current_subset_indices = subset_indices
+
+        # --- 1. MERGE ---
+        global_is_merge = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
+        global_is_merge[current_subset_indices[final_subset_is_merge]] = True
+        n_merge_pairs = 0
+
+        if global_is_merge.any():
+            removed_by_merge_mask, n_merge_pairs = merge(params, optimizers, state_to_modify, global_is_merge)
+
+            num_gaussians_before_merge = num_gaussians
+            num_gaussians = len(params["means"])
+
+            orig_to_post_merge_map = torch.full((num_gaussians_before_merge,), -1, dtype=torch.long, device=device)
+            orig_to_post_merge_map[~removed_by_merge_mask] = torch.arange((~removed_by_merge_mask).sum(), device=device)
+
+            post_merge_subset_indices = orig_to_post_merge_map[current_subset_indices]
+            valid_after_merge = post_merge_subset_indices != -1
+
+            current_subset_indices = post_merge_subset_indices[valid_after_merge]
+            pruned_mask_on_subset = pruned_mask_on_subset[valid_after_merge]
+            final_subset_is_dupe = final_subset_is_dupe[valid_after_merge]
+            final_subset_is_split = final_subset_is_split[valid_after_merge]
+            continuous_params = continuous_params[valid_after_merge]
+
+            final_split_ratios = continuous_params[final_subset_is_split, 0]
+            final_dupe_offset_mags = continuous_params[final_subset_is_dupe, 1]
+
+        global_is_prune = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
+        global_is_prune[current_subset_indices[pruned_mask_on_subset]] = True
         n_prune = global_is_prune.sum().item()
 
-        if global_is_prune.any():
+        if n_prune > 0:
             remove(params, optimizers, state_to_modify, global_is_prune)
 
         post_prune_indices = torch.arange(num_gaussians, device=device)[~global_is_prune]
-
         orig_to_post_prune_map = torch.full((num_gaussians,), -1, dtype=torch.long, device=device)
         orig_to_post_prune_map[post_prune_indices] = torch.arange(len(post_prune_indices), device=device)
 
-        post_prune_subset_indices = orig_to_post_prune_map[subset_indices]
+        post_prune_subset_indices = orig_to_post_prune_map[current_subset_indices]
 
+        valid_after_prune = post_prune_subset_indices != -1
+        dupe_mask_after_prune = final_subset_is_dupe[valid_after_prune]
+        split_mask_after_prune = final_subset_is_split[valid_after_prune]
+        dupe_split_continuous_params = continuous_params[valid_after_prune]
+
+        dupe_indices_in_new_space = post_prune_subset_indices[valid_after_prune][dupe_mask_after_prune]
+        split_indices_in_new_space = post_prune_subset_indices[valid_after_prune][split_mask_after_prune]
+
+        final_dupe_offset_mags = dupe_split_continuous_params[dupe_mask_after_prune, 1]
+        final_split_ratios = dupe_split_continuous_params[split_mask_after_prune, 0]
 
         num_after_prune = len(params["means"])
 
         global_is_dupe_after_prune = torch.zeros(num_after_prune, dtype=torch.bool, device=device)
-        global_is_split_after_prune = torch.zeros(num_after_prune, dtype=torch.bool, device=device)
-
-        dupe_subset_indices_post_prune = post_prune_subset_indices[final_subset_is_dupe]
-        split_subset_indices_post_prune = post_prune_subset_indices[final_subset_is_split]
-
-        global_is_dupe_after_prune[dupe_subset_indices_post_prune[dupe_subset_indices_post_prune != -1]] = True
-        global_is_split_after_prune[split_subset_indices_post_prune[split_subset_indices_post_prune != -1]] = True
-
+        global_is_dupe_after_prune[dupe_indices_in_new_space] = True
         n_dupli = global_is_dupe_after_prune.sum().item()
-        if n_dupli > 0:
-            dupe_indices_in_new_space = torch.where(global_is_dupe_after_prune)[0]
 
+        if n_dupli > 0:
             dupe_scales = torch.exp(params["scales"][dupe_indices_in_new_space])
             dupe_quats = F.normalize(params["quats"][dupe_indices_in_new_space], dim=-1)
             dupe_rotmats = normalized_quat_to_rotmat(dupe_quats)
@@ -955,9 +890,12 @@ class AdaptiveStrategy(DefaultStrategy):
 
             duplicate(params, optimizers, state_to_modify, global_is_dupe_after_prune, offsets=duplication_offsets)
 
-        n_split = global_is_split_after_prune.sum().item()
+        global_is_split_after_prune = torch.zeros(num_after_prune, dtype=torch.bool, device=device)
+        global_is_split_after_prune[split_indices_in_new_space] = True
+        is_split_after_dup = torch.cat([global_is_split_after_prune, torch.zeros(n_dupli, dtype=torch.bool, device=device)])
+        n_split = is_split_after_dup.sum().item()
+
         if n_split > 0:
-            is_split_after_dup = torch.cat([global_is_split_after_prune, torch.zeros(n_dupli, dtype=torch.bool, device=device)])
             split(params, optimizers, state_to_modify, is_split_after_dup,
                   anisotropic=self.anisotropic_split, revised_opacity=self.revised_opacity,
                   split_ratios=final_split_ratios)

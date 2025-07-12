@@ -2,6 +2,7 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
+from examples.utils import knn_with_ids, knn_with_ids_two_tensor
 from gsplat.strategy.ops import _update_param_with_optimizer
 from gsplat.utils import normalized_quat_to_rotmat
 
@@ -137,3 +138,103 @@ def duplicate(
     for k, v in state.items():
         if isinstance(v, torch.Tensor):
             state[k] = torch.cat((v, v[sel]))
+
+@torch.no_grad()
+def merge(
+        params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
+        optimizers: dict[str, torch.optim.Optimizer],
+        state: dict[str, Tensor],
+        mask: Tensor,
+) -> tuple[Tensor, int]:
+    """
+    In-place merges selected Gaussians with their nearest neighbors, reducing the total count.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        state: A dictionary of running states (e.g. age, grad2d).
+        mask: A boolean mask indicating which Gaussians should initiate a merge.
+
+    Returns:
+        A tuple containing:
+        - A boolean mask of the same size as the input, indicating which Gaussians were removed.
+        - An integer count of the new Gaussians that were created.
+    """
+    if not mask.any():
+        return torch.zeros_like(mask, dtype=torch.bool), 0
+
+    device = mask.device
+    source_indices = torch.where(mask)[0]
+    all_means = params["means"]
+
+    _, nn_indices = knn_with_ids_two_tensor(all_means[source_indices], all_means, K=2)
+    target_indices = nn_indices[:, 1]
+
+    unique_pairs = set()
+    for i, j in zip(source_indices.tolist(), target_indices.tolist()):
+        if i != j:
+            pair = tuple(sorted((i, j)))
+            unique_pairs.add(pair)
+
+    if not unique_pairs:
+        return torch.zeros_like(mask, dtype=torch.bool), 0
+
+    pairs = torch.tensor(list(unique_pairs), device=device)
+    indices_i, indices_j = pairs[:, 0], pairs[:, 1]
+
+    opacities_i = torch.sigmoid(params["opacities"][indices_i])
+    opacities_j = torch.sigmoid(params["opacities"][indices_j])
+
+    alpha_sum = opacities_i + opacities_j + 1e-8
+    w_i = opacities_i / alpha_sum
+    w_j = opacities_j / alpha_sum
+
+    new_opacities_alpha = 1.0 - (1.0 - opacities_i) * (1.0 - opacities_j)
+    new_opacities = torch.logit(torch.clamp(new_opacities_alpha, 1e-6, 1.0 - 1e-6))
+
+    new_means = w_i.unsqueeze(-1) * params["means"][indices_i] + w_j.unsqueeze(-1) * params["means"][indices_j]
+    new_scales = w_i.unsqueeze(-1) * torch.exp(params["scales"][indices_i]) + w_j.unsqueeze(-1) * torch.exp(params["scales"][indices_j])
+    new_scales = torch.log(torch.clamp(new_scales, min=1e-8))
+
+    quat_mask = (opacities_i > opacities_j).unsqueeze(-1)
+    new_quats = torch.where(quat_mask, params["quats"][indices_i], params["quats"][indices_j])
+
+    colors_i = torch.cat([params["sh0"][indices_i], params["shN"][indices_i]], dim=1)
+    colors_j = torch.cat([params["sh0"][indices_j], params["shN"][indices_j]], dim=1)
+    new_colors = w_i.unsqueeze(-1).unsqueeze(-1) * colors_i + w_j.unsqueeze(-1).unsqueeze(-1) * colors_j
+    new_sh0, new_shN = new_colors[:, :1], new_colors[:, 1:]
+
+    new_params_dict = {
+        "means": new_means, "scales": new_scales, "opacities": new_opacities,
+        "quats": new_quats, "sh0": new_sh0, "shN": new_shN
+    }
+
+    prune_mask = torch.zeros(len(mask), dtype=torch.bool, device=device)
+    prune_mask[indices_i] = True
+    prune_mask[indices_j] = True
+    kept_mask = ~prune_mask
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        p_kept = p[kept_mask]
+        p_new = new_params_dict.get(name)
+        if p_new is None:
+            return torch.nn.Parameter(p_kept, requires_grad=p.requires_grad)
+        return torch.nn.Parameter(torch.cat([p_kept, p_new]), requires_grad=p.requires_grad)
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v_kept = v[kept_mask]
+        v_new = torch.zeros((len(new_means), *v.shape[1:]), device=v.device)
+        return torch.cat([v_kept, v_new])
+
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor) and v.shape[0] == len(mask):
+            v_kept = v[kept_mask]
+            v_from_i, v_from_j = v[indices_i], v[indices_j]
+            w_i_reshaped = w_i.view(-1, *([1]*(v.dim()-1)))
+            w_j_reshaped = w_j.view(-1, *([1]*(v.dim()-1)))
+            v_new = w_i_reshaped * v_from_i + w_j_reshaped * v_from_j
+            state[k] = torch.cat([v_kept, v_new])
+
+    return prune_mask, len(new_means)

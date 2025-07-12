@@ -862,13 +862,13 @@ class AdaptiveStrategy(DefaultStrategy):
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> Tuple[int, int, int, int]:
         """
-        Robust, sequential implementation of geometry updates using the dual-agent system.
-        This version uses explicit index remapping to prevent out-of-bounds errors.
+        Robust implementation using a state-independent action resolution strategy.
+        Conflicts are resolved before any modifications, ensuring index stability.
         """
         initial_num_gaussians = len(params["means"])
         device = params["means"].device
 
-        # 1. Agent Decision Making
+        # 1. Agent Decision Making on a Subset
         subset_mask = torch.rand(initial_num_gaussians, device=device) < self.subset_fraction
         if subset_mask.sum() == 0: return 0, 0, 0, 0
 
@@ -878,6 +878,7 @@ class AdaptiveStrategy(DefaultStrategy):
         if graph_embeddings is None: return 0, 0, 0, 0
         px, py, ptx, pty, valid_mask_subset = coords
 
+        # Create global context vector for network input
         avg_scale = torch.exp(params['scales']).mean() / state['scene_scale']
         std_scale = torch.exp(params['scales']).std() / state['scene_scale']
         global_context = torch.tensor([
@@ -889,154 +890,119 @@ class AdaptiveStrategy(DefaultStrategy):
         expanded_global_context = global_context.unsqueeze(0).expand(graph_embeddings.shape[0], -1)
         ac_input = torch.cat([graph_embeddings, expanded_global_context], dim=-1)
 
-        # Get Pruning Decisions
-        prune_mask_on_subset = torch.zeros(len(original_subset_indices), dtype=torch.bool, device=device)
+        # Get all potential actions from agents
+        # Pruning actions
+        prune_actions = torch.zeros(len(original_subset_indices), dtype=torch.bool, device=device)
         if self.use_learned_pruning:
             self.pruning_ac_net.eval()
             prune_logits, _ = self.pruning_ac_net(ac_input)
             prune_dist = Bernoulli(logits=prune_logits)
-            prune_actions = prune_dist.sample()
+            prune_actions = (prune_dist.sample() == 1)
 
-            age_in_steps = state["age"][original_subset_indices]
-            significance = state["significance"][original_subset_indices]
-            is_too_young = age_in_steps < 800
-            is_too_significant = significance > self.prune_significance_threshold
-
-            prune_mask_on_subset = (prune_actions == 1) & ~is_too_young & ~is_too_significant
-
-            for i, is_valid in enumerate(valid_mask_subset):
-                if is_valid and prune_mask_on_subset[i]:
-                    exp = {"step": step, "features": ac_input[i].detach().cpu(), "action": 1,
-                           "log_prob": prune_dist.log_prob(prune_actions[i]).detach().cpu(),
-                           "px": px[i], "py": py[i],
-                           "initial_error": state["l1_loss_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean()}
-                    state["pruning_hindsight_buffer"].append(exp)
-
-        # Get Densification Decisions
+        # Densification actions
         self.ac_net.eval()
         action_logits, _, continuous_params = self.ac_net(ac_input)
-
         progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
         epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)
-
         densify_dist = Categorical(logits=action_logits)
         if torch.rand(1).item() < epsilon:
-            densify_actions_on_subset = torch.randint(0, 4, (len(original_subset_indices),), device=device)
+            densify_actions = torch.randint(0, 4, (len(original_subset_indices),), device=device)
         else:
-            densify_actions_on_subset = densify_dist.sample()
+            densify_actions = densify_dist.sample()
 
-        for i, is_valid in enumerate(valid_mask_subset):
-            if is_valid:
-                exp = {"step": step, "features": ac_input[i].detach().cpu(), "action": densify_actions_on_subset[i].detach().cpu(),
-                       "log_prob": densify_dist.log_prob(densify_actions_on_subset[i]).detach().cpu(),
-                       "px": px[i], "py": py[i], "ptx": ptx[i], "pty": pty[i],
-                       "initial_error": state["l1_loss_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean(),
-                       "initial_quality": state.get("quality_heatmap", torch.zeros(1,1,device=device))[pty[i], ptx[i]],
-                       "initial_uncertainty": state.get("geom_uncertainty_map", torch.zeros(1,1,device=device))[py[i], px[i]]}
-                state["densify_hindsight_buffer"].append(exp)
+        # 2. Resolve Action Conflicts with a Priority System
+        # Action codes: 0=Keep, 1=Split, 2=Duplicate, 3=Merge, 4=Prune
+        final_actions = torch.zeros_like(densify_actions) # Default to Keep
 
-        # --- 2. Execute Geometry Modifications Sequentially with Correct Remapping ---
+        # Apply densification actions first
+        final_actions[densify_actions == 1] = 1 # Split
+        final_actions[densify_actions == 2] = 2 # Duplicate
+        final_actions[densify_actions == 3] = 3 # Merge
+
+        # Apply pruning action (highest priority)
+        final_actions[prune_actions] = 4 # Prune
+
+        # Apply heuristics (e.g., age, significance for pruning)
+        age_in_steps = state["age"][original_subset_indices]
+        significance = state["significance"][original_subset_indices]
+        prune_heuristic_mask = (age_in_steps < 800) | (significance > self.prune_significance_threshold)
+        final_actions[(final_actions == 4) & prune_heuristic_mask] = 0 # Revert invalid prunes to Keep
+
+        # 3. Create Final, Disjoint Masks for Each Action
+        final_prune_mask_on_subset = (final_actions == 4)
+        final_merge_mask_on_subset = (final_actions == 3)
+        final_split_mask_on_subset = (final_actions == 1)
+        final_dupe_mask_on_subset = (final_actions == 2)
+
+        # 4. Execute Operations Sequentially with Simple Remapping
+        n_prune, n_merge_pairs, n_split, n_dupli = 0, 0, 0, 0
 
         # A. PRUNE
         global_prune_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=device)
-        global_prune_mask[original_subset_indices] = prune_mask_on_subset
+        global_prune_mask[original_subset_indices[final_prune_mask_on_subset]] = True
         n_prune = global_prune_mask.sum().item()
-
         if n_prune > 0:
             remove(params, optimizers, state, global_prune_mask)
-
         prune_map = torch.full((initial_num_gaussians,), -1, dtype=torch.long, device=device)
         prune_map[~global_prune_mask] = torch.arange(initial_num_gaussians - n_prune, device=device)
-        num_gaussians_post_prune = len(params["means"])
 
         # B. MERGE
-        active_mask_post_prune = ~prune_mask_on_subset
-        actions_post_prune = densify_actions_on_subset[active_mask_post_prune]
-        indices_orig_post_prune = original_subset_indices[active_mask_post_prune]
-
-        merge_mask_on_active = (actions_post_prune == 3)
-        merge_candidate_orig_indices = indices_orig_post_prune[merge_mask_on_active]
-
+        num_gaussians_post_prune = len(params["means"])
         global_merge_mask = torch.zeros(num_gaussians_post_prune, dtype=torch.bool, device=device)
-        if len(merge_candidate_orig_indices) > 0:
-            remapped_merge_indices = prune_map[merge_candidate_orig_indices]
-            valid_merge_indices = remapped_merge_indices[remapped_merge_indices != -1]
-            if len(valid_merge_indices) > 0:
-                global_merge_mask[valid_merge_indices] = True
-
-        n_merge_pairs = 0
+        merge_orig_indices = original_subset_indices[final_merge_mask_on_subset]
+        if len(merge_orig_indices) > 0:
+            remapped_merge_indices = prune_map[merge_orig_indices]
+            global_merge_mask[remapped_merge_indices[remapped_merge_indices != -1]] = True
         if global_merge_mask.any():
             removed_by_merge_mask, n_merge_pairs = merge(params, optimizers, state, global_merge_mask)
         else:
             removed_by_merge_mask = torch.zeros(num_gaussians_post_prune, dtype=torch.bool, device=device)
 
-        merge_map = torch.full((num_gaussians_post_prune,), -1, dtype=torch.long, device=device)
-        merge_map[~removed_by_merge_mask] = torch.arange(num_gaussians_post_prune - removed_by_merge_mask.sum(), device=device)
-        num_gaussians_post_merge = len(params["means"])
-
         # C. SPLIT
-        active_mask_post_merge = ~merge_mask_on_active
-        actions_post_merge = actions_post_prune[active_mask_post_merge]
-        indices_orig_post_merge = indices_orig_post_prune[active_mask_post_merge]
-        continuous_params_post_merge = continuous_params[active_mask_post_prune][active_mask_post_merge]
-
-        split_mask_on_active = (actions_post_merge == 1)
-        split_candidate_orig_indices = indices_orig_post_merge[split_mask_on_active]
-        continuous_params_for_split = continuous_params_post_merge[split_mask_on_active]
-
+        num_gaussians_post_merge = len(params["means"])
         global_split_mask = torch.zeros(num_gaussians_post_merge, dtype=torch.bool, device=device)
-        n_split = 0
-        if len(split_candidate_orig_indices) > 0:
-            remapped_split_indices = merge_map[prune_map[split_candidate_orig_indices]]
-            valid_remapped_mask = remapped_split_indices != -1
+        split_orig_indices = original_subset_indices[final_split_mask_on_subset]
+        split_continuous_params = continuous_params[final_split_mask_on_subset]
 
-            final_split_indices = remapped_split_indices[valid_remapped_mask]
-            final_split_params = continuous_params_for_split[valid_remapped_mask]
+        if len(split_orig_indices) > 0:
+            merge_map = torch.full((num_gaussians_post_prune,), -1, dtype=torch.long, device=device)
+            merge_map[~removed_by_merge_mask] = torch.arange(num_gaussians_post_prune - removed_by_merge_mask.sum(), device=device)
+            remapped_split_indices = merge_map[prune_map[split_orig_indices]]
+            valid_mask = remapped_split_indices != -1
+            global_split_mask[remapped_split_indices[valid_mask]] = True
 
-            if len(final_split_indices) > 0:
-                global_split_mask[final_split_indices] = True
-                n_split = global_split_mask.sum().item()
-
-                assert n_split == len(final_split_params), f"Split count mismatch: {n_split} vs {len(final_split_params)}"
-
-                split_ratios = final_split_params[:, 0]
-                split_directions = final_split_params[:, 2:5]
+            n_split = global_split_mask.sum().item()
+            if n_split > 0:
+                split_ratios = split_continuous_params[valid_mask, 0]
+                split_directions = split_continuous_params[valid_mask, 2:5]
+                assert n_split == len(split_directions), "Internal logic error: split mismatch"
                 split(params, optimizers, state, global_split_mask, split_ratios=split_ratios, directions=split_directions)
 
-        num_gaussians_post_split = len(params["means"])
-
         # D. DUPLICATE
-        active_mask_post_split = ~split_mask_on_active
-        actions_post_split = actions_post_merge[active_mask_post_split]
-        indices_orig_post_split = indices_orig_post_merge[active_mask_post_split]
-        continuous_params_post_split = continuous_params_post_merge[active_mask_post_split]
-
-        dupe_mask_on_active = (actions_post_split == 2)
-        dupe_candidate_orig_indices = indices_orig_post_split[dupe_mask_on_active]
-        continuous_params_for_dupe = continuous_params_post_split[dupe_mask_on_active]
-
-        # Remap original indices to the post-split space
-        split_map = torch.full((num_gaussians_post_merge,), -1, dtype=torch.long, device=device)
-        split_map[~global_split_mask] = torch.arange(num_gaussians_post_merge - n_split, device=device)
-
+        num_gaussians_post_split = len(params["means"])
         global_dupe_mask = torch.zeros(num_gaussians_post_split, dtype=torch.bool, device=device)
-        n_dupli = 0
-        if len(dupe_candidate_orig_indices) > 0:
-            remapped_dupe_indices = split_map[merge_map[prune_map[dupe_candidate_orig_indices]]]
-            valid_remapped_mask = remapped_dupe_indices != -1
+        dupe_orig_indices = original_subset_indices[final_dupe_mask_on_subset]
+        dupe_continuous_params = continuous_params[final_dupe_mask_on_subset]
 
-            final_dupe_indices = remapped_dupe_indices[valid_remapped_mask]
-            final_dupe_params = continuous_params_for_dupe[valid_remapped_mask]
+        if len(dupe_orig_indices) > 0:
+            # Re-create maps as sizes have changed
+            prune_map = torch.full((initial_num_gaussians,), -1, dtype=torch.long, device=device)
+            prune_map[~global_prune_mask] = torch.arange(initial_num_gaussians - n_prune, device=device)
+            merge_map = torch.full((num_gaussians_post_prune,), -1, dtype=torch.long, device=device)
+            merge_map[~removed_by_merge_mask] = torch.arange(num_gaussians_post_prune - removed_by_merge_mask.sum(), device=device)
+            split_map = torch.full((num_gaussians_post_merge,), -1, dtype=torch.long, device=device)
+            split_map[~global_split_mask] = torch.arange(num_gaussians_post_merge - n_split, device=device)
 
-            if len(final_dupe_indices) > 0:
-                # The indices are now valid in the post-split, pre-duplication space
-                global_dupe_mask[final_dupe_indices] = True
-                n_dupli = global_dupe_mask.sum().item()
+            remapped_dupe_indices = split_map[merge_map[prune_map[dupe_orig_indices]]]
+            valid_mask = remapped_dupe_indices != -1
 
-                assert n_dupli == len(final_dupe_params), f"Duplicate count mismatch: {n_dupli} vs {len(final_dupe_params)}"
-
-                dupe_offset_mags = final_dupe_params[:, 1]
-                dupe_directions = final_dupe_params[:, 5:8]
+            n_dupli = valid_mask.sum().item()
+            if n_dupli > 0:
+                global_dupe_mask[remapped_dupe_indices[valid_mask]] = True
+                dupe_params = dupe_continuous_params[valid_mask]
+                dupe_offset_mags = dupe_params[:, 1]
+                dupe_directions = dupe_params[:, 5:8]
+                assert n_dupli == len(dupe_directions), "Internal logic error: duplicate mismatch"
 
                 dupe_indices = torch.where(global_dupe_mask)[0]
                 dupe_scales = torch.exp(params["scales"][dupe_indices])

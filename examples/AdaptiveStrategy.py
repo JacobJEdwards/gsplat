@@ -169,9 +169,9 @@ class AdaptiveStrategy(DefaultStrategy):
     pruning_net: Any = field(default=None, repr=False)
     pruning_optimizer: Any = field(default=None, repr=False)
 
-    w_photometric: float = 0.6
-    w_quality: float = -0.2
-    w_uncertainty: float = 0.2
+    w_photometric: float = 1.0
+    w_quality: float = -0.5
+    w_uncertainty: float = 1.0
 
     rasterizer_fn: Any = field(default=None, repr=False)
     nrqm_model: Any = field(default=None, repr=False)
@@ -616,8 +616,9 @@ class AdaptiveStrategy(DefaultStrategy):
             reward_photo = experience["initial_error"] - current_error
 
             current_quality = state["quality_heatmap"][patch_y, patch_x]
-            current_uncertainty = state["geom_uncertainty_map"][py, px]
             reward_quality = experience["initial_quality"] - current_quality
+
+            current_uncertainty = state["geom_uncertainty_map"][py, px]
             reward_uncertainty = experience["initial_uncertainty"] - current_uncertainty
 
             final_reward = (self.w_photometric * reward_photo +

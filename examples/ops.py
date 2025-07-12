@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
-from examples.utils import knn_with_ids_two_tensor
+from utils import knn_with_ids_two_tensor
 from gsplat.strategy.ops import _update_param_with_optimizer
 from gsplat.utils import normalized_quat_to_rotmat
 

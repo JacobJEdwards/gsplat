@@ -93,7 +93,7 @@ class PrioritizedReplayBuffer:
             a, b = segment * i, segment * (i + 1)
             s = np.random.uniform(a, b)
             (idx, p, data) = self.tree.get(s)
-            if data is not 0:
+            if data != 0 and data is not None:
                 priorities.append(p)
                 batch.append(data)
                 idxs.append(idx)

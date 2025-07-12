@@ -622,7 +622,7 @@ class AdaptiveStrategy(DefaultStrategy):
                             self.w_uncertainty * reward_uncertainty)
 
             if len(state["replay_buffer"]) < state["replay_buffer"].maxlen:
-                state["replay_buffer"].append((experience["features"], final_reward.clone().detach()))
+                state["replay_buffer"].append((experience["features"], experience["action"], final_reward.clone().detach()))
 
     def _train_actor_critic(self, state: dict[str, Any]):
         if len(state["replay_buffer"]) < 256:

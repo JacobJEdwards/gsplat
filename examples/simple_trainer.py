@@ -699,11 +699,14 @@ class Runner:
             )
 
             # loss
-            l1loss = F.l1_loss(colors, pixels)
+            l1_loss_unreduced = torch.abs(colors - pixels)
+            l1_loss_map = l1_loss_unreduced.mean(dim=-1, keepdim=True).detach() # [B, H, W, 1]
+            l1loss = l1_loss_unreduced.mean()
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -876,6 +879,7 @@ class Runner:
                 info["Ks"] = Ks
                 info["pixels"] = pixels
                 info["image_ids"] = image_ids
+                info["l1_loss_map"] = l1_loss_map
 
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,

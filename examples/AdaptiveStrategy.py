@@ -76,7 +76,7 @@ class ActorCriticNetwork(nn.Module):
 class PatchBasedNRQM(nn.Module):
     def __init__(self):
         super().__init__()
-        self.brisque = piq.BRISQUELoss(reduction='none', data_range=1.)
+        self.brisque = piq.BRISQUELoss(reduction='none')
 
     def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
         return self.brisque(image_patches)
@@ -183,6 +183,7 @@ class AdaptiveStrategy(DefaultStrategy):
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
         state.update({
+            "loss_map": None,
             "quality_heatmap": None,
             "view_proj_matrix": None,
             "stagnation_count": None,
@@ -351,12 +352,14 @@ class AdaptiveStrategy(DefaultStrategy):
 
             state["significance"] = 0.9 * state["significance"] + 0.1 * current_significance
 
+
         should_update_maps = (state["last_nrqm_step"] == -1 and step > 0) or \
                              (step % self.nrqm_every == 0)
 
         if should_update_maps:
+            loss_map = info["l1_loss_map"].squeeze(0)
             t = time.time()
-            self._update_quality_map(params, state, info)
+            self._update_quality_map(params, state, info, loss_map)
             if self.verbose:
                 print(f"Updated quality maps in {time.time() - t:.2f} seconds.")
             state["last_nrqm_step"] = step
@@ -464,7 +467,15 @@ class AdaptiveStrategy(DefaultStrategy):
             params: dict[str, torch.nn.Parameter],
             state: dict[str, Any],
             info: dict[str, Any],
+            l1_loss_map: Tensor,
     ):
+        if state["photometric_error_map"] is None:
+            state["photometric_error_map"] = l1_loss_map
+        else:
+            state["photometric_error_map"] = torch.lerp(
+                l1_loss_map, state["photometric_error_map"], self.nrqm_ema_decay
+            )
+
         step = info["step"]
         width, height = info['width'], info['height']
         sh_degree_to_use = min(step // 1000, 3)
@@ -556,35 +567,6 @@ class AdaptiveStrategy(DefaultStrategy):
         quality_factor = torch.clamp(1.0 + (normalized_quality - 1.0) * 0.5, 0.5, 1.5).item()
         state["dynamic_grow_grad2d"] = self.grow_grad2d * quality_factor
 
-        gt_image = info["pixels"]
-        gt_ids = info["image_ids"]
-        gt_ks = info["Ks"]
-        camtoworlds_gt = info["camtoworlds"]
-        rendered_train_view, _, _ = self.rasterizer_fn(
-            means=params["means"], quats=params["quats"], scales=params["scales"],
-            opacities=params["opacities"], colors=torch.cat([params["sh0"], params["shN"]], 1),
-            Ks=gt_ks, width=width, height=height, sh_degree=sh_degree_to_use,
-            camtoworlds=camtoworlds_gt, image_ids=gt_ids,
-        )
-
-        if self.lpips_metric is not None:
-            rendered_p = rendered_train_view.permute(0, 3, 1, 2)
-            gt_p = gt_image.permute(0, 3, 1, 2)
-
-            with torch.no_grad():
-                feats_render = self.lpips_metric(rendered_p, gt_p)
-
-            photometric_error_map = feats_render
-        else:
-            photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=-1).squeeze(0)
-
-
-        if state["photometric_error_map"] is None:
-            state["photometric_error_map"] = photometric_error_map
-        else:
-            state["photometric_error_map"] = torch.lerp(
-                photometric_error_map, state["photometric_error_map"], self.nrqm_ema_decay
-            )
 
     @torch.no_grad()
     def _project_to_patch_coords(self, means3d: Tensor, view_proj_matrix: Tensor, h: int, w: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -739,7 +721,7 @@ class AdaptiveStrategy(DefaultStrategy):
         for i, original_idx in enumerate(subset_indices):
             if valid_mask_subset[i]:
                 experience = {
-                    "step": step, "features": features[i].detach().cpu(),
+                    "step": step, "features": graph_embeddings[i].detach().cpu(),
                     "action": actions[i].detach().cpu(),
                     "continuous_params": continuous_params[i].detach().cpu(),
                     "pixel_coords": (px[i], py[i]), "patch_coords": (ptx[i], pty[i]),
@@ -805,250 +787,3 @@ class AdaptiveStrategy(DefaultStrategy):
         state.update(state_to_modify)
 
         return n_dupli, n_split, n_prune
-
-
-    @torch.no_grad()
-    def _grow_gs(
-            self,
-            params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
-            optimizers: dict[str, torch.optim.Optimizer],
-            state: dict[str, Any],
-            step: int,
-    ) -> tuple[int, int]:
-        num_gaussians = len(params["means"])
-        device = params["means"].device
-
-        subset_size = min(num_gaussians, self.max_densification_subset)
-        selection = torch.randperm(num_gaussians, device=device)[:subset_size]
-
-        subset_mask = torch.rand(num_gaussians, device=device) < self.subset_fraction
-        subset_mask[selection] = True
-        subset_indices = torch.where(subset_mask)[0]
-
-        if subset_indices.numel() == 0:
-            if self.verbose:
-                print("Skipping Gaussian growth: no valid subset indices.")
-
-            return 0, 0
-
-        t = time.time()
-        features_subset, px, py, ptx, pty, valid_mask_subset = self._get_gaussian_features(params, state, subset_mask, step)
-        if self.verbose:
-            print(f"Extracted features for {len(subset_indices)} Gaussians in {time.time() - t:.2f} seconds.")
-
-        if features_subset is None:
-            if self.verbose:
-                print("Skipping Gaussian growth: no valid features extracted.")
-
-            return 0, 0
-
-        if self.use_learned_densification and step >= self.bootstrap_steps:
-            self.densification_net.eval()
-            with torch.no_grad():
-                t = time.time()
-                utility_scores = self.densification_net(features_subset).squeeze()
-                if self.verbose:
-                    print(f"Computed utility scores for {len(subset_indices)} Gaussians in {time.time() - t:.2f} seconds.")
-        else:
-            utility_scores = features_subset[:, 12]
-
-        if self.use_learned_densification:
-            if self.verbose:
-                print(f"Appending {len(subset_indices)} Gaussians to hindsight buffer.")
-            for i, original_idx in enumerate(subset_indices):
-                if valid_mask_subset[i]:
-                    initial_error = state["photometric_error_map"][max(0, py[i]-2):py[i]+3, max(0, px[i]-2):px[i]+3].mean()
-                    initial_quality = state["quality_heatmap"][pty[i], ptx[i]]
-                    initial_uncertainty = state["geom_uncertainty_map"][py[i], px[i]]
-
-                    state["hindsight_buffer"].append({
-                        "step": step, "features": features_subset[i].detach().cpu(),
-                        "pixel_coords": (px[i], py[i]), "patch_coords": (ptx[i], pty[i]),
-                        "initial_error": initial_error, "initial_quality": initial_quality,
-                        "initial_uncertainty": initial_uncertainty
-                    })
-
-        scales_subset = torch.exp(params["scales"][subset_mask])
-        is_small_subset = scales_subset.max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]
-
-        dupli_candidates_mask = is_small_subset
-        split_candidates_mask = ~is_small_subset
-
-        is_dupli = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
-        dupli_indices_in_subset = torch.where(dupli_candidates_mask)[0]
-        n_dupli = min(len(dupli_indices_in_subset), self.max_duplications_per_step)
-        if n_dupli > 0:
-            t = time.time()
-            dupli_scores = utility_scores[dupli_indices_in_subset]
-            _, top_indices = topk(dupli_scores, n_dupli, dim=-1)
-            final_dupli_indices_in_subset = dupli_indices_in_subset[top_indices]
-            is_dupli[subset_indices[final_dupli_indices_in_subset]] = True
-            if self.verbose:
-                print(f"Selected {n_dupli} Gaussians for duplication in {time.time() - t:.2f} seconds.")
-
-        is_split = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
-        split_indices_in_subset = torch.where(split_candidates_mask)[0]
-        n_split = min(len(split_indices_in_subset), self.max_splits_per_step)
-        if n_split > 0:
-            t = time.time()
-            split_scores = utility_scores[split_indices_in_subset]
-            _, top_indices = topk(split_scores, n_split, dim=-1)
-            final_split_indices_in_subset = split_indices_in_subset[top_indices]
-            is_split[subset_indices[final_split_indices_in_subset]] = True
-            if self.verbose:
-                print(f"Selected {n_split} Gaussians for splitting in {time.time() - t:.2f} seconds.")
-
-        per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance"]
-        state_to_densify = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
-
-        if n_dupli > 0:
-            t = time.time()
-            duplicate(params, optimizers, state_to_densify, is_dupli)
-            if self.verbose:
-                print(f"Duplicated {n_dupli} Gaussians in {time.time() - t:.2f} seconds.")
-        if n_split > 0:
-            t = time.time()
-            is_split_after_dup = torch.cat([is_split, torch.zeros(n_dupli, dtype=torch.bool, device=device)])
-            split(params, optimizers, state_to_densify, is_split_after_dup, anisotropic=self.anisotropic_split,
-                  revised_opacity=self.revised_opacity)
-            if self.verbose:
-                print(f"Split {n_split} Gaussians in {time.time() - t:.2f} seconds.")
-
-
-        state.update(state_to_densify)
-
-        if n_dupli > 0 or n_split > 0:
-            if n_dupli > 0:
-                state["age"][-n_dupli:] = 0
-
-        state["prev_grad2d"] = state["grad2d"] / state["count"].clamp_min(1)
-        state["prev_opacity"] = torch.sigmoid(params["opacities"].flatten())
-
-        return n_dupli, n_split
-
-    @torch.no_grad()
-    def _prune_gs(
-            self,
-            params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-            optimizers: Dict[str, torch.optim.Optimizer],
-            state: Dict[str, Any],
-            step: int,
-    ) -> int:
-        is_prune_original = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
-        if step > self.reset_every:
-            is_too_big = (
-                    torch.exp(params["scales"]).max(dim=-1).values
-                    > self.prune_scale3d * state["scene_scale"]
-            )
-            if step < self.refine_scale2d_stop_iter:
-                is_too_big |= state["radii"] > self.prune_scale2d
-            is_prune_original |= is_too_big
-
-        is_prune_stagnant = torch.zeros_like(is_prune_original)
-        if state.get("quality_heatmap") is not None and step > state["last_nrqm_step"] and state["quality_heatmap"].numel() > 0:
-            if state.get("stagnation_count") is None:
-                state["stagnation_count"] = torch.zeros(params["means"].shape[0], dtype=torch.int, device=params["means"].device)
-
-            grads = state["grad2d"] / state["count"].clamp_min(1)
-            is_grad_low = grads < self.grow_grad2d
-
-            means3d = params["means"]
-            h = state["quality_heatmap"].shape[0] * self.nrqm_patch_size
-            w = state["quality_heatmap"].shape[1] * self.nrqm_patch_size
-
-            patch_coords_x, patch_coords_y, _, _, valid_mask = self._project_to_patch_coords(
-                means3d, state["view_proj_matrix"], h, w
-            )
-
-            patch_coords_x, patch_coords_y, _, _, valid_mask = self._project_to_patch_coords(params["means"], state["view_proj_matrix"], h, w)
-
-            is_in_low_quality_region = torch.zeros_like(is_prune_original)
-            valid_indices = torch.where(valid_mask)[0]
-            if valid_indices.numel() > 0:
-                patch_scores = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
-                is_in_low_quality_region[valid_indices] = patch_scores < self.nrqm_stagnation_threshold
-            is_stagnant = is_grad_low & is_in_low_quality_region
-
-            state["stagnation_count"][is_stagnant] += 1
-            state["stagnation_count"][~is_stagnant] = (state["stagnation_count"][~is_stagnant] - 1).clamp(min=0)
-            is_prune_stagnant = state["stagnation_count"] > self.nrqm_prune_stagnant_after
-
-        is_prune_significant = torch.zeros_like(is_prune_original)
-        if "significance" in state and state["significance"] is not None and state["significance"].numel() > 0:
-            if state["significance"].numel() == is_prune_original.numel():
-                is_prune_significant = state["significance"] < self.prune_significance_threshold
-
-
-        is_prune_redundant = torch.zeros_like(is_prune_original)
-        if self.prune_redundant and self.knn_fn is not None:
-            num_gaussians = len(params["means"])
-            device = params["means"].device
-            subset_mask = torch.rand(num_gaussians, device=device) < self.subset_fraction
-            subset_indices_map = torch.where(subset_mask)[0]
-
-            if subset_indices_map.numel() > self.redundancy_knn:
-                subset_means = params["means"][subset_mask]
-                dists_subset, idxs_subset = self.knn_fn(subset_means, K=self.redundancy_knn)
-                original_neighbor_idxs = subset_indices_map[idxs_subset[:, 1:]]
-                neighbor_scales = torch.exp(params["scales"][original_neighbor_idxs]).max(dim=-1).values
-
-                neighbor_opacities = torch.sigmoid(params["opacities"][original_neighbor_idxs].squeeze(-1))
-                neighbor_sh0 = params["sh0"][original_neighbor_idxs].squeeze(-2)
-                scales_subset = torch.exp(params["scales"][subset_mask]).max(dim=-1).values
-                opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
-                sh0_subset = params["sh0"][subset_mask].squeeze(1)
-
-                overlap_mask = dists_subset[:, 1:] < (scales_subset.unsqueeze(1) + neighbor_scales) * self.redundancy_overlap_thresh
-                color_dist = torch.norm(sh0_subset.unsqueeze(1) - neighbor_sh0, dim=-1)
-                color_sim_mask = color_dist < self.redundancy_color_thresh
-                is_less_opaque = opacities_subset.unsqueeze(1) < neighbor_opacities
-                is_redundant_neighbor = overlap_mask & color_sim_mask & is_less_opaque
-                is_prune_redundant[subset_indices_map] = is_redundant_neighbor.any(dim=1)
-
-        if self.use_learned_pruning and "photometric_error_map" in state:
-            subset_mask = torch.rand(params["means"].shape[0], device=params["means"].device) < 0.1 # Use a small subset
-            t = time.time()
-            features, _, _, _, _, _ = self._get_gaussian_features(params, state, subset_mask, step)
-            if self.verbose:
-                print(f"Extracted features for learned pruning in {time.time() - t:.2f} seconds.")
-
-            if features is not None:
-                heuristic_prune_labels = (
-                        is_prune_original[subset_mask] |
-                        is_prune_stagnant[subset_mask] |
-                        is_prune_redundant[subset_mask] |
-                        is_prune_significant[subset_mask]
-                )
-
-                for i in range(features.shape[0]):
-                    if len(state["pruning_replay_buffer"]) < state["pruning_replay_buffer"].maxlen:
-                        state["pruning_replay_buffer"].append(
-                            (features[i].detach().cpu(), heuristic_prune_labels[i].detach().cpu())
-                        )
-
-        is_prune_learned = torch.zeros_like(is_prune_original)
-        if self.use_learned_pruning and step > self.pruning_bootstrap_steps and "photometric_error_map" in state:
-            self.pruning_net.eval()
-
-            t = time.time()
-            all_features, _, _, _, _, _ = self._get_gaussian_features(params, state, torch.ones_like(is_prune_original), step)
-            if self.verbose:
-                print(f"Extracted features for all Gaussians in {time.time() - t:.2f} seconds.")
-
-            if all_features is not None:
-                pruning_logits = self.pruning_net(all_features).squeeze(-1)
-                pruning_probs = torch.sigmoid(pruning_logits)
-                is_prune_learned = torch.rand_like(pruning_probs) < pruning_probs
-
-        is_prune = is_prune_original | is_prune_stagnant | is_prune_redundant | is_prune_significant | is_prune_learned
-
-        n_prune = is_prune.sum().item()
-        if n_prune > 0:
-            per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance"]
-            state_to_prune = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
-
-            remove(params=params, optimizers=optimizers, state=state_to_prune, mask=is_prune)
-
-            state.update(state_to_prune)
-
-        return n_prune

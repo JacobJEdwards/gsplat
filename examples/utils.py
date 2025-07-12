@@ -7,8 +7,8 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
-import faiss
-import faiss.contrib.torch_utils
+# import faiss
+# import faiss.contrib.torch_utils
 
 
 class CameraOptModule(torch.nn.Module):
@@ -163,27 +163,27 @@ def knn_with_ids(x: Tensor, K: int = 4, batch_size: int = 2000) -> tuple[Tensor,
 
     return all_distances, all_indices
 
-def faiss_knn_with_ids(
-        x: Tensor, K: int = 4
-) -> tuple[Tensor, Tensor]:
-    x_np = x.cpu().numpy().astype('float32')
-    N, D = x_np.shape
-
-    index_cpu = faiss.IndexFlatL2(D)
-
-    res = faiss.StandardGpuResources()
-    index_gpu = faiss.index_cpu_to_gpu(res, 0, index_cpu)
-
-    index_gpu.add(x_np)
-
-    D_np, I_np = index_gpu.search(x_np, K)
-
-    distances = torch.from_numpy(D_np)
-    indices = torch.from_numpy(I_np).long()
-
-    euclidean_distances = torch.sqrt(distances)
-
-    return euclidean_distances.to(x.device), indices.to(x.device)
+# def faiss_knn_with_ids(
+#         x: Tensor, K: int = 4
+# ) -> tuple[Tensor, Tensor]:
+#     x_np = x.cpu().numpy().astype('float32')
+#     N, D = x_np.shape
+#
+#     index_cpu = faiss.IndexFlatL2(D)
+#
+#     res = faiss.StandardGpuResources()
+#     index_gpu = faiss.index_cpu_to_gpu(res, 0, index_cpu)
+#
+#     index_gpu.add(x_np)
+#
+#     D_np, I_np = index_gpu.search(x_np, K)
+#
+#     distances = torch.from_numpy(D_np)
+#     indices = torch.from_numpy(I_np).long()
+#
+#     euclidean_distances = torch.sqrt(distances)
+#
+#     return euclidean_distances.to(x.device), indices.to(x.device)
 
 def rgb_to_sh(rgb: Tensor) -> Tensor:
     C0 = 0.28209479177387814

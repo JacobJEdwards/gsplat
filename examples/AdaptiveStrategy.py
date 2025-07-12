@@ -158,7 +158,7 @@ class AdaptiveStrategy(DefaultStrategy):
     hindsight_delay: int = 100
 
     actor_loss_weight: float = 1.0
-    entropy_loss_weight: float = 0.01
+    entropy_loss_weight: float = 0.05
     continuous_loss_weight: float = 0.5
 
     use_learned_pruning: bool = True

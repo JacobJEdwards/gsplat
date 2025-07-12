@@ -14,6 +14,7 @@ def split(
         mask: Tensor,
         revised_opacity: bool = False,
         anisotropic: bool = False,
+        split_ratios: Tensor | None = None,
 ):
     """Inplace split the Gaussian with the given mask.
 
@@ -24,6 +25,7 @@ def split(
         revised_opacity: Whether to use revised opacity formulation
           from arXiv:2404.06109. Default: False.
         anisotropic: Whether to split along the largest variance axis. Default: False.
+        split_ratios (Optional[Tensor]): Per-Gaussian split ratios. If None, uses a default.
     """
     device = mask.device
     sel = torch.where(mask)[0]
@@ -59,13 +61,13 @@ def split(
         if name == "means":
             p_split = (p[sel] + samples).reshape(-1, 3)  # [2N, 3]
         elif name == "scales":
+            current_split_ratios = split_ratios if split_ratios is not None else torch.full((len(scales),), 1.6, device=device)
             if anisotropic:
-                # Reduce the scale along the split axis
                 new_scales_val = scales.clone()
-                new_scales_val[torch.arange(len(scales)), largest_scale_idx] /= 1.6
+                new_scales_val[torch.arange(len(scales)), largest_scale_idx] /= current_split_ratios
                 p_split = torch.log(new_scales_val).repeat(2, 1)
             else:
-                p_split = torch.log(scales / 1.6).repeat(2, 1)  # [2N, 3]
+                p_split = torch.log(scales / current_split_ratios[:, None]).repeat(2, 1)  # [2N, 3]
         elif name == "opacities" and revised_opacity:
             original_alpha = torch.sigmoid(p[sel])
             original_alpha = torch.clamp(original_alpha, 0.0, 1.0 - 1e-6)

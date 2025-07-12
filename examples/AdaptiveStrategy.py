@@ -672,6 +672,8 @@ class AdaptiveStrategy(DefaultStrategy):
         if subset_mask.sum() == 0:
             return
 
+        subset_indices = torch.where(subset_mask)[0]
+
         features, px, py, ptx, pty, valid_mask_subset = self._get_gaussian_features(params, state, subset_mask, step)
         if features is None:
             return
@@ -682,7 +684,29 @@ class AdaptiveStrategy(DefaultStrategy):
         dist = Categorical(logits=action_logits)
         actions = dist.sample()
 
-        subset_indices = torch.where(subset_mask)[0]
+
+        subset_is_prune = (actions == 0)
+        subset_is_dupe  = (actions == 2)
+        subset_is_split = (actions == 3)
+
+        subset_scales = torch.exp(params["scales"][subset_indices])
+        is_too_small_to_split = subset_scales.max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]
+        is_too_big_to_dupe = ~is_too_small_to_split
+
+        subset_is_split[is_too_small_to_split] = False
+        subset_is_dupe[is_too_big_to_dupe] = False
+
+        global_is_prune = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
+        global_is_prune[subset_indices[subset_is_prune]] = True
+
+        pruned_mask_on_subset = torch.zeros(len(subset_indices), dtype=torch.bool, device=device)
+        pruned_mask_on_subset[subset_is_prune] = True
+
+        final_subset_is_dupe = subset_is_dupe & ~pruned_mask_on_subset
+        final_subset_is_split = subset_is_split & ~pruned_mask_on_subset
+
+        final_split_ratios = continuous_params[final_subset_is_split, 0]
+
         for i, original_idx in enumerate(subset_indices):
             if valid_mask_subset[i]:
                 experience = {
@@ -696,48 +720,46 @@ class AdaptiveStrategy(DefaultStrategy):
                 }
                 state["hindsight_buffer"].append(experience)
 
-        is_prune = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
-        is_dupe = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
-        is_split = torch.zeros(num_gaussians, dtype=torch.bool, device=device)
-
-        is_prune[subset_indices] = (actions == 0)
-        is_dupe[subset_indices] = (actions == 2)
-        is_split[subset_indices] = (actions == 3)
-
-        scales = torch.exp(params["scales"])
-        is_too_small_to_split = scales.max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]
-        is_too_big_to_dupe = ~is_too_small_to_split
-
-        is_split[is_too_small_to_split] = False
-        is_dupe[is_too_big_to_dupe] = False
-
         per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance", "age"]
         state_to_modify = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
 
-        n_pruned = is_prune.sum().item()
-        if n_pruned > 0:
-            remove(params, optimizers, state_to_modify, is_prune)
+        if global_is_prune.any():
+            remove(params, optimizers, state_to_modify, global_is_prune)
 
-        is_dupe = is_dupe[~is_prune]
-        is_split = is_split[~is_prune]
+        post_prune_indices = torch.arange(num_gaussians, device=device)[~global_is_prune]
 
-        n_dupli = is_dupe.sum().item()
+        orig_to_post_prune_map = torch.full((num_gaussians,), -1, dtype=torch.long, device=device)
+        orig_to_post_prune_map[post_prune_indices] = torch.arange(len(post_prune_indices), device=device)
+
+        post_prune_subset_indices = orig_to_post_prune_map[subset_indices]
+
+        num_after_prune = len(params["means"])
+        global_is_dupe_after_prune = torch.zeros(num_after_prune, dtype=torch.bool, device=device)
+        global_is_split_after_prune = torch.zeros(num_after_prune, dtype=torch.bool, device=device)
+
+        dupe_subset_indices_post_prune = post_prune_subset_indices[final_subset_is_dupe]
+        split_subset_indices_post_prune = post_prune_subset_indices[final_subset_is_split]
+
+        global_is_dupe_after_prune[dupe_subset_indices_post_prune[dupe_subset_indices_post_prune != -1]] = True
+        global_is_split_after_prune[split_subset_indices_post_prune[split_subset_indices_post_prune != -1]] = True
+
+        n_dupli = global_is_dupe_after_prune.sum().item()
         if n_dupli > 0:
-            # pass the learned offset to a modified duplicate function.
-            duplicate(params, optimizers, state_to_modify, is_dupe)
-            if "age" in state_to_modify: state_to_modify["age"][-n_dupli:] = 0
+            duplicate(params, optimizers, state_to_modify, global_is_dupe_after_prune)
 
-        n_split = is_split.sum().item()
+        n_split = global_is_split_after_prune.sum().item()
         if n_split > 0:
-            is_split_after_dup = torch.cat([is_split, torch.zeros(n_dupli, dtype=torch.bool, device=device)])
-
-            split_ratios = continuous_params[actions == 3, 0]
-
+            is_split_after_dup = torch.cat([global_is_split_after_prune, torch.zeros(n_dupli, dtype=torch.bool, device=device)])
             split(params, optimizers, state_to_modify, is_split_after_dup,
                   anisotropic=self.anisotropic_split, revised_opacity=self.revised_opacity,
-                  split_ratios=split_ratios)
+                  split_ratios=final_split_ratios)
+
+
+        if n_dupli > 0:
+            state["age"][-n_dupli:] = 0
 
         state.update(state_to_modify)
+
 
     @torch.no_grad()
     def _grow_gs(

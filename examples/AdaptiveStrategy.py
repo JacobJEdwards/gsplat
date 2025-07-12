@@ -452,16 +452,9 @@ class AdaptiveStrategy(DefaultStrategy):
             gt_p = gt_image.permute(0, 3, 1, 2)
 
             with torch.no_grad():
-                feats_render = self.lpips_metric.net(rendered_p)
-                feats_gt = self.lpips_metric.net(gt_p)
+                feats_render = self.lpips_metric(rendered_p, gt_p)
 
-            error_maps = []
-            for feat_r, feat_g in zip(feats_render, feats_gt):
-                error_map_layer = (feat_r - feat_g).abs().mean(dim=1, keepdim=True)
-                error_map_resized = F.interpolate(error_map_layer, size=(height, width), mode='bilinear', align_corners=False)
-                error_maps.append(error_map_resized)
-
-            photometric_error_map = torch.stack(error_maps).mean(dim=0).squeeze()
+            photometric_error_map = torch.stack(feats_render)
         else:
             photometric_error_map = F.l1_loss(rendered_train_view, gt_image)
 

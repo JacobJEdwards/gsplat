@@ -40,7 +40,7 @@ class GaussianGraphNetwork(nn.Module):
         return x
 
 class ActorCriticNetwork(nn.Module):
-    def __init__(self, input_dim: int = 18, mlp_width: int = 64):
+    def __init__(self, input_dim: int = 18, mlp_width: int = 64, hidden_dim: int = 64):
         super().__init__()
         self.base_net = nn.Sequential(
             nn.Linear(input_dim, mlp_width),
@@ -50,17 +50,20 @@ class ActorCriticNetwork(nn.Module):
             nn.LayerNorm(mlp_width),
             nn.SELU(),
         )
+        self.gru_cell = nn.GRUCell(mlp_width, hidden_dim)
 
-        self.critic_head = nn.Linear(mlp_width, 1)
-        self.actor_discrete_head = nn.Linear(mlp_width, 4)
-        self.actor_continuous_head = nn.Linear(mlp_width, 8)
+        self.critic_head = nn.Linear(hidden_dim, 1)
+        self.actor_discrete_head = nn.Linear(hidden_dim, 4)
+        self.actor_continuous_head = nn.Linear(hidden_dim, 8)
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, x: Tensor, h_old: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         base_features = self.base_net(x)
-        value = self.critic_head(base_features).squeeze(-1)
-        action_logits = self.actor_discrete_head(base_features)
+        h_new = self.gru_cell(base_features, h_old)
 
-        continuous_params = self.actor_continuous_head(base_features)
+        value = self.critic_head(h_new).squeeze(-1)
+        action_logits = self.actor_discrete_head(h_new)
+
+        continuous_params = self.actor_continuous_head(h_new)
         split_ratio = 1.2 + 2.0 * torch.sigmoid(continuous_params[:, 0])
         dupe_offset_mag = torch.sigmoid(continuous_params[:, 1])
         split_dir = F.normalize(continuous_params[:, 2:5], dim=-1)
@@ -69,11 +72,11 @@ class ActorCriticNetwork(nn.Module):
         processed_continuous_params = torch.cat([
             split_ratio.unsqueeze(-1), dupe_offset_mag.unsqueeze(-1), split_dir, dupe_dir
         ], dim=-1)
-        return action_logits, value, processed_continuous_params
+        return action_logits, value, processed_continuous_params, h_new
 
 class PruningActorCritic(nn.Module):
     """A dedicated agent for the binary decision of pruning a Gaussian."""
-    def __init__(self, input_dim: int = 18, mlp_width: int = 64):
+    def __init__(self, input_dim: int = 18, mlp_width: int = 64, hidden_dim: int = 64):
         super().__init__()
         self.base_net = nn.Sequential(
             nn.Linear(input_dim, mlp_width),
@@ -81,14 +84,18 @@ class PruningActorCritic(nn.Module):
             nn.Linear(mlp_width, mlp_width),
             nn.LayerNorm(mlp_width), nn.SELU(),
         )
+        self.gru_cell = nn.GRUCell(mlp_width, mlp_width)
+
         self.critic_head = nn.Linear(mlp_width, 1)
         self.actor_head = nn.Linear(mlp_width, 1)
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, h_old: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         base_features = self.base_net(x)
-        value = self.critic_head(base_features).squeeze(-1)
-        action_logit = self.actor_head(base_features).squeeze(-1)
-        return action_logit, value
+        h_new = self.gru_cell(base_features, h_old)
+
+        value = self.critic_head(h_new).squeeze(-1)
+        action_logit = self.actor_head(h_new).squeeze(-1)
+        return action_logit, value, h_new
 
 class ICMModule(nn.Module):
     """Intrinsic Curiosity Module to encourage exploration."""
@@ -172,6 +179,7 @@ class AdaptiveStrategy(DefaultStrategy):
     gnn_edge_dim: int = 4
     gnn_hidden_dim: int = 32
     gnn_embedding_dim: int = 16
+    ac_hidden_dim: int = 64
     num_global_features: int = 5
     use_learned_strategy: bool = True
     bootstrap_steps: int = 5000
@@ -270,6 +278,8 @@ class AdaptiveStrategy(DefaultStrategy):
             "prev_opacity": None,
             "age": None,
             "l1_loss_map": None,
+            "ac_hidden_states": None,
+            "pruning_ac_hidden_states": None,
         })
 
         return state
@@ -283,12 +293,14 @@ class AdaptiveStrategy(DefaultStrategy):
             hidden_dim=self.gnn_hidden_dim, output_dim=self.gnn_embedding_dim,
         ).to(device)
 
-        self.ac_net = ActorCriticNetwork(input_dim=ac_input_dim).to(device)
+        self.ac_net = ActorCriticNetwork(input_dim=ac_input_dim, mlp_width=self.ac_hidden_dim, hidden_dim=self.ac_hidden_dim).to(
+            device)
         densify_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
         self.densify_optimizer = torch.optim.AdamW(densify_params, lr=1e-4, weight_decay=1e-5)
 
         if self.use_learned_pruning:
-            self.pruning_ac_net = PruningActorCritic(input_dim=ac_input_dim).to(device)
+            self.pruning_ac_net = PruningActorCritic(input_dim=ac_input_dim, mlp_width=self.ac_hidden_dim,
+                                                     hidden_dim=self.ac_hidden_dim).to(device)
             pruning_params = list(self.gnn_net.parameters()) + list(self.pruning_ac_net.parameters())
             self.pruning_optimizer = torch.optim.AdamW(pruning_params, lr=5e-5, weight_decay=1e-5)
 
@@ -908,6 +920,16 @@ class AdaptiveStrategy(DefaultStrategy):
 
         if state.get("view_matrix") is None: return 0,0,0,0
 
+        if state.get("ac_hidden_states") is None or state["ac_hidden_states"].shape[0] != initial_num_gaussians:
+            state["ac_hidden_states"] = torch.zeros(
+                (initial_num_gaussians, self.ac_hidden_dim), device=device
+            )
+
+        if self.use_learned_pruning and (state.get("pruning_ac_hidden_states") is None or state["pruning_ac_hidden_states"].shape[0] != initial_num_gaussians):
+            state["pruning_ac_hidden_states"] = torch.zeros(
+                (initial_num_gaussians, self.ac_hidden_dim), device=device
+            )
+
         grad_thresh = state["dynamic_grow_grad2d"]
         candidates_by_grad = state["grad2d"] / state["count"].clamp_min(1) > grad_thresh
 
@@ -957,12 +979,17 @@ class AdaptiveStrategy(DefaultStrategy):
         prune_actions = torch.zeros(len(original_subset_indices), dtype=torch.bool, device=device)
         if self.use_learned_pruning:
             self.pruning_ac_net.eval()
-            prune_logits, _ = self.pruning_ac_net(ac_input)
+            h_prev = state['pruning_ac_hidden_states'][original_subset_indices]
+
+            prune_logits, _, h_new = self.pruning_ac_net(ac_input, h_prev=h_prev)
+            state['pruning_ac_hidden_states'][original_subset_indices] = h_new
             prune_dist = Bernoulli(logits=prune_logits)
             prune_actions = (prune_dist.sample() == 1)
 
         self.ac_net.eval()
-        action_logits, _, continuous_params = self.ac_net(ac_input)
+        h_prev = state['ac_hidden_states'][original_subset_indices]
+        action_logits, _, continuous_params, h_new = self.ac_net(ac_input, h_prev=h_prev)
+        state['ac_hidden_states'][original_subset_indices] = h_new
         progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
         epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)
         densify_dist = Categorical(logits=action_logits)
@@ -998,7 +1025,6 @@ class AdaptiveStrategy(DefaultStrategy):
         final_split_mask_subset = (final_actions == 1)
         final_dupe_mask_subset = (final_actions == 2)
 
-        # 3. Execute Operations Sequentially
         state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "significance"]}
 
         # A. PRUNE

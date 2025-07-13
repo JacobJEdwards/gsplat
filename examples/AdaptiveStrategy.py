@@ -180,7 +180,7 @@ class AdaptiveStrategy(DefaultStrategy):
     end_exploration_epsilon: float = 0.05
     exploration_decay_steps: int = 15000
 
-    prune_age_threshold: int = 600
+    prune_age_threshold: int = 1000
     prune_significance_threshold: float = 0.01
 
     subset_fraction: float = 1.0
@@ -905,7 +905,8 @@ class AdaptiveStrategy(DefaultStrategy):
                 (initial_num_gaussians, self.num_temporal_steps, hidden_dim), device=device
             )
 
-        grad_thresh = state["dynamic_grow_grad2d"]
+        # grad_thresh = state["dynamic_grow_grad2d"]
+        grad_thresh = self.grow_grad2d
         candidates_by_grad = state["grad2d"] / state["count"].clamp_min(1) > grad_thresh
 
         h, w = state['l1_loss_map'].shape[0], state['l1_loss_map'].shape[1]
@@ -1008,20 +1009,20 @@ class AdaptiveStrategy(DefaultStrategy):
         # prune_mask = (region_decision_for_each_gaussian == 2)
         # final_actions[prune_mask & ((final_actions == 1) | (final_actions == 2))] = 0
 
-        # age_in_steps = state["age"][original_subset_indices]
-        # significance = state["significance"][original_subset_indices]
-        # scales_mag = torch.exp(params["scales"][original_subset_indices]).norm(dim=-1)
-        # opacities = torch.sigmoid(params["opacities"][original_subset_indices])
-        #
-        # prune_merge_veto_mask = (
-        #         (age_in_steps < self.prune_age_threshold) |
-        #         (significance > self.prune_significance_threshold) |
-        #         (opacities > self.prune_opa) |
-        #         (scales_mag > self.prune_scale3d * state["scene_scale"])
-        # )
+        age_in_steps = state["age"][original_subset_indices]
+        significance = state["significance"][original_subset_indices]
+        scales_mag = torch.exp(params["scales"][original_subset_indices]).norm(dim=-1)
+        opacities = torch.sigmoid(params["opacities"][original_subset_indices])
 
-        # final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
-        # final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
+        prune_merge_veto_mask = (
+                (age_in_steps < self.prune_age_threshold) |
+                (significance > self.prune_significance_threshold) |
+                (opacities > self.prune_opa) |
+                (scales_mag > self.prune_scale3d * state["scene_scale"])
+        )
+
+        final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
+        final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
 
         final_finetune_mask_subset = (final_actions == 5) # Finetune action
         final_prune_mask_subset = (final_actions == 4) # Prune action

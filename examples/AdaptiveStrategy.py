@@ -979,6 +979,10 @@ class AdaptiveStrategy(DefaultStrategy):
                     if actions[i] != ACTION_DO_NOTHING: # Only store meaningful actions
                         state["expert_replay_buffer"].append((ac_input[i].cpu(), actions[i].cpu(), 0.0)) # reward is calculated later
 
+            continuous_params = torch.zeros((len(original_subset_indices), 5), device=device)  # Placeholder for split params
+            h_new = torch.zeros((len(original_subset_indices), self.ac_hidden_dim), device=device)  # Placeholder for hidden states
+            lr_multipliers = torch.ones((len(original_subset_indices),), device=device)  # Placeholder for LR multipliers
+
         else: # Use the learned RL agent
             self.ac_net.eval()
             h_prev = state['ac_hidden_states'][original_subset_indices]

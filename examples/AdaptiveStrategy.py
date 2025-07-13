@@ -756,6 +756,7 @@ class AdaptiveStrategy(DefaultStrategy):
                     state.get("quality_heatmap") is None or \
                     state.get("geom_uncertainty_map") is None \
                     or state.get("detail_error_map") is None:
+                print("Skipping hindsight processing due to missing maps.")
                 continue
 
             px, py = exp["px"], exp["py"]

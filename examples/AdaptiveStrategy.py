@@ -238,6 +238,7 @@ class AdaptiveStrategy(DefaultStrategy):
             batch_size=256
         )
         state.update({
+            "prev_means": None,
             "quality_heatmap": None,
             "view_proj_matrix": None,
             "view_matrix": None,
@@ -257,7 +258,7 @@ class AdaptiveStrategy(DefaultStrategy):
         return state
 
     def _initialize_learning_components(self, device) -> None:
-        raw_feature_dim = 19
+        raw_feature_dim = 21
         ac_feature_dim = self.gnn_hidden_dim * 2
 
         self.gnn_net = TemporalGaussianGNN(
@@ -283,7 +284,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     @torch.no_grad()
     def _get_raw_features(
-            self, params: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
+            self, params: dict, optimizers: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
     ) -> tuple[Tensor, tuple, Tensor]:
         num_subset = subset_mask.sum().item()
         device = params["means"].device
@@ -298,7 +299,7 @@ class AdaptiveStrategy(DefaultStrategy):
             means3d_subset, state["view_proj_matrix"], h, w
         )
 
-        feature_dim = 19
+        feature_dim = 21
         features = torch.zeros(num_subset, feature_dim, device=device)
 
         opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
@@ -363,14 +364,26 @@ class AdaptiveStrategy(DefaultStrategy):
         view_alignment = torch.abs((largest_axis * view_dirs).sum(dim=-1))
         features[:, 18] = view_alignment
 
+        if state.get("prev_means") is not None and state["prev_means"].shape == params["means"].shape:
+            mean_velocity = torch.norm(params["means"][subset_mask] - state["prev_means"][subset_mask], dim=-1)
+            features[:, 19] = mean_velocity / state["scene_scale"]
+
+        mean_optimizer = optimizers.get("means")
+
+        if mean_optimizer is not None and 'exp_avg_sq' in mean_optimizer.state[params['means']]:
+            optimizer_state_mag = torch.norm(mean_optimizer.state[params['means']]['exp_avg_sq'][subset_mask], dim=-1)
+            features[:, 20] = torch.log1p(optimizer_state_mag)
+
         return torch.nan_to_num(features, 0.0), (pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y), valid_mask
 
     @torch.no_grad()
     def _get_motion_aware_features(
-            self, params: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
+            self, params: dict, optimizers: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
     ) -> tuple[Tensor, tuple, Tensor]:
         original_indices = torch.where(subset_mask)[0]
-        raw_features, (px, py, ptx, pty), valid_mask = self._get_raw_features(params, state, subset_mask, step, campos)
+        raw_features, (px, py, ptx, pty), valid_mask = self._get_raw_features(params, optimizers, state, subset_mask,
+                                                                                                  step,
+                                                                                         campos)
 
         if raw_features is None:
             return None, None, None
@@ -415,7 +428,6 @@ class AdaptiveStrategy(DefaultStrategy):
         if step >= self.refine_stop_iter:
             return
 
-        devices = params["means"].device
         if state.get("custom_lr_timers") is not None:
             active_lr_mask = state["custom_lr_timers"] > 0
             if active_lr_mask.any():
@@ -873,9 +885,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
         subset_means = params["means"][subset_mask]
         motion_features, (px_sub, py_sub, ptx_sub, pty_sub, valid_mask_subset), _ = self._get_motion_aware_features(
-            params, state,
-                                                                                             subset_mask, step,
-                                                                                campos)
+            params, optimizers, state,subset_mask, step,campos)
+
         if motion_features is None: return 0, 0, 0, 0, 0
 
         if len(subset_means) < self.num_regions: return 0,0,0,0,0
@@ -931,15 +942,20 @@ class AdaptiveStrategy(DefaultStrategy):
             }
             state["hindsight_buffer"].append(exp)
 
-        # age_in_steps = state["age"][original_subset_indices]
-        # significance = state["significance"][original_subset_indices]
+        age_in_steps = state["age"][original_subset_indices]
+        significance = state["significance"][original_subset_indices]
+        scales_mag = torch.exp(params["scales"][original_subset_indices]).norm(dim=-1)
+        opacities = torch.sigmoid(params["opacities"][original_subset_indices])
 
-        # prune_merge_veto_mask = (
-        #         (age_in_steps < self.prune_age_threshold)
-        #         # (significance > self.prune_significance_threshold)
-        # )
-        # final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
-        # final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
+        prune_merge_veto_mask = (
+                (age_in_steps < self.prune_age_threshold) |
+                (significance > self.prune_significance_threshold) |
+                (opacities > self.prune_opa) |
+                (scales_mag > self.prune_scale3d * state["scene_scale"])
+        )
+
+        final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
+        final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
 
         final_finetune_mask_subset = (final_actions == 5)
         final_prune_mask_subset = (final_actions == 4)
@@ -1049,5 +1065,7 @@ class AdaptiveStrategy(DefaultStrategy):
         state.update(state_to_modify)
         if n_dupli > 0: state["age"][-n_dupli:] = 0
         if n_split > 0: state["age"][-(n_split*2):-n_split] = 0; state["age"][-n_split:] = 0
+
+        state["prev_means"] = params["means"].clone()
 
         return n_dupli, n_split, n_prune, n_merge_pairs, n_finetune

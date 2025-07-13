@@ -682,7 +682,6 @@ class AdaptiveStrategy(DefaultStrategy):
             print("Processing hindsight buffer...")
 
             exp = state["hindsight_buffer"].popleft()
-            action = exp["action"]
 
             if state.get("l1_loss_map") is None or \
                     state.get("quality_heatmap") is None or \
@@ -701,16 +700,16 @@ class AdaptiveStrategy(DefaultStrategy):
             reward_quality = exp["initial_quality"] - current_quality
 
             current_uncertainty = state["geom_uncertainty_map"][py, px]
-            reward_uncertainty = exp["initial_uncertainty"] - current_uncertainty # Positive if uncertainty decreased
+            reward_uncertainty = exp["initial_uncertainty"] - current_uncertainty
 
             current_detail_error = state["detail_error_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
             reward_detail = exp["initial_detail_error"] - current_detail_error
 
             action_cost = 0.0
-            if action in [1, 2, 5]:
-                action_cost = -self.action_cost_weight
-            elif action in [3, 4]:
-                action_cost = self.prune_reward_weight
+            # if action in [1, 2, 5]:
+            #     action_cost = -self.action_cost_weight
+            # elif action in [3, 4]:
+            #     action_cost = self.prune_reward_weight
 
             final_reward = (self.w_photometric * reward_photo +
                             self.w_detail * reward_detail +
@@ -878,8 +877,6 @@ class AdaptiveStrategy(DefaultStrategy):
         for i in range(len(original_subset_indices)):
             if not valid_mask_subset[i]:
                 continue
-
-            print(f"Processing Gaussian {i+1}/{len(original_subset_indices)}...")
 
             initial_error = state["l1_loss_map"][max(0, py_sub[i]-2):py_sub[i]+3, max(0, px_sub[i]-2):px_sub[i]+3].mean()
             initial_quality = state["quality_heatmap"][pty_sub[i], ptx_sub[i]]

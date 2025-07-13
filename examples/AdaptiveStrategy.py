@@ -259,7 +259,7 @@ class AdaptiveStrategy(DefaultStrategy):
         return state
 
     def _initialize_learning_components(self, device) -> None:
-        raw_feature_dim = 21
+        raw_feature_dim = 23
         ac_feature_dim = self.gnn_hidden_dim * 2
 
         self.gnn_net = TemporalGaussianGNN(
@@ -303,7 +303,7 @@ class AdaptiveStrategy(DefaultStrategy):
             means3d_subset, state["view_proj_matrix"], h, w
         )
 
-        feature_dim = 21
+        feature_dim = 23
         features = torch.zeros(num_subset, feature_dim, device=device)
 
         opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
@@ -335,28 +335,34 @@ class AdaptiveStrategy(DefaultStrategy):
 
             sh0_subset = params["sh0"][subset_mask]
 
+            neighbor_means = params["means"][neighbor_idxs]
+            centered_neighbors = neighbor_means - means3d_subset.unsqueeze(1)
+            cov_neighbors = torch.einsum('nki,nkj->nij', centered_neighbors, centered_neighbors) / 5
+
             features[:, 9] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
             features[:, 10] = neighbor_opacities.mean(dim=-1)
             features[:, 11] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
+            features[:, 12] = cov_neighbors.mean(dim=(1, 2)).norm(dim=-1) / state["scene_scale"]
+            features[:, 13] = torch.det(cov_neighbors)
 
         current_grad = state["grad2d"][subset_mask] / state["count"][subset_mask].clamp_min(1)
-        features[:, 12] = current_grad
+        features[:, 14] = current_grad
 
         if state.get("prev_grad2d") is not None and state.get("prev_opacity") is not None:
             time_delta = self.refine_every
             prev_grad_subset = state["prev_grad2d"][subset_mask]
             prev_opacity_subset = state["prev_opacity"][subset_mask]
 
-            features[:, 13] = (current_grad - prev_grad_subset) / time_delta
-            features[:, 14] = (opacities_subset - prev_opacity_subset) / time_delta
+            features[:, 15] = (current_grad - prev_grad_subset) / time_delta
+            features[:, 16] = (opacities_subset - prev_opacity_subset) / time_delta
 
         if state.get("significance") is not None and state["significance"].numel() == len(subset_mask):
-            features[:, 15] = state["significance"][subset_mask]
+            features[:, 17] = state["significance"][subset_mask]
 
-        features[:, 16] = step / self.refine_stop_iter
+        features[:, 18] = step / self.refine_stop_iter
 
         if state.get("age") is not None:
-            features[:, 17] = state["age"][subset_mask].float() / self.refine_stop_iter
+            features[:, 19] = state["age"][subset_mask].float() / self.refine_stop_iter
 
         view_dirs = F.normalize(means3d_subset - campos, dim=-1)
         quats_subset = F.normalize(params["quats"][subset_mask], dim=-1)
@@ -366,17 +372,17 @@ class AdaptiveStrategy(DefaultStrategy):
         largest_axis = rotmats[torch.arange(num_subset), :, largest_scale_indices]
 
         view_alignment = torch.abs((largest_axis * view_dirs).sum(dim=-1))
-        features[:, 18] = view_alignment
+        features[:, 20] = view_alignment
 
         if state.get("prev_means") is not None and state["prev_means"].shape == params["means"].shape:
             mean_velocity = torch.norm(params["means"][subset_mask] - state["prev_means"][subset_mask], dim=-1)
-            features[:, 19] = mean_velocity / state["scene_scale"]
+            features[:, 21] = mean_velocity / state["scene_scale"]
 
         mean_optimizer = optimizers.get("means")
 
         if mean_optimizer is not None and 'exp_avg_sq' in mean_optimizer.state[params['means']]:
             optimizer_state_mag = torch.norm(mean_optimizer.state[params['means']]['exp_avg_sq'][subset_mask], dim=-1)
-            features[:, 20] = torch.log1p(optimizer_state_mag)
+            features[:, 22] = torch.log1p(optimizer_state_mag)
 
         return torch.nan_to_num(features, 0.0), (pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y), valid_mask
 

@@ -749,7 +749,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
         device = next(self.ac_net.parameters()).device
 
-        sampled_td = state["replay_buffer"].sample(return_info=True).to(device)
+        sampled_td, info = state["replay_buffer"].sample(return_info=True)
+        sampled_td = sampled_td.to(device)
         raw_is_weights = sampled_td.get("importance_weights", None)
         if raw_is_weights is None:
             is_weights = torch.ones(sampled_td.shape[0], device=device)
@@ -820,7 +821,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         sampled_td.set("priority", td_errors)
 
-        state["replay_buffer"].update_priority(sampled_td.get("indices"), td_errors)
+        state["replay_buffer"].update_priority(info.get("index"), td_errors)
 
         if self.verbose:
             print(f"Agent trained: Loss = {loss.item():.4f}, Actor Loss = {actor_loss_gauss.mean().item():.4f}, "

@@ -143,7 +143,7 @@ class PatchBasedNRQM(nn.Module):
             return scores
         elif self.model_name == "clipiqa":
             scores = self.model(image_patches)
-            return -scores.view(scores.shape[0])
+            return -scores.flatten()
 
         raise ValueError(f"Unknown NRQM model: {self.model_name}. Supported models are 'brisque' and 'clipiqa'.")
 

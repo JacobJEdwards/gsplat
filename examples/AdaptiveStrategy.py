@@ -12,7 +12,7 @@ from torch.distributions import Categorical, Bernoulli
 
 from torch_geometric.nn import knn_graph, TransformerConv
 
-from examples.utils import knn_with_ids
+from utils import knn_with_ids
 from gsplat.utils import normalized_quat_to_rotmat
 from utils import PrioritizedReplayBuffer
 from gsplat.strategy.ops import (

@@ -743,6 +743,7 @@ class AdaptiveStrategy(DefaultStrategy):
                     "reward": final_reward.clone().detach(),
                     "gaussian_log_prob": exp["gaussian_log_prob"],
                     "region_log_prob": exp["region_log_prob"],
+                    "continuous_params": exp["continuous_params"],
                 }, batch_size=[])
                 state["replay_buffer"].add(experience_tensordict)
 

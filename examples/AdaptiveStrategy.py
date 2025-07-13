@@ -174,7 +174,7 @@ class AdaptiveStrategy(DefaultStrategy):
     learn_every: int = 200
     hindsight_delay: int = 100
     actor_loss_weight: float = 1.0
-    entropy_loss_weight: float = 0.05
+    entropy_loss_weight: float = 0.1
 
     start_exploration_epsilon: float = 0.3
     end_exploration_epsilon: float = 0.05

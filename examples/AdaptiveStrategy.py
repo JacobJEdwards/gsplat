@@ -793,7 +793,7 @@ class AdaptiveStrategy(DefaultStrategy):
         state["replay_buffer"].update_priorities(tree_idxs, td_errors)
 
         if self.verbose:
-            print(f"Step {state['step']}: PPO Loss: {loss.item():.4f}")
+            print(f"Agent trained: Loss = {loss.item():.4f}, ")
 
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> Tuple[int, int, int, int, int]:

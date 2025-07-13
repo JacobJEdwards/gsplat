@@ -820,7 +820,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         sampled_td.set("priority", td_errors)
 
-        state["replay_buffer"].update_priorities(sampled_td)
+        state["replay_buffer"].update_priority(sampled_td)
 
         if self.verbose:
             print(f"Agent trained: Loss = {loss.item():.4f}, Actor Loss = {actor_loss_gauss.mean().item():.4f}, "

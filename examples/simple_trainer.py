@@ -44,6 +44,18 @@ from gsplat.optimizers import SelectiveAdam
 from rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 
+def sobel_filter(image_batch: Tensor, device: torch.device) -> Tensor:
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
+
+    images_gray = image_batch.mean(dim=-1, keepdim=True).permute(0, 3, 1, 2)
+
+    grad_x = F.conv2d(images_gray, sobel_x, padding=1)
+    grad_y = F.conv2d(images_gray, sobel_y, padding=1)
+
+    gradient_magnitude = torch.hypot(grad_x, grad_y) # [B, 1, H, W]
+    return gradient_magnitude.squeeze(1) # [B, H, W]
+
 def strategy_representer(dumper: yaml.Dumper, data: Strategy) -> yaml.nodes.MappingNode:
     strategy_dict = vars(data).copy()
 
@@ -701,6 +713,12 @@ class Runner:
             # loss
             l1_loss_unreduced = torch.abs(colors - pixels)
             l1_loss_map = l1_loss_unreduced.mean(dim=-1).detach().squeeze() # [B, H, W, 1]
+
+            with torch.no_grad():
+                grad_render = sobel_filter(colors, device)
+                grad_gt = sobel_filter(pixels, device)
+                detail_loss_map = torch.abs(grad_render - grad_gt).detach()
+
             l1loss = l1_loss_unreduced.mean()
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
@@ -880,6 +898,7 @@ class Runner:
                 info["pixels"] = pixels
                 info["image_ids"] = image_ids
                 info["l1_loss_map"] = l1_loss_map
+                info["detail_loss_map"] = detail_loss_map
 
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,

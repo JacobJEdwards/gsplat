@@ -187,16 +187,18 @@ class AdaptiveStrategy(DefaultStrategy):
     pruning_learn_every: int = 500
     pruning_hindsight_delay: int = 800
     prune_threshold: float = 0.6
+    prune_age_threshold: int = 1200
 
     use_curiosity: bool = True
     curiosity_weight: float = 0.05
     icm_action_dim: int = 4
 
     subset_fraction: float = 1.0
-    max_densification_subset: int = 1_000_000
+    max_densification_subset: int = 200_000
     prune_significance_threshold: float = 0.01
     action_cost_weight: float = 0.001
-    w_photometric: float = 1.0
+    w_photometric: float = 0.8
+    w_detail: float = 0.4
     w_quality: float = -1.0
     w_uncertainty: float = 1.0
     ppo_clip_epsilon: float = 0.2
@@ -254,7 +256,9 @@ class AdaptiveStrategy(DefaultStrategy):
         state.update({
             "quality_heatmap": None,
             "view_proj_matrix": None,
+            "view_matrix": None,
             "photometric_error_map": None,
+            "detail_error_map": None,
             "geom_uncertainty_map": None,
             "densify_replay_buffer": PrioritizedReplayBuffer(capacity=20_000),
             "densify_hindsight_buffer": deque(maxlen=5_000),
@@ -270,7 +274,7 @@ class AdaptiveStrategy(DefaultStrategy):
         return state
 
     def _initialize_learning_components(self, device) -> None:
-        raw_feature_dim = 18
+        raw_feature_dim = 19
         ac_input_dim = self.gnn_embedding_dim + self.num_global_features
 
         self.gnn_net = GaussianGraphNetwork(
@@ -296,7 +300,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     @torch.no_grad()
     def _get_raw_features(
-            self, params: dict, state: dict, subset_mask: Tensor, step: int
+            self, params: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         num_subset = subset_mask.sum().item()
         device = params["means"].device
@@ -305,16 +309,14 @@ class AdaptiveStrategy(DefaultStrategy):
         if state.get("photometric_error_map") is None and state.get("l1_loss_map") is None:
             return None, None, None, None, None
 
-        if state.get("l1_loss_map") is not None:
-            h, w = state["l1_loss_map"].shape
-        else:
-            h, w = state["photometric_error_map"].shape
+        error_map_key = "l1_loss_map" if state.get("l1_loss_map") is not None else "photometric_error_map"
+        h, w = state[error_map_key].shape
 
         patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask = self._project_to_patch_coords(
             means3d_subset, state["view_proj_matrix"], h, w
         )
 
-        feature_dim = 18
+        feature_dim = 19
         features = torch.zeros(num_subset, feature_dim, device=device)
 
         opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
@@ -327,18 +329,14 @@ class AdaptiveStrategy(DefaultStrategy):
 
         valid_indices = torch.where(valid_mask)[0]
         if valid_indices.numel() > 0:
-            if state.get("l1_loss_map") is not None:
-                features[valid_indices, 5] = state["l1_loss_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
-            elif state.get("photometric_error_map") is not None:
-                features[valid_indices, 5] = state["photometric_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
-
+            features[valid_indices, 5] = state[error_map_key][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
             if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
-                features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+                    features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
             if state.get("quality_heatmap") is not None:
-                features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
+                    features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
 
         if self.knn_fn is not None and len(params["means"]) > self.redundancy_knn:
-            dists, idxs = self.knn_fn(means3d_subset, K=self.redundancy_knn + 1)
+            dists, idxs = self.knn_fn(means3d_subset, k=self.redundancy_knn + 1)
             neighbor_idxs = idxs[:, 1:]
 
             features[:, 8] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
@@ -372,14 +370,24 @@ class AdaptiveStrategy(DefaultStrategy):
         if state.get("age") is not None:
             features[:, 17] = state["age"][subset_mask].float() / self.refine_stop_iter
 
+        view_dirs = F.normalize(means3d_subset - campos, dim=-1)
+        quats_subset = F.normalize(params["quats"][subset_mask], dim=-1)
+        rotmats = normalized_quat_to_rotmat(quats_subset)
+
+        largest_scale_indices = torch.argmax(scales, dim=1)
+        largest_axis = rotmats[torch.arange(num_subset), :, largest_scale_indices]
+
+        view_alignment = torch.abs((largest_axis * view_dirs).sum(dim=-1))
+        features[:, 18] = view_alignment
+
         return torch.nan_to_num(features, 0.0), pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y, valid_mask
 
 
     @torch.no_grad()
     def _get_graph_representation(
-            self, params: dict, state: dict, subset_mask: Tensor, step: int
+            self, params: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
     ) -> tuple[Tensor, tuple, Tensor]:
-        raw_features, px, py, ptx, pty, valid_mask = self._get_raw_features(params, state, subset_mask, step)
+        raw_features, px, py, ptx, pty, valid_mask = self._get_raw_features(params, state, subset_mask, step, campos)
 
         if raw_features is None:
             return None, None, None
@@ -432,8 +440,12 @@ class AdaptiveStrategy(DefaultStrategy):
             state["significance"] = torch.zeros(params["means"].shape[0], device=params["means"].device)
         if self.nrqm_model is None:
             self.nrqm_model = PatchBasedNRQM().to(params["means"].device)
+        if self.knn_fn is None:
+            self.knn_fn = knn_graph
 
         state["l1_loss_map"] = info.get("l1_loss_map")
+        state["detail_error_map"] = info.get("detail_error_map")
+
 
         if "gaussian_contribution" in info:
             current_significance = info["gaussian_contribution"]
@@ -621,6 +633,7 @@ class AdaptiveStrategy(DefaultStrategy):
         main_novel_K = novel_Ks[0].unsqueeze(0)
 
         view_matrix = torch.inverse(main_novel_camtoworld)
+        state["view_matrix"] = view_matrix[0]
 
         fx, fy = main_novel_K[0, 0, 0], main_novel_K[0, 1, 1]
         cx, cy = main_novel_K[0, 0, 2], main_novel_K[0, 1, 2]
@@ -702,7 +715,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
             if state.get("l1_loss_map") is None or \
                     state.get("quality_heatmap") is None or \
-                    state.get("geom_uncertainty_map") is None:
+                    state.get("geom_uncertainty_map") is None \
+                    or state.get("detail_error_map") is None:
                 continue
 
             px, py = exp["px"], exp["py"]
@@ -710,21 +724,25 @@ class AdaptiveStrategy(DefaultStrategy):
             action = exp["action"]
 
             current_error = state["l1_loss_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
-            reward_photo = exp["initial_error"] - current_error # Positive reward if error decreased
+            reward_photo = exp["initial_error"] - current_error
 
             current_quality = state["quality_heatmap"][pty, ptx]
-            reward_quality = exp["initial_quality"] - current_quality # Positive if NRQM score improved (i.e., raw score decreased)
+            reward_quality = exp["initial_quality"] - current_quality
 
             current_uncertainty = state["geom_uncertainty_map"][py, px]
             reward_uncertainty = exp["initial_uncertainty"] - current_uncertainty # Positive if uncertainty decreased
 
+            current_detail_error = state["detail_error_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
+            reward_detail = exp["initial_detail_error"] - current_detail_error
+
             action_cost = 0.0
-            if action == 1 or action == 2:
-                action_cost = -self.action_cost_weight
-            elif action == 3:
-                action_cost = self.action_cost_weight
+            # if action == 1 or action == 2:
+            #     action_cost = -self.action_cost_weight
+            # elif action == 3:
+            #     action_cost = self.action_cost_weight
 
             final_reward = (self.w_photometric * reward_photo +
+                            self.w_detail * reward_detail +
                             self.w_quality * reward_quality +
                             self.w_uncertainty * reward_uncertainty +
                             action_cost)
@@ -887,15 +905,42 @@ class AdaptiveStrategy(DefaultStrategy):
         initial_num_gaussians = len(params["means"])
         device = params["means"].device
 
-        # 1. Agent Decision Making
-        subset_mask = torch.rand(initial_num_gaussians, device=device) < self.subset_fraction
-        if subset_mask.sum() == 0: return 0, 0, 0, 0
+        if state.get("view_matrix") is None: return 0,0,0,0
+
+        grad_thresh = state["dynamic_grow_grad2d"]
+        candidates_by_grad = state["grad2d"] / state["count"].clamp_min(1) > grad_thresh
+
+        h = state['l1_loss_map'].shape[0]
+        w = state['l1_loss_map'].shape[1]
+        ptx, pty, px, py, valid_proj = self._project_to_patch_coords(params['means'], state['view_proj_matrix'], h, w)
+
+        low_quality_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=device)
+        low_quality_mask[valid_proj] = state["quality_heatmap"][pty[valid_proj], ptx[valid_proj]] < self.nrqm_stagnation_threshold
+
+        high_uncertainty_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=device)
+        high_uncertainty_mask[valid_proj] = state["geom_uncertainty_map"][py[valid_proj], px[valid_proj]] > self.geom_uncertainty_thresh
+
+        subset_mask = (candidates_by_grad | low_quality_mask | high_uncertainty_mask)
+
+        num_candidates = subset_mask.sum().item()
+        if num_candidates == 0: return 0, 0, 0, 0
+
+        if num_candidates > self.max_densification_subset:
+            candidate_indices = torch.where(subset_mask)[0]
+            sampled_indices = candidate_indices[torch.randperm(num_candidates)[:self.max_densification_subset]]
+            subset_mask.fill_(False)
+            subset_mask[sampled_indices] = True
 
         original_subset_indices = torch.where(subset_mask)[0]
 
-        graph_embeddings, coords, _ = self._get_graph_representation(params, state, subset_mask, step)
+        camtoworld_matrix = torch.inverse(state['view_matrix'])
+        campos = camtoworld_matrix[:3, 3]
+
+        graph_embeddings, coords, raw_features = self._get_graph_representation(params, state, subset_mask, step,
+                                                                                campos)
         if graph_embeddings is None: return 0, 0, 0, 0
-        px, py, ptx, pty, valid_mask_subset = coords
+
+        px_sub, py_sub, ptx_sub, pty_sub, valid_mask_subset = coords
 
         avg_scale = torch.exp(params['scales']).mean() / state['scene_scale']
         std_scale = torch.exp(params['scales']).std() / state['scene_scale']
@@ -934,8 +979,17 @@ class AdaptiveStrategy(DefaultStrategy):
 
         age_in_steps = state["age"][original_subset_indices]
         significance = state["significance"][original_subset_indices]
-        prune_heuristic_mask = (age_in_steps < 800) | (significance > self.prune_significance_threshold)
-        final_actions[(final_actions == 4) & prune_heuristic_mask] = 0 # Veto pruning
+
+        quality_scores = torch.full_like(significance, 100.0)
+        quality_scores[valid_mask_subset] = state['quality_heatmap'][pty_sub[valid_mask_subset], ptx_sub[valid_mask_subset]]
+
+        prune_veto_mask = (
+                (quality_scores < self.nrqm_stagnation_threshold) |
+                (age_in_steps < self.prune_age_threshold) |
+                (significance > self.prune_significance_threshold)
+        )
+
+        final_actions[(final_actions == 4) & prune_veto_mask] = 0
 
         final_prune_mask_subset = (final_actions == 4)
         final_merge_mask_subset = (final_actions == 3)

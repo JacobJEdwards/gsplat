@@ -931,15 +931,15 @@ class AdaptiveStrategy(DefaultStrategy):
             }
             state["hindsight_buffer"].append(exp)
 
-        age_in_steps = state["age"][original_subset_indices]
-        significance = state["significance"][original_subset_indices]
+        # age_in_steps = state["age"][original_subset_indices]
+        # significance = state["significance"][original_subset_indices]
 
-        prune_merge_veto_mask = (
-                (age_in_steps < self.prune_age_threshold)
-                # (significance > self.prune_significance_threshold)
-        )
-        final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
-        final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
+        # prune_merge_veto_mask = (
+        #         (age_in_steps < self.prune_age_threshold)
+        #         # (significance > self.prune_significance_threshold)
+        # )
+        # final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
+        # final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
 
         final_finetune_mask_subset = (final_actions == 5)
         final_prune_mask_subset = (final_actions == 4)

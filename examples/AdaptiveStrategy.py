@@ -22,6 +22,7 @@ from gsplat.strategy.ops import (
 )
 from gsplat.strategy.default import DefaultStrategy
 from ops import split, duplicate, merge
+from torchrl import data
 
 class TemporalGaussianGNN(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, edge_dim: int, num_temporal_steps: int = 5):
@@ -724,7 +725,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 ))
 
     def _train_agent(self, state: dict[str, Any]):
-        if len(state["replay_buffer"]) < 257:
+        if len(state["replay_buffer"]) < 256:
             if self.verbose:
                 print("Not enough samples in replay buffer for training.")
             return
@@ -752,6 +753,9 @@ class AdaptiveStrategy(DefaultStrategy):
         old_gauss_log_probs = torch.stack([x[6] for x in batch]).to(device)
         old_region_log_probs = torch.stack([x[7] for x in batch]).to(device)
 
+        rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0, neginf=-1.0)
+        rewards = torch.clamp(rewards, -5.0, 5.0)
+
         (gauss_logits, gauss_values, _, _,
          region_logits, region_values) = self.ac_net(motion_features, region_features, region_assignments)
 
@@ -761,6 +765,8 @@ class AdaptiveStrategy(DefaultStrategy):
         new_gauss_dist = Categorical(logits=gauss_logits)
         new_gauss_log_probs = new_gauss_dist.log_prob(gauss_actions)
         ratio_gauss = torch.exp(new_gauss_log_probs - old_gauss_log_probs)
+
+        ratio_gauss = torch.clamp(ratio_gauss, 0.0, 10.0)
 
         surr1_gauss = ratio_gauss * gauss_advantage
         surr2_gauss = torch.clamp(ratio_gauss, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * gauss_advantage
@@ -774,6 +780,7 @@ class AdaptiveStrategy(DefaultStrategy):
         new_region_dist = Categorical(logits=region_logits)
         new_region_log_probs = new_region_dist.log_prob(region_actions)
         ratio_region = torch.exp(new_region_log_probs - old_region_log_probs)
+        ratio_region = torch.clamp(ratio_region, 0.0, 10.0)
 
         surr1_region = ratio_region * region_advantage
         surr2_region = torch.clamp(ratio_region, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * region_advantage
@@ -786,13 +793,20 @@ class AdaptiveStrategy(DefaultStrategy):
 
         loss = (total_loss_unreduced * is_weights).mean()
 
+        if torch.isnan(loss).any():
+            print("NaN loss detected, skipping training step to prevent model corruption.")
+            return
+
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
         self.optimizer.step()
 
-        td_errors = (rewards - gauss_values).abs().detach().cpu().numpy()
+        td_errors = (rewards - gauss_values).abs().detach()
+        td_errors = torch.nan_to_num(td_errors, nan=0.0, posinf=1.0, neginf=0.0)
+        td_errors = td_errors.cpu().numpy()
+
         state["replay_buffer"].update_priorities(tree_idxs, td_errors)
 
         if self.verbose:

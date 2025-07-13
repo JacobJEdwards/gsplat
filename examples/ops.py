@@ -67,13 +67,10 @@ def split(
             p_split = (p[sel] + samples).reshape(-1, 3)
         elif name == "scales":
             current_split_ratios = split_ratios if split_ratios is not None else torch.full((len(scales),), 1.6, device=device)
-            if directions is not None:
-                p_split = torch.log(scales / current_split_ratios.unsqueeze(-1)).repeat(2,1)
-            else:
-                largest_scale_idx = torch.argmax(scales, dim=1)
-                new_scales_val = scales.clone()
-                new_scales_val[torch.arange(len(scales)), largest_scale_idx] /= current_split_ratios
-                p_split = torch.log(new_scales_val).repeat(2, 1)
+            largest_scale_idx = torch.argmax(scales, dim=1)
+            new_scales_val = scales.clone()
+            new_scales_val[torch.arange(len(scales)), largest_scale_idx] /= current_split_ratios
+            p_split = torch.log(new_scales_val).repeat(2, 1)
         elif name == "opacities" and revised_opacity:
             original_alpha = torch.sigmoid(p[sel])
             original_alpha = torch.clamp(original_alpha, 0.0, 1.0 - 1e-6)
@@ -173,22 +170,10 @@ def merge(
     target_indices = nn_indices[:, 1]
 
     unique_pairs = set()
-    used_indices = torch.zeros(len(all_means), dtype=torch.bool, device=device)
-    distances, _ = knn_with_ids_two_tensor(all_means[source_indices], all_means, K=2)
-    pair_distances = distances[:, 1]
-    sorted_pair_indices = torch.argsort(pair_distances)
-
-    for idx in sorted_pair_indices:
-        i = source_indices[idx].item()
-        j = target_indices[idx].item()
-
-        if i == j or used_indices[i] or used_indices[j]:
-            continue
-
-        pair = tuple(sorted((i, j)))
-        unique_pairs.add(pair)
-        used_indices[i] = True
-        used_indices[j] = True
+    for i, j in zip(source_indices.tolist(), target_indices.tolist()):
+        if i != j:
+            pair = tuple(sorted((i, j)))
+            unique_pairs.add(pair)
 
     if not unique_pairs:
         return torch.zeros_like(mask, dtype=torch.bool), 0

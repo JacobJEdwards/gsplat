@@ -12,6 +12,7 @@ from torch.distributions import Categorical, Bernoulli
 
 from torch_geometric.nn import knn_graph, TransformerConv
 
+from examples.utils import knn_with_ids
 from gsplat.utils import normalized_quat_to_rotmat
 from utils import PrioritizedReplayBuffer
 from gsplat.strategy.ops import (
@@ -441,7 +442,7 @@ class AdaptiveStrategy(DefaultStrategy):
         if self.nrqm_model is None:
             self.nrqm_model = PatchBasedNRQM().to(params["means"].device)
         if self.knn_fn is None:
-            self.knn_fn = knn_graph
+            self.knn_fn = knn_with_ids
 
         state["l1_loss_map"] = info.get("l1_loss_map")
         state["detail_error_map"] = info.get("detail_error_map")

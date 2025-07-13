@@ -126,7 +126,7 @@ class ICMModule(nn.Module):
         return pred_next_state, pred_action_logits
 
 class PatchBasedNRQM(nn.Module):
-    def __init__(self, model_name: str = "clipiqa"):
+    def __init__(self, model_name: str = "brisque"):
         super().__init__()
         self.model_name = model_name
         if self.model_name == "brisque":

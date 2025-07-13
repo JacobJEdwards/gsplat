@@ -968,7 +968,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
             # Heuristic for pruning: low opacity AND large size
             opa_heuristic_mask = torch.sigmoid(params["opacities"][original_subset_indices].flatten()) < self.prune_opa
-            scale_heuristic_mask = torch.exp(params["scales"][original_subset_indices]).mean(dim=-1) > (self.grow_scale_max * state['scene_scale'])
+            scale_heuristic_mask = torch.exp(params["scales"][original_subset_indices]).mean(dim=-1) > (self.grow_scale2d *
+                                                                                                        state['scene_scale'])
             prune_heuristic_mask = opa_heuristic_mask & scale_heuristic_mask
             actions[prune_heuristic_mask] = ACTION_PRUNE
 

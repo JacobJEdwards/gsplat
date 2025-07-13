@@ -35,6 +35,7 @@ from utils import (
     knn,
     rgb_to_sh,
     set_random_seed,
+    generate_novel_views,
 )
 
 from gsplat import export_splats, Strategy
@@ -357,11 +358,6 @@ class Runner:
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
-
-        if isinstance(cfg.strategy, AdaptiveStrategy):
-            cfg.strategy.rasterizer_fn = self.rasterize_splats
-
-        # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
             data_dir=str(cfg.data_dir),
             factor=cfg.data_factor,
@@ -372,6 +368,37 @@ class Runner:
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
+
+        if isinstance(cfg.strategy, AdaptiveStrategy):
+            cfg.strategy.rasterizer_fn = self.rasterize_splats
+            candidate_poses_np = generate_interpolated_path(
+                self.parser.camtoworlds, n_interp=5
+            )
+            if candidate_poses_np.shape[1] == 3:
+                print("Padding interpolated poses from 3x4 to 4x4...")
+                bottom_row = np.array([[[0.0, 0.0, 0.0, 1.0]]])
+                repeated_bottom_row = np.repeat(
+                    bottom_row, len(candidate_poses_np), axis=0
+                )
+                candidate_poses_np = np.concatenate(
+                    [candidate_poses_np, repeated_bottom_row], axis=1
+                )
+
+            perturbed_poses_np = generate_novel_views(
+                self.parser.camtoworlds,
+                num_novel_views=100,
+                translation_perturbation=5.0,
+                rotation_perturbation= 0.1,
+            )
+
+            all_poses_np = np.concatenate(
+                [candidate_poses_np, perturbed_poses_np], axis=0
+            )
+            np.random.shuffle(all_poses_np)
+            self.novel_poses_np = torch.from_numpy(all_poses_np).float().to(self.device)
+            self.cfg.strategy.novel_poses = self.novel_poses_np
+
+        # Load data: Training data should contain initial points and colors.
 
         # Model
         feature_dim = 32 if cfg.app_opt else None

@@ -262,6 +262,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
     meta_lr_warmup_steps: int = 300
 
+    novel_poses: Any = field(default=None, repr=False)
+
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
         state.update({
@@ -594,22 +596,27 @@ class AdaptiveStrategy(DefaultStrategy):
         width, height = info['width'], info['height']
         sh_degree_to_use = min(step // 1000, 3)
 
-        cam_indices = torch.randint(0, info['n_cameras'], (self.num_uncertainty_views,))
+        num_nrqm_poses = min(4, self.novel_poses.shape[0])
+        sampled_pose_indices = torch.randperm(self.novel_poses.shape[0])[:num_nrqm_poses]
+        novel_camtoworlds = self.novel_poses[sampled_pose_indices]
 
-        novel_camtoworlds = info['camtoworlds'][cam_indices]
-        novel_Ks = info['Ks'][cam_indices]
+        Ks = info["Ks"]
 
-        novel_render_pkg, _, _ = self.rasterizer_fn(
+        novel_Ks = Ks.repeat(num_nrqm_poses, 1, 1)
+        novel_width = width
+        novel_height = height
+
+        novel_render_pkg, nrqm_alphas, _ = self.rasterizer_fn(
             means=params["means"],
             quats=params["quats"],
             scales=params["scales"],
             opacities=params["opacities"],
             colors=torch.cat([params["sh0"], params["shN"]], 1),
-            Ks=novel_Ks,
-            width=width,
-            height=height,
-            sh_degree=sh_degree_to_use,
             camtoworlds=novel_camtoworlds,
+            Ks=novel_Ks,
+            width=novel_width,
+            height=novel_height,
+            sh_degree=sh_degree_to_use,
             render_mode="RGB+ED"
         )
 

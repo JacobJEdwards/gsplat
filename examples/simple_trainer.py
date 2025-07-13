@@ -665,7 +665,51 @@ class Runner:
 
         # Training loop.
         global_tic = time.time()
-        pbar = tqdm.tqdm(range(init_step, max_steps))
+
+        if isinstance(cfg.strategy, AdaptiveStrategy) and cfg.strategy.use_expert_pretraining:
+            print("--- Phase 1: Bootstrapping and collecting expert demonstrations ---")
+            pbar = tqdm.tqdm(range(cfg.strategy.bootstrap_steps), desc="Bootstrap")
+            for step in pbar:
+                # Standard training forward/backward pass to get gradients
+                # which are needed for the heuristic policy
+                data = next(trainloader_iter)
+                # ... (standard data loading and forward pass as in original train loop) ...
+                camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)
+                Ks = data["K"].to(device)
+                pixels = data["image"].to(device) / 255.0
+                image_ids = data["image_id"].to(device)
+                masks = data["mask"].to(device) if "mask" in data else None
+                height, width = pixels.shape[1:3]
+                sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+                renders, alphas, info = self.rasterize_splats(
+                    camtoworlds=camtoworlds, Ks=Ks, width=width, height=height, sh_degree=sh_degree_to_use, image_ids=image_ids, masks=masks
+                )
+                colors = renders
+                l1loss = torch.abs(colors - pixels).mean()
+                loss = l1loss # Simplified loss for bootstrap
+                loss.backward()
+
+                # The strategy step will use the heuristic and store demonstrations
+                info.update({"step": step, 'width': width, 'height': height, 'Ks': Ks})
+                cfg.strategy.step_post_backward(
+                    self.splats, self.optimizers, self.strategy_state, step, info, cfg.packed
+                )
+
+                # Optimizer step and zero grad
+                for optimizer in self.optimizers.values():
+                    optimizer.step()
+                    optimizer.zero_grad()
+                for scheduler in schedulers:
+                    scheduler.step()
+
+        if isinstance(cfg.strategy, AdaptiveStrategy) and cfg.strategy.use_expert_pretraining:
+            print("\n--- Phase 2: Offline pre-training with Behavioral Cloning ---")
+            # The pre-training logic is now inside the strategy class
+            cfg.strategy._pretrain_agent_with_bc(self.strategy_state)
+            self.strategy_state["is_pretraining_done"] = True # Set flag
+
+        start_step = cfg.strategy.bootstrap_steps if isinstance(cfg.strategy, AdaptiveStrategy) else 0
+        pbar = tqdm.tqdm(range(start_step, max_steps), desc="Online RL")
         for step in pbar:
             try:
                 data = next(trainloader_iter)
@@ -916,6 +960,12 @@ class Runner:
                 optimizer.zero_grad()
             for scheduler in schedulers:
                 scheduler.step()
+
+            info.update({
+                "step": step, 'width': width, 'height': height,
+                "camtoworlds": camtoworlds, "Ks": Ks, "pixels": pixels,
+                "l1_loss_map": l1_loss_map, "detail_error_map": detail_loss_map
+            })
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, AdaptiveStrategy):

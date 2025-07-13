@@ -703,27 +703,28 @@ class AdaptiveStrategy(DefaultStrategy):
     @torch.no_grad()
     def _project_to_patch_coords(self, means3d: Tensor, view_proj_matrix: Tensor, h: int, w: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         means_h = F.pad(means3d, (0, 1), value=1.0)
-        p_hom = means_h @ view_proj_matrix
+        p_hom = means_h @ view_proj_matrix.T
+
         w_coord = p_hom[:, 3]
-        w_coord_safe = torch.clamp(w_coord, min=1e-6)
-        p_w = 1.0 / w_coord_safe
-        p_proj = p_hom[:, :2] * p_w[:, None]
+        w_coord_safe = torch.clamp(w_coord, min=1e-8)
+        p_proj = p_hom[:, :2] / w_coord_safe[:, None]
 
-        valid_mask = (torch.isfinite(p_proj).all(dim=1) &
-                      (torch.abs(p_proj) < 10.0).all(dim=1) &
-                      (w_coord > 1e-6))
+        ndc_x = -p_proj[:, 0]
+        ndc_y = -p_proj[:, 1]
 
-        coords_x = (p_proj[:, 0] * 0.5 + 0.5) * w
-        coords_y = (p_proj[:, 1] * 0.5 + 0.5) * h
+        valid_mask = (w_coord > 0) & (ndc_x.abs() < 1) & (ndc_y.abs() < 1)
+
+        coords_x = (ndc_x * 0.5 + 0.5) * w
+        coords_y = (ndc_y * 0.5 + 0.5) * h
 
         patch_coords_x = torch.clamp(torch.floor(coords_x / self.nrqm_patch_size), 0, (w // self.nrqm_patch_size) - 1).long()
         patch_coords_y = torch.clamp(torch.floor(coords_y / self.nrqm_patch_size), 0, (h // self.nrqm_patch_size) - 1).long()
-
         pixel_coords_x = torch.clamp(coords_x, 0, w - 1).long()
         pixel_coords_y = torch.clamp(coords_y, 0, h - 1).long()
 
         return patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask
 
+        # means_h = F.pad(means3d, (0, 1), value=1.0)
         # means_h = F.pad(means3d, (0, 1), value=1.0)
         # p_hom = means_h @ view_proj_matrix
         #

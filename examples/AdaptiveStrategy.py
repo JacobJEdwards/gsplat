@@ -724,7 +724,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 ))
 
     def _train_agent(self, state: dict[str, Any]):
-        if len(state["replay_buffer"]) < 256:
+        if len(state["replay_buffer"]) < 257:
             if self.verbose:
                 print("Not enough samples in replay buffer for training.")
             return

@@ -756,14 +756,14 @@ class AdaptiveStrategy(DefaultStrategy):
         else:
             is_weights = raw_is_weights
 
-        motion_features = sampled_td.get("motion_features").to(device)
-        region_features = sampled_td.get("region_features").to(device)
-        region_assignments = sampled_td.get("region_assignment").to(device)
-        gauss_actions = sampled_td.get("gaussian_action").to(device)
-        region_actions = sampled_td.get("region_action").to(device)
-        rewards = sampled_td.get("reward").to(device)
-        old_gauss_log_probs = sampled_td.get("gaussian_log_prob").to(device)
-        old_region_log_probs = sampled_td.get("region_log_prob").to(device)
+        motion_features = sampled_td.get("motion_features")
+        region_features = sampled_td.get("region_features")
+        region_assignments = sampled_td.get("region_assignment")
+        gauss_actions = sampled_td.get("gaussian_action")
+        region_actions = sampled_td.get("region_action")
+        rewards = sampled_td.get("reward")
+        old_gauss_log_probs = sampled_td.get("gaussian_log_prob")
+        old_region_log_probs = sampled_td.get("region_log_prob")
 
         rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0, neginf=-1.0)
         rewards = torch.clamp(rewards, -5.0, 5.0)

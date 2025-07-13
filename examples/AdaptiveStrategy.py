@@ -731,12 +731,20 @@ class AdaptiveStrategy(DefaultStrategy):
             reward_detail = exp["initial_detail_error"] - current_detail_error
 
             action = exp["gaussian_action"]
+            initial_error = exp["initial_error"]
+            initial_quality = exp["initial_quality"]
 
             action_cost = 0.0
-            # if action in [1, 2, 5]:
-            #     action_cost = -self.action_cost_weight
-            # elif action in [3, 4]:
-            #     action_cost = self.prune_reward_weight
+            if action == 1 or action == 2:
+                action_cost = -self.action_cost_weight * torch.clamp(1.0 - initial_error / self.stable_error_threshold, 0.0, 1.0)
+            elif action == 0:
+                action_cost = -self.action_cost_weight * torch.clamp(1.0 - initial_quality / self.stable_quality_threshold, 0.0, 1.0)
+            elif action == 3:
+                action_cost = -self.action_cost_weight * torch.clamp(1.0 - current_uncertainty / self.geom_uncertainty_thresh, 0.0, 1.0)
+            elif action == 4:
+                action_cost = -self.action_cost_weight * torch.clamp(1.0 - current_detail_error / 0.1, 0.0, 1.0)
+            elif action == 5:
+                action_cost = -self.action_cost_weight * torch.clamp(1.0 - current_quality / self.stable_quality_threshold, 0.0, 1.0)
 
             final_reward = (self.w_photometric * reward_photo +
                             self.w_detail * reward_detail +
@@ -745,12 +753,9 @@ class AdaptiveStrategy(DefaultStrategy):
                             action_cost)
 
             if action == 0:
-                initial_error = exp["initial_error"]
-                initial_quality = exp["initial_quality"]
-
                 if initial_error < self.stable_error_threshold and \
                         initial_quality < self.stable_quality_threshold:
-                    final_reward += self.stable_reward_bonus
+                    final_reward += self.stability_reward_bonus
 
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
                 experience_tensordict = TensorDict({

@@ -681,15 +681,19 @@ class AdaptiveStrategy(DefaultStrategy):
         # proj_matrix[3, 2] = 1.0
         # state["view_proj_matrix"] = view_matrix[0] @ proj_matrix
 
+        znear = 0.01
+        zfar = 100.0
+
         proj_matrix = torch.zeros(4, 4, device=view_matrix.device)
         proj_matrix[0, 0] = 2 * fx / width
         proj_matrix[1, 1] = 2 * fy / height
-        proj_matrix[2, 2] = 1.0
-        proj_matrix[0, 2] = - (2 * cx / width - 1)
-        proj_matrix[1, 2] = - (2 * cy / height - 1)
-        proj_matrix[3, 3] = 0.0
+        proj_matrix[2, 0] = (2 * cx / width) - 1.0
+        proj_matrix[2, 1] = (2 * cy / height) - 1.0
+        proj_matrix[2, 2] = -(zfar + znear) / (zfar - znear)
         proj_matrix[3, 2] = -1.0
-        state["view_proj_matrix"] = view_matrix[0] @ proj_matrix.T
+        proj_matrix[2, 3] = -2.0 * zfar * znear / (zfar - znear)
+
+        state["view_proj_matrix"] = view_matrix @ proj_matrix
 
         avg_quality = patch_scores.mean()
         normalized_quality = torch.clamp(avg_quality / 50.0, 0.0, 2.0)
@@ -699,7 +703,7 @@ class AdaptiveStrategy(DefaultStrategy):
     @torch.no_grad()
     def _project_to_patch_coords(self, means3d: Tensor, view_proj_matrix: Tensor, h: int, w: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         means_h = F.pad(means3d, (0, 1), value=1.0)
-        p_hom = means_h @ view_proj_matrix.T # Use transpose for row-major points
+        p_hom = means_h @ view_proj_matrix
 
         w_coord = p_hom[:, 3]
         w_coord_safe = torch.clamp(w_coord, min=1e-8)

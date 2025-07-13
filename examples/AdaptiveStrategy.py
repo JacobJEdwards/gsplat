@@ -337,7 +337,7 @@ class AdaptiveStrategy(DefaultStrategy):
                     features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
 
         if self.knn_fn is not None and len(params["means"]) > self.redundancy_knn:
-            dists, idxs = self.knn_fn(means3d_subset, k=self.redundancy_knn + 1)
+            dists, idxs = self.knn_fn(means3d_subset, K=self.redundancy_knn + 1)
             neighbor_idxs = idxs[:, 1:]
 
             features[:, 8] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]

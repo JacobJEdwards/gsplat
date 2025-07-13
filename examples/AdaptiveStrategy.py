@@ -363,12 +363,12 @@ class AdaptiveStrategy(DefaultStrategy):
     @torch.no_grad()
     def _get_motion_aware_features(
             self, params: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, tuple, Tensor]:
         original_indices = torch.where(subset_mask)[0]
-        raw_features, coords, valid_mask = self._get_raw_features(params, state, subset_mask, step, campos)
+        raw_features, (px, py, ptx, pty), valid_mask = self._get_raw_features(params, state, subset_mask, step, campos)
 
         if raw_features is None:
-            return None, None, None, None, None
+            return None, None, None
 
         subset_means = params["means"][subset_mask]
         edge_index = knn_graph(subset_means, k=self.gnn_knn, loop=True)
@@ -396,7 +396,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         state['ac_hidden_states'][original_indices] = updated_history
 
-        return motion_context, coords, raw_features, subset_means, valid_mask
+        return motion_context, (px, py, ptx, pty, valid_mask), raw_features
 
 
     @torch.no_grad()
@@ -704,21 +704,21 @@ class AdaptiveStrategy(DefaultStrategy):
     def _project_to_patch_coords(self, means3d: Tensor, view_proj_matrix: Tensor, h: int, w: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         means_h = F.pad(means3d, (0, 1), value=1.0)
         p_hom = means_h @ view_proj_matrix
-
         w_coord = p_hom[:, 3]
-        w_coord_safe = torch.clamp(w_coord, min=1e-8)
-        p_proj = p_hom[:, :2] / w_coord_safe[:, None]
+        w_coord_safe = torch.clamp(w_coord, min=1e-6)
+        p_w = 1.0 / w_coord_safe
+        p_proj = p_hom[:, :2] * p_w[:, None]
 
-        ndc_x = -p_proj[:, 0]
-        ndc_y = -p_proj[:, 1]
+        valid_mask = (torch.isfinite(p_proj).all(dim=1) &
+                      (torch.abs(p_proj) < 10.0).all(dim=1) &
+                      (w_coord > 1e-6))
 
-        valid_mask = (w_coord > 0) & (ndc_x.abs() < 1) & (ndc_y.abs() < 1)
-
-        coords_x = (ndc_x * 0.5 + 0.5) * w
-        coords_y = (ndc_y * 0.5 + 0.5) * h
+        coords_x = (p_proj[:, 0] * 0.5 + 0.5) * w
+        coords_y = (p_proj[:, 1] * 0.5 + 0.5) * h
 
         patch_coords_x = torch.clamp(torch.floor(coords_x / self.nrqm_patch_size), 0, (w // self.nrqm_patch_size) - 1).long()
         patch_coords_y = torch.clamp(torch.floor(coords_y / self.nrqm_patch_size), 0, (h // self.nrqm_patch_size) - 1).long()
+
         pixel_coords_x = torch.clamp(coords_x, 0, w - 1).long()
         pixel_coords_y = torch.clamp(coords_y, 0, h - 1).long()
 
@@ -915,7 +915,9 @@ class AdaptiveStrategy(DefaultStrategy):
         camtoworld_matrix = torch.inverse(state['view_matrix'])
         campos = camtoworld_matrix[:3, 3]
 
-        motion_features, coords, _, subset_means, valid_mask_subset = self._get_motion_aware_features(params, state,
+        subset_means = params["means"][subset_mask]
+        motion_features, (px_sub, py_sub, ptx_sub, pty_sub, valid_mask_subset), _ = self._get_motion_aware_features(
+            params, state,
                                                                                              subset_mask, step,
                                                                                 campos)
         if motion_features is None: return 0, 0, 0, 0, 0
@@ -945,7 +947,6 @@ class AdaptiveStrategy(DefaultStrategy):
         gauss_log_probs = gauss_dist.log_prob(final_actions)
         region_log_probs = region_dist.log_prob(region_actions)
 
-        px_sub, py_sub, ptx_sub, pty_sub = coords
         for i in range(len(original_subset_indices)):
             if not valid_mask_subset[i]:
                 continue

@@ -751,7 +751,6 @@ class AdaptiveStrategy(DefaultStrategy):
         (gauss_logits, gauss_values, _, _,
          region_logits, region_values) = self.ac_net(motion_features, region_features, region_assignments)
 
-        # --- Gaussian-Level PPO Loss ---
         gauss_advantage = rewards - gauss_values.detach()
         gauss_advantage = (gauss_advantage - gauss_advantage.mean()) / (gauss_advantage.std() + 1e-8)
 
@@ -793,7 +792,12 @@ class AdaptiveStrategy(DefaultStrategy):
         state["replay_buffer"].update_priorities(tree_idxs, td_errors)
 
         if self.verbose:
-            print(f"Agent trained: Loss = {loss.item():.4f}, ")
+            print(f"Agent trained: Loss = {loss.item():.4f}, Actor Loss = {actor_loss_gauss.mean().item():.4f}, "
+                  f"Critic Loss = {critic_loss_gauss.mean().item():.4f}, "
+                  f"Entropy Loss = {entropy_loss_gauss.mean().item():.4f}, "
+                  f"Region Actor Loss = {actor_loss_region.mean().item():.4f}, "
+                  f"Region Critic Loss = {critic_loss_region.mean().item():.4f}, "
+                  f"Region Entropy Loss = {entropy_loss_region.mean().item():.4f}, ")
 
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> Tuple[int, int, int, int, int]:

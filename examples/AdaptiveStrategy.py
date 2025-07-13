@@ -242,8 +242,6 @@ class AdaptiveStrategy(DefaultStrategy):
     num_uncertainty_views: int = 3
     geom_uncertainty_thresh: float = 0.002
 
-    photometric_error_thresh: float = 0.1
-
     learn_every: int = 200
     hindsight_delay: int = 400
 
@@ -270,7 +268,6 @@ class AdaptiveStrategy(DefaultStrategy):
             "quality_heatmap": None,
             "view_proj_matrix": None,
             "view_matrix": None,
-            "photometric_error_map": None,
             "detail_error_map": None,
             "geom_uncertainty_map": None,
             "densify_replay_buffer": PrioritizedReplayBuffer(capacity=20_000),
@@ -325,11 +322,10 @@ class AdaptiveStrategy(DefaultStrategy):
         device = params["means"].device
 
         means3d_subset = params["means"][subset_mask]
-        if state.get("photometric_error_map") is None and state.get("l1_loss_map") is None:
+        if state.get("l1_loss_map") is None:
             return None, None, None, None, None
 
-        error_map_key = "l1_loss_map" if state.get("l1_loss_map") is not None else "photometric_error_map"
-        h, w = state[error_map_key].shape
+        h, w = state["l1_loss_map"].shape
 
         patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask = self._project_to_patch_coords(
             means3d_subset, state["view_proj_matrix"], h, w
@@ -348,7 +344,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
         valid_indices = torch.where(valid_mask)[0]
         if valid_indices.numel() > 0:
-            features[valid_indices, 5] = state[error_map_key][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+            features[valid_indices, 5] = state["l1_loss_map"][pixel_coords_y[valid_indices], pixel_coords_x[
+                valid_indices]]
             if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
                     features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
             if state.get("quality_heatmap") is not None:
@@ -685,36 +682,6 @@ class AdaptiveStrategy(DefaultStrategy):
         quality_factor = torch.clamp(1.0 + (normalized_quality - 1.0) * 0.5, 0.5, 1.5).item()
         state["dynamic_grow_grad2d"] = self.grow_grad2d * quality_factor
 
-        gt_image = info["pixels"]
-        gt_ids = info["image_ids"]
-        gt_ks = info["Ks"]
-        camtoworlds_gt = info["camtoworlds"]
-        rendered_train_view, _, _ = self.rasterizer_fn(
-            means=params["means"], quats=params["quats"], scales=params["scales"],
-            opacities=params["opacities"], colors=torch.cat([params["sh0"], params["shN"]], 1),
-            Ks=gt_ks, width=width, height=height, sh_degree=sh_degree_to_use,
-            camtoworlds=camtoworlds_gt, image_ids=gt_ids,
-        )
-
-        if self.lpips_metric is not None:
-            rendered_p = rendered_train_view.permute(0, 3, 1, 2)
-            gt_p = gt_image.permute(0, 3, 1, 2)
-
-            with torch.no_grad():
-                feats_render = self.lpips_metric(rendered_p, gt_p)
-
-            photometric_error_map = feats_render
-        else:
-            photometric_error_map = torch.abs(rendered_train_view - gt_image).mean(dim=-1).squeeze(0)
-
-
-        if state["photometric_error_map"] is None:
-            state["photometric_error_map"] = photometric_error_map
-        else:
-            state["photometric_error_map"] = torch.lerp(
-                photometric_error_map, state["photometric_error_map"], self.nrqm_ema_decay
-            )
-
     @torch.no_grad()
     def _project_to_patch_coords(self, means3d: Tensor, view_proj_matrix: Tensor, h: int, w: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         means_h = F.pad(means3d, (0, 1), value=1.0)
@@ -754,7 +721,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
             px, py = exp["px"], exp["py"]
             ptx, pty = exp["ptx"], exp["pty"]
-            action = exp["action"]
 
             current_error = state["l1_loss_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
             reward_photo = exp["initial_error"] - current_error

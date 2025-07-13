@@ -229,6 +229,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
     novel_poses: Any = field(default=None, repr=False)
 
+    writer: Any = field(default=None, repr=False)
+
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
         storage = LazyMemmapStorage(max_size=30_000)
@@ -443,6 +445,7 @@ class AdaptiveStrategy(DefaultStrategy):
     ) -> None:
         if step >= self.refine_stop_iter:
             return
+        state["step"] = step
 
         if state.get("custom_lr_timers") is not None:
             active_lr_mask = state["custom_lr_timers"] > 0
@@ -886,6 +889,15 @@ class AdaptiveStrategy(DefaultStrategy):
                   f"Region Critic Loss = {critic_loss_region.mean().item():.4f}, "
                   f"Region Entropy Loss = {entropy_loss_region.mean().item():.4f}, "
                     f"Continuous Loss = {weighted_continuous_loss.mean().item() if is_continuous_action.any() else 0.0:.4f}")
+
+        self.writer.add_scalar("agent/loss", loss.item(), state["step"])
+        self.writer.add_scalar("agent/actor_loss", actor_loss_gauss.mean().item(), state["step"])
+        self.writer.add_scalar("agent/critic_loss", critic_loss_gauss.mean().item(), state["step"])
+        self.writer.add_scalar("agent/entropy_loss", entropy_loss_gauss.mean().item(), state["step"])
+        self.writer.add_scalar("agent/region_actor_loss", actor_loss_region.mean().item(), state["step"])
+        self.writer.add_scalar("agent/region_critic_loss", critic_loss_region.mean().item(), state["step"])
+        self.writer.add_scalar("agent/region_entropy_loss", entropy_loss_region.mean().item(), state["step"])
+        self.writer.add_scalar("agent/continuous_loss", weighted_continuous_loss.mean().item() if is_continuous_action.any() else 0.0, state["step"])
 
 
     @torch.no_grad()

@@ -370,6 +370,7 @@ class Runner:
         print("Scene scale:", self.scene_scale)
 
         if isinstance(cfg.strategy, AdaptiveStrategy):
+            cfg.strategy.writer = self.writer
             cfg.strategy.rasterizer_fn = self.rasterize_splats
             candidate_poses_np = generate_interpolated_path(
                 self.parser.camtoworlds, n_interp=5

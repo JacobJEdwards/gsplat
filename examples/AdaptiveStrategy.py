@@ -34,7 +34,7 @@ class TemporalGaussianGNN(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_dim * 2)
         self.norm2 = nn.LayerNorm(hidden_dim * 2)
 
-    def forward(self, gaussian_features: Tensor, edge_index: Tensor, edge_attr: Tensor, temporal_history: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(self, gaussian_features: Tensor, edge_index: Tensor, edge_attr: Tensor, temporal_history: Tensor) -> tuple[Tensor, Tensor]:
         spatial_features = self.selu(self.spatial_gnn(gaussian_features, edge_index, edge_attr)) # [N, hidden_dim * 2]
 
         temporal_features, _ = self.temporal_gru(temporal_history) # [N, T, hidden_dim * 2]
@@ -363,12 +363,12 @@ class AdaptiveStrategy(DefaultStrategy):
     @torch.no_grad()
     def _get_motion_aware_features(
             self, params: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         original_indices = torch.where(subset_mask)[0]
         raw_features, coords, valid_mask = self._get_raw_features(params, state, subset_mask, step, campos)
 
         if raw_features is None:
-            return None, None, None, None
+            return None, None, None, None, None
 
         subset_means = params["means"][subset_mask]
         edge_index = knn_graph(subset_means, k=self.gnn_knn, loop=True)
@@ -967,8 +967,8 @@ class AdaptiveStrategy(DefaultStrategy):
         significance = state["significance"][original_subset_indices]
 
         prune_merge_veto_mask = (
-                (age_in_steps < self.prune_age_threshold) |
-                (significance > self.prune_significance_threshold)
+                (age_in_steps < self.prune_age_threshold)
+                # (significance > self.prune_significance_threshold)
         )
         final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
         final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0

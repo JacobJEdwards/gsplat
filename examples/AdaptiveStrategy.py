@@ -744,10 +744,6 @@ class AdaptiveStrategy(DefaultStrategy):
             if action == 1 or action == 2:
                 action_cost = -self.action_cost_weight * torch.clamp(1.0 - initial_error / self.stable_error_threshold, 0.0, 1.0)
 
-            if action == 3:
-                action_cost += 10
-
-
             final_reward = base_reward + action_cost
 
             if action == 0:
@@ -1022,6 +1018,9 @@ class AdaptiveStrategy(DefaultStrategy):
         final_merge_mask_subset = (final_actions == 3) # Merge action
         final_dupe_mask_subset = (final_actions == 2) # Duplicate action
         final_split_mask_subset = (final_actions == 1) # Split action
+
+        # no merge:
+        final_merge_mask_subset = torch.zeros_like(final_merge_mask_subset, dtype=torch.bool)
 
         finetune_indices = original_subset_indices[final_finetune_mask_subset]
         n_finetune = finetune_indices.numel()

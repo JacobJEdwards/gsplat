@@ -745,7 +745,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 action_cost = -self.action_cost_weight * torch.clamp(1.0 - initial_error / self.stable_error_threshold, 0.0, 1.0)
 
             if action == 3:
-                action_cost += 10000
+                action_cost += 10
 
 
             final_reward = base_reward + action_cost

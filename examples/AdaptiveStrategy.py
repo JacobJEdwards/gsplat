@@ -160,7 +160,7 @@ class AdaptiveStrategy(DefaultStrategy):
     num_temporal_steps: int = 8
     num_regions: int = 256
     region_loss_weight: float = 0.5
-    region_entropy_weight: float = 0.4
+    region_entropy_weight: float = 0.02
 
     gnn_knn: int = 10
     gnn_edge_dim: int = 4
@@ -172,9 +172,9 @@ class AdaptiveStrategy(DefaultStrategy):
     bootstrap_steps: int = 0
 
     learn_every: int = 200
-    hindsight_delay: int = 300
+    hindsight_delay: int = 100
     actor_loss_weight: float = 1.0
-    entropy_loss_weight: float = 1.0
+    entropy_loss_weight: float = 0.05
 
     start_exploration_epsilon: float = 0.3
     end_exploration_epsilon: float = 0.05
@@ -185,7 +185,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     subset_fraction: float = 1.0
     max_densification_subset: int = 200_000
-    action_cost_weight: float = 0.001
+    action_cost_weight: float = 0.0001
 
     finetune_lr_multiplier: float = 10.0
     finetune_duration: int = 200
@@ -196,8 +196,8 @@ class AdaptiveStrategy(DefaultStrategy):
     w_uncertainty: float = 1.0
 
     stable_error_threshold: float = 0.01
-    stable_quality_threshold: float = 0.05
-    stability_reward_bonus: float = 0.1
+    stable_quality_threshold: float = 0.005
+    stability_reward_bonus: float = 0.05
 
     ppo_clip_epsilon: float = 0.2
     gnn_net: Any = field(default=None, repr=False)
@@ -259,7 +259,7 @@ class AdaptiveStrategy(DefaultStrategy):
         return state
 
     def _initialize_learning_components(self, device) -> None:
-        raw_feature_dim = 23
+        raw_feature_dim = 24
         ac_feature_dim = self.gnn_hidden_dim * 2
 
         self.gnn_net = TemporalGaussianGNN(
@@ -303,7 +303,7 @@ class AdaptiveStrategy(DefaultStrategy):
             means3d_subset, state["view_proj_matrix"], h, w
         )
 
-        feature_dim = 23
+        feature_dim = 24
         features = torch.zeros(num_subset, feature_dim, device=device)
 
         opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
@@ -384,6 +384,11 @@ class AdaptiveStrategy(DefaultStrategy):
         if mean_optimizer is not None and 'exp_avg_sq' in mean_optimizer.state[params['means']]:
             optimizer_state_mag = torch.norm(mean_optimizer.state[params['means']]['exp_avg_sq'][subset_mask], dim=-1)
             features[:, 22] = torch.log1p(optimizer_state_mag)
+
+        if valid_indices.numel() > 0:
+            l1_error = state["l1_loss_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+            max_scale = scales[valid_indices].max(dim=-1).values
+            features[valid_indices, 23] = l1_error * max_scale
 
         return torch.nan_to_num(features, 0.0), (pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y), valid_mask
 
@@ -731,20 +736,21 @@ class AdaptiveStrategy(DefaultStrategy):
             current_detail_error = state["detail_error_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
             reward_detail = exp["initial_detail_error"] - current_detail_error
 
-            base_reward = (self.w_photometric * reward_photo +
-                           self.w_detail * reward_detail +
-                           self.w_quality * reward_quality +
-                           self.w_uncertainty * reward_uncertainty)
+            # base_reward = (self.w_photometric * reward_photo +
+            #                self.w_detail * reward_detail +
+            #                self.w_quality * reward_quality +
+            #                self.w_uncertainty * reward_uncertainty)
+            base_reward = exp["initial_error"] - current_error
 
             action = exp["gaussian_action"]
             initial_error = exp["initial_error"]
             initial_quality = exp["initial_quality"]
 
             action_cost = 0.0
-            if action == 1 or action == 2:
-                action_cost = -self.action_cost_weight * torch.clamp(1.0 - initial_error / self.stable_error_threshold, 0.0, 1.0)
-            if action == 3:
-                action_cost += 100
+            # if action == 1 or action == 2:
+            #     action_cost = -self.action_cost_weight * torch.clamp(1.0 - initial_error / self.stable_error_threshold, 0.0, 1.0)
+            # if action == 3:
+            #     action_cost += 100
 
 
             final_reward = base_reward + action_cost

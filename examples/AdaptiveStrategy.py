@@ -30,7 +30,7 @@ class GaussianGraphNetwork(nn.Module):
         for _ in range(num_layers - 2):
             self.convs.append(TransformerConv(hidden_dim * 2, hidden_dim, heads=2, edge_dim=edge_dim))
         self.convs.append(TransformerConv(hidden_dim * 2, output_dim, concat=False, edge_dim=edge_dim))
-        self.prelu = nn.PReLU()
+        self.prelu = nn.SELU()
 
     def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
         for i, conv in enumerate(self.convs):
@@ -54,9 +54,9 @@ class ActorCriticNetwork(nn.Module):
 
         self.critic_head = nn.Linear(hidden_dim, 1)
         self.actor_discrete_head = nn.Linear(hidden_dim, 4)
-        self.actor_continuous_head = nn.Linear(hidden_dim, 8)
+        self.actor_continuous_head = nn.Linear(hidden_dim, 9)
 
-    def forward(self, x: Tensor, h_old: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def forward(self, x: Tensor, h_old: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         base_features = self.base_net(x)
         h_new = self.gru_cell(base_features, h_old)
 
@@ -69,10 +69,12 @@ class ActorCriticNetwork(nn.Module):
         split_dir = F.normalize(continuous_params[:, 2:5], dim=-1)
         dupe_dir = F.normalize(continuous_params[:, 5:8], dim=-1)
 
+        lr_multiplier = 0.5 + 1.5 * torch.sigmoid(continuous_params[:, 8])
+
         processed_continuous_params = torch.cat([
             split_ratio.unsqueeze(-1), dupe_offset_mag.unsqueeze(-1), split_dir, dupe_dir
         ], dim=-1)
-        return action_logits, value, processed_continuous_params, h_new
+        return action_logits, value, processed_continuous_params, h_new, lr_multiplier
 
 class PruningActorCritic(nn.Module):
     """A dedicated agent for the binary decision of pruning a Gaussian."""
@@ -260,6 +262,8 @@ class AdaptiveStrategy(DefaultStrategy):
     start_asc_grad2d: float = 0.0002
     end_asc_grad2d: float = 0.001
 
+    meta_lr_warmup_steps: int = 300
+
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
         state.update({
@@ -280,6 +284,8 @@ class AdaptiveStrategy(DefaultStrategy):
             "l1_loss_map": None,
             "ac_hidden_states": None,
             "pruning_ac_hidden_states": None,
+            "custom_lr_multipliers": None,
+            "custom_lr_timers": None,
         })
 
         return state
@@ -444,6 +450,20 @@ class AdaptiveStrategy(DefaultStrategy):
     ) -> None:
         if step >= self.refine_stop_iter:
             return
+
+        devices = params["means"].device
+        if state.get("custom_lr_timers") is not None:
+            active_lr_mask = state["custom_lr_timers"] > 0
+            if active_lr_mask.any():
+                active_indices = torch.where(active_lr_mask)[0]
+                multipliers = state["custom_lr_multipliers"][active_indices]
+
+                for p_name, p_val in params.items():
+                    if p_val.grad is not None:
+                        grad_multipliers = multipliers.view([-1] + [1] * (p_val.grad.dim() - 1))
+                        p_val.grad[active_indices] *= grad_multipliers
+
+                state["custom_lr_timers"][active_indices] -= 1
 
         if self.ac_net is None and self.use_learned_strategy:
             self._initialize_learning_components(params["means"].device)
@@ -918,6 +938,10 @@ class AdaptiveStrategy(DefaultStrategy):
         initial_num_gaussians = len(params["means"])
         device = params["means"].device
 
+        if state.get("custom_lr_timers") is None or state["custom_lr_timers"].shape[0] != initial_num_gaussians:
+            state["custom_lr_timers"] = torch.zeros(initial_num_gaussians, dtype=torch.int32, device=device)
+            state["custom_lr_multipliers"] = torch.ones(initial_num_gaussians, device=device)
+
         if state.get("view_matrix") is None: return 0,0,0,0
 
         if state.get("ac_hidden_states") is None or state["ac_hidden_states"].shape[0] != initial_num_gaussians:
@@ -987,9 +1011,11 @@ class AdaptiveStrategy(DefaultStrategy):
             prune_actions = (prune_dist.sample() == 1)
 
         self.ac_net.eval()
+
         h_prev = state['ac_hidden_states'][original_subset_indices]
-        action_logits, _, continuous_params, h_new = self.ac_net(ac_input, h_old=h_prev)
+        action_logits, _, continuous_params, h_new, lr_multipliers = self.ac_net(ac_input, h_old=h_prev)
         state['ac_hidden_states'][original_subset_indices] = h_new
+
         progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
         epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)
         densify_dist = Categorical(logits=action_logits)
@@ -1025,7 +1051,7 @@ class AdaptiveStrategy(DefaultStrategy):
         final_split_mask_subset = (final_actions == 1)
         final_dupe_mask_subset = (final_actions == 2)
 
-        state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "significance"]}
+        state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "significance", "ac_hidden_states", "custom_lr_multipliers", "custom_lr_timers"]}
 
         # A. PRUNE
         prune_orig_indices = original_subset_indices[final_prune_mask_subset]
@@ -1073,7 +1099,9 @@ class AdaptiveStrategy(DefaultStrategy):
         if n_split > 0:
             split(params, optimizers, state_to_modify, global_split_mask,
                   split_ratios=split_continuous_params[:, 0],
-                  directions=split_continuous_params[:, 2:5])
+                  directions=split_continuous_params[:, 2:5],
+                  lr_multipliers=lr_multipliers[final_split_mask_subset],
+                  warmup_steps=self.meta_lr_warmup_steps)
         num_gaussians_post_split = len(params["means"])
 
         # D. DUPLICATE
@@ -1114,7 +1142,9 @@ class AdaptiveStrategy(DefaultStrategy):
                     dupe_dirs = final_dupe_params[:, 5:8]
                     offset_magnitudes = dupe_scales.max(dim=-1).values * offset_mags
                     duplication_offsets = dupe_dirs * offset_magnitudes.unsqueeze(-1)
-                    duplicate(params, optimizers, state_to_modify, global_dupe_mask, offsets=duplication_offsets)
+                    duplicate(params, optimizers, state_to_modify, global_dupe_mask, offsets=duplication_offsets,
+                              lr_multipliers=state["custom_lr_multipliers"][original_subset_indices[final_dupe_mask_subset]],
+                              warmup_steps=self.meta_lr_warmup_steps)
 
         state.update(state_to_modify)
         if n_dupli > 0: state["age"][-n_dupli:] = 0

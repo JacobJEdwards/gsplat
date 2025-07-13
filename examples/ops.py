@@ -17,6 +17,8 @@ def split(
         anisotropic: bool = False,
         split_ratios: Tensor | None = None,
         directions: Tensor | None = None,
+        lr_multipliers: Tensor | None = None,
+        warmup_steps: int = 0,
 ):
     """Inplace split the Gaussian with the given mask.
 
@@ -85,11 +87,18 @@ def split(
         return torch.cat([v[rest], v_split])
 
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+
     for k, v in state.items():
         if isinstance(v, torch.Tensor):
             repeats = [2] + [1] * (v.dim() - 1)
             if k == 'ac_hidden_states':
                 v_split = torch.zeros_like(v[sel].repeat(repeats))
+                state[k] = torch.cat((v[rest], v_split))
+            elif k == 'custom_lr_multipliers' and lr_multipliers is not None:
+                v_split = lr_multipliers.repeat_interleave(2)
+                state[k] = torch.cat((v[rest], v_split))
+            elif k == 'custom_lr_timers' and warmup_steps > 0:
+                v_split = torch.full((len(sel) * 2,), warmup_steps, dtype=torch.int32, device=device)
                 state[k] = torch.cat((v[rest], v_split))
             else:
                 v_new = v[sel].repeat(repeats)
@@ -102,6 +111,8 @@ def duplicate(
         state: dict[str, Tensor],
         mask: Tensor,
         offsets: Tensor | None = None,
+        lr_multipliers: Tensor | None = None,
+        warmup_steps: int = 0,
 ):
     """
     Inplace duplicate the Gaussian with the given mask, with optional displacement.
@@ -127,6 +138,11 @@ def duplicate(
         if isinstance(v, torch.Tensor):
             if k == 'ac_hidden_states':
                 v_new = torch.zeros_like(v[sel])
+                state[k] = torch.cat((v, v_new))
+            elif k == 'custom_lr_multipliers' and lr_multipliers is not None:
+                state[k] = torch.cat((v, lr_multipliers))
+            elif k == 'custom_lr_timers' and warmup_steps > 0:
+                v_new = torch.full((len(sel),), warmup_steps, dtype=torch.int32, device=device)
                 state[k] = torch.cat((v, v_new))
             else:
                 state[k] = torch.cat((v, v[sel]))

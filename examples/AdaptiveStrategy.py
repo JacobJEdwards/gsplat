@@ -158,13 +158,12 @@ class AdaptiveStrategy(DefaultStrategy):
     to guide the growth and pruning of Gaussians, driven by NRQM feedback.
     """
     refine_every: int = 400
-    prune_every: int = 400
-    nrqm_every: int = 1000
+    nrqm_every: int = 500
 
-    num_temporal_steps: int = 5
-    num_regions: int = 128
-    region_loss_weight: float = 0.2
-    region_entropy_weight: float = 0.1
+    num_temporal_steps: int = 8
+    num_regions: int = 256
+    region_loss_weight: float = 0.5
+    region_entropy_weight: float = 0.4
 
     gnn_knn: int = 10
     gnn_edge_dim: int = 4
@@ -173,36 +172,33 @@ class AdaptiveStrategy(DefaultStrategy):
     ac_hidden_dim: int = 64
     num_global_features: int = 5
     use_learned_strategy: bool = True
-    bootstrap_steps: int = 1000
+    bootstrap_steps: int = 0
 
     learn_every: int = 200
-    hindsight_delay: int = 400
+    hindsight_delay: int = 300
     actor_loss_weight: float = 1.0
-    entropy_loss_weight: float = 0.1
+    entropy_loss_weight: float = 0.3
+
     start_exploration_epsilon: float = 0.3
     end_exploration_epsilon: float = 0.05
     exploration_decay_steps: int = 15000
 
-    prune_age_threshold: int = 1200
+    prune_age_threshold: int = 600
     prune_significance_threshold: float = 0.01
 
-    use_curiosity: bool = True
-    curiosity_weight: float = 0.05
-    icm_action_dim: int = 6
-
-    subset_fraction: float = 1.0
+    subset_fraction: float = 0.2
     max_densification_subset: int = 200_000
     action_cost_weight: float = 0.001
-    prune_reward_weight: float = 0.002
 
-    finetune_lr_multiplier: float = 4.0
-    finetune_duration: int = 100
+    finetune_lr_multiplier: float = 10.0
+    finetune_duration: int = 200
 
-    w_photometric: float = 0.8
-    w_detail: float = 0.4
+    w_photometric: float = 1.0
+    w_detail: float = 1.0
     w_quality: float = -1.0
     w_uncertainty: float = 1.0
-    ppo_clip_epsilon: float = 0.2
+
+    ppo_clip_epsilon: float = 0.3
 
     gnn_net: Any = field(default=None, repr=False)
     ac_net: Any = field(default=None, repr=False)
@@ -216,16 +212,15 @@ class AdaptiveStrategy(DefaultStrategy):
 
     nrqm_patch_size: int = 32
     nrqm_stagnation_threshold: float = 0.3
-    nrqm_prune_stagnant_after: int = 15
     nrqm_ema_decay: float = 0.9
 
     anisotropic_split: bool = True
 
     use_geom_uncertainty: bool = True
     num_uncertainty_views: int = 3
-    geom_uncertainty_thresh: float = 0.002
+    geom_uncertainty_thresh: float = 0.05
 
-    continuous_loss_weight: float = 0.5
+    continuous_loss_weight: float = 0.6
 
     knn_fn: Any = field(default=None, repr=False)
 

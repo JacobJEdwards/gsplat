@@ -157,7 +157,7 @@ class AdaptiveStrategy(DefaultStrategy):
     An advanced densification strategy that uses a UNIFIED actor-critic network
     to guide the growth and pruning of Gaussians, driven by NRQM feedback.
     """
-    refine_every: int = 400
+    refine_every: int = 600
     nrqm_every: int = 500
 
     num_temporal_steps: int = 8
@@ -186,7 +186,7 @@ class AdaptiveStrategy(DefaultStrategy):
     prune_age_threshold: int = 600
     prune_significance_threshold: float = 0.01
 
-    subset_fraction: float = 0.2
+    subset_fraction: float = 0.6
     max_densification_subset: int = 200_000
     action_cost_weight: float = 0.001
 

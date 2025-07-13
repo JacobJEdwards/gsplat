@@ -7,12 +7,13 @@ from approx_topk import topk
 import piq
 import torch
 import torch.nn.functional as F
+from sklearn.cluster import MiniBatchKMeans
 from torch import Tensor, nn
-from torch.distributions import Categorical, Bernoulli
+from torch.distributions import Categorical
 
 from torch_geometric.nn import knn_graph, TransformerConv
 
-from utils import knn_with_ids
+from utils import knn_with_ids, scatter_mean
 from gsplat.utils import normalized_quat_to_rotmat
 from utils import PrioritizedReplayBuffer
 from gsplat.strategy.ops import (
@@ -22,60 +23,87 @@ from gsplat.strategy.ops import (
 from gsplat.strategy.default import DefaultStrategy
 from ops import split, duplicate, merge
 
-class GaussianGraphNetwork(nn.Module):
-    def __init__(self, input_dim: int, edge_dim: int, hidden_dim: int, output_dim: int, num_layers: int = 2):
+class TemporalGaussianGNN(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, edge_dim: int, num_temporal_steps: int = 5):
         super().__init__()
-        self.convs = nn.ModuleList()
-        self.convs.append(TransformerConv(input_dim, hidden_dim, heads=2, edge_dim=edge_dim))
-        for _ in range(num_layers - 2):
-            self.convs.append(TransformerConv(hidden_dim * 2, hidden_dim, heads=2, edge_dim=edge_dim))
-        self.convs.append(TransformerConv(hidden_dim * 2, output_dim, concat=False, edge_dim=edge_dim))
-        self.prelu = nn.SELU()
+        self.temporal_steps = num_temporal_steps
+        self.spatial_gnn = TransformerConv(input_dim, hidden_dim, heads=2, edge_dim=edge_dim)
+        self.temporal_gru = nn.GRU(hidden_dim * 2, hidden_dim * 2, batch_first=True)
+        self.temporal_attention = nn.MultiheadAttention(hidden_dim * 2, num_heads=4, batch_first=True)
+        self.selu = nn.SELU()
+        self.norm1 = nn.LayerNorm(hidden_dim * 2)
+        self.norm2 = nn.LayerNorm(hidden_dim * 2)
 
-    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
-        for i, conv in enumerate(self.convs):
-            x = conv(x, edge_index, edge_attr)
-            if i < len(self.convs) - 1:
-                x = self.prelu(x)
-        return x
+    def forward(self, gaussian_features: Tensor, edge_index: Tensor, edge_attr: Tensor, temporal_history: Tensor) -> Tuple[Tensor, Tensor]:
+        spatial_features = self.selu(self.spatial_gnn(gaussian_features, edge_index, edge_attr)) # [N, hidden_dim * 2]
 
-class UnifiedActorCriticNetwork(nn.Module):
-    def __init__(self, input_dim: int = 18, mlp_width: int = 64, hidden_dim: int = 64):
-        super().__init__()
-        self.base_net = nn.Sequential(
-            nn.Linear(input_dim, mlp_width),
-            nn.LayerNorm(mlp_width),
-            nn.SELU(),
-            nn.Linear(mlp_width, mlp_width),
-            nn.LayerNorm(mlp_width),
-            nn.SELU(),
+        temporal_features, _ = self.temporal_gru(temporal_history) # [N, T, hidden_dim * 2]
+
+        motion_context, _ = self.temporal_attention(
+            spatial_features.unsqueeze(1), temporal_features, temporal_features
         )
-        self.gru_cell = nn.GRUCell(mlp_width, hidden_dim)
+        motion_context = self.norm1(motion_context.squeeze(1) + spatial_features)
 
-        self.critic_head = nn.Linear(hidden_dim, 1)
-        # 0: no-op, 1: split, 2: duplicate, 3: merge, 4: prune, 5: fine-tune
-        self.actor_discrete_head = nn.Linear(hidden_dim, 6)
-        self.actor_continuous_head = nn.Linear(hidden_dim, 9)
+        updated_history = torch.cat([temporal_history[:, 1:, :], motion_context.unsqueeze(1)], dim=1)
 
-    def forward(self, x: Tensor, h_old: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        base_features = self.base_net(x)
-        h_new = self.gru_cell(base_features, h_old)
+        return self.norm2(motion_context), updated_history
 
-        value = self.critic_head(h_new).squeeze(-1)
-        action_logits = self.actor_discrete_head(h_new)
+class HierarchicalActorCritic(nn.Module):
+    """
+    An Actor-Critic module that makes decisions on two scales: coarse regions and fine Gaussians.
+    It uses Transformer encoders for both levels and a cross-attention mechanism to allow
+    region-level decisions to inform Gaussian-level decisions.
+    """
+    def __init__(self, feature_dim: int, hidden_dim: int, action_dim: int = 6, continuous_dim: int = 9):
+        super().__init__()
+        region_encoder_layer = nn.TransformerEncoderLayer(d_model=feature_dim, nhead=4, dim_feedforward=hidden_dim, batch_first=True)
+        self.region_encoder = nn.TransformerEncoder(region_encoder_layer, num_layers=2)
+        self.region_value_head = nn.Linear(feature_dim, 1)
+        self.region_actor_head = nn.Linear(feature_dim, 3)  # e.g., 0: stable, 1: refine, 2: prune
 
-        continuous_params = self.actor_continuous_head(h_new)
+        gaussian_encoder_layer = nn.TransformerEncoderLayer(d_model=feature_dim, nhead=4, dim_feedforward=hidden_dim, batch_first=True)
+        self.gaussian_encoder = nn.TransformerEncoder(gaussian_encoder_layer, num_layers=2)
+
+        self.cross_scale_attention = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=4, batch_first=True)
+        self.norm_cross = nn.LayerNorm(feature_dim)
+
+        self.gaussian_value_head = nn.Linear(feature_dim, 1)
+        self.gaussian_actor_discrete_head = nn.Linear(feature_dim, action_dim)
+        self.gaussian_actor_continuous_head = nn.Linear(feature_dim, continuous_dim)
+        self.lr_multiplier_head = nn.Linear(feature_dim, 1)
+
+    def forward(self, gaussian_features: Tensor, region_features: Tensor, region_assignments: Tensor) -> Tuple:
+        region_features_encoded = self.region_encoder(region_features.unsqueeze(0)).squeeze(0)
+        region_values = self.region_value_head(region_features_encoded).squeeze(-1)
+        region_action_logits = self.region_actor_head(region_features_encoded)
+
+        region_context = region_features_encoded[region_assignments]
+
+        fused_features, _ = self.cross_scale_attention(
+            query=gaussian_features.unsqueeze(1),
+            key=region_context.unsqueeze(1),
+            value=region_context.unsqueeze(1)
+        )
+        fused_features = self.norm_cross(fused_features.squeeze(1) + gaussian_features)
+
+        gaussian_features_encoded = self.gaussian_encoder(fused_features.unsqueeze(0)).squeeze(0)
+
+        gaussian_values = self.gaussian_value_head(gaussian_features_encoded).squeeze(-1)
+        gaussian_action_logits = self.gaussian_actor_discrete_head(gaussian_features_encoded)
+
+        continuous_params = self.gaussian_actor_continuous_head(gaussian_features_encoded)
         split_ratio = 1.2 + 2.0 * torch.sigmoid(continuous_params[:, 0])
         dupe_offset_mag = torch.sigmoid(continuous_params[:, 1])
         split_dir = F.normalize(continuous_params[:, 2:5], dim=-1)
         dupe_dir = F.normalize(continuous_params[:, 5:8], dim=-1)
-
-        lr_multiplier = 0.5 + 1.5 * torch.sigmoid(continuous_params[:, 8])
-
         processed_continuous_params = torch.cat([
             split_ratio.unsqueeze(-1), dupe_offset_mag.unsqueeze(-1), split_dir, dupe_dir
         ], dim=-1)
-        return action_logits, value, processed_continuous_params, h_new, lr_multiplier
+        lr_multiplier = 0.5 + 1.5 * torch.sigmoid(self.lr_multiplier_head(gaussian_features_encoded).squeeze(-1))
+
+        return (gaussian_action_logits, gaussian_values, processed_continuous_params, lr_multiplier,
+                region_action_logits, region_values)
+
 
 class ICMModule(nn.Module):
     """Intrinsic Curiosity Module to encourage exploration."""
@@ -127,8 +155,13 @@ class AdaptiveStrategy(DefaultStrategy):
     to guide the growth and pruning of Gaussians, driven by NRQM feedback.
     """
     refine_every: int = 400
-    prune_every: int = 400 # Keep for compatibility, though pruning is now part of the unified policy
+    prune_every: int = 400
     nrqm_every: int = 1000
+
+    num_temporal_steps: int = 5
+    num_regions: int = 128
+    region_loss_weight: float = 0.2
+    region_entropy_weight: float = 0.1
 
     gnn_knn: int = 10
     gnn_edge_dim: int = 4
@@ -220,36 +253,39 @@ class AdaptiveStrategy(DefaultStrategy):
 
     def _initialize_learning_components(self, device) -> None:
         raw_feature_dim = 19
-        ac_input_dim = self.gnn_embedding_dim + self.num_global_features
+        ac_feature_dim = self.gnn_hidden_dim * 2
 
-        self.gnn_net = GaussianGraphNetwork(
-            input_dim=raw_feature_dim, edge_dim=self.gnn_edge_dim,
-            hidden_dim=self.gnn_hidden_dim, output_dim=self.gnn_embedding_dim,
+        self.gnn_net = TemporalGaussianGNN(
+            input_dim=raw_feature_dim,
+            hidden_dim=self.gnn_hidden_dim,
+            edge_dim=self.gnn_edge_dim,
+            num_temporal_steps=self.num_temporal_steps
         ).to(device)
 
-        self.ac_net = UnifiedActorCriticNetwork(
-            input_dim=ac_input_dim, mlp_width=self.ac_hidden_dim, hidden_dim=self.ac_hidden_dim
+        self.ac_net = HierarchicalActorCritic(
+            feature_dim=ac_feature_dim,
+            hidden_dim=self.ac_hidden_dim,
         ).to(device)
 
         unified_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
         self.optimizer = torch.optim.AdamW(unified_params, lr=1e-4, weight_decay=1e-5)
 
-        if self.use_curiosity:
-            self.icm_module = ICMModule(
-                feature_dim=ac_input_dim, action_dim=self.icm_action_dim
-            ).to(device)
-            self.icm_optimizer = torch.optim.AdamW(self.icm_module.parameters(), lr=1e-4)
+        # if self.use_curiosity:
+        #     self.icm_module = ICMModule(
+        #         feature_dim=ac_input_dim, action_dim=self.icm_action_dim
+        #     ).to(device)
+        #     self.icm_optimizer = torch.optim.AdamW(self.icm_module.parameters(), lr=1e-4)
 
     @torch.no_grad()
     def _get_raw_features(
             self, params: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, tuple, Tensor]:
         num_subset = subset_mask.sum().item()
         device = params["means"].device
 
         means3d_subset = params["means"][subset_mask]
         if state.get("l1_loss_map") is None:
-            return None, None, None, None, None
+            return None, None, None
 
         h, w = state["l1_loss_map"].shape
 
@@ -322,14 +358,52 @@ class AdaptiveStrategy(DefaultStrategy):
         view_alignment = torch.abs((largest_axis * view_dirs).sum(dim=-1))
         features[:, 18] = view_alignment
 
-        return torch.nan_to_num(features, 0.0), pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y, valid_mask
+        return torch.nan_to_num(features, 0.0), (pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y), valid_mask
+
+    @torch.no_grad()
+    def _get_motion_aware_features(
+            self, params: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        original_indices = torch.where(subset_mask)[0]
+        raw_features, coords, _ = self._get_raw_features(params, state, subset_mask, step, campos)
+
+        if raw_features is None:
+            return None, None, None, None
+
+        subset_means = params["means"][subset_mask]
+        edge_index = knn_graph(subset_means, k=self.gnn_knn, loop=True)
+
+        row, col = edge_index
+        means_i, means_j = subset_means[row], subset_means[col]
+        rel_dist = torch.norm(means_i - means_j, dim=-1) / state["scene_scale"]
+
+        scales_i = torch.exp(params["scales"][subset_mask][row]).mean(dim=-1)
+        scales_j = torch.exp(params["scales"][subset_mask][col]).mean(dim=-1)
+        scale_diff = torch.abs(scales_i - scales_j) / state["scene_scale"]
+        opacities_i = torch.sigmoid(params["opacities"][subset_mask][row].flatten())
+        opacities_j = torch.sigmoid(params["opacities"][subset_mask][col].flatten())
+        opacity_diff = torch.abs(opacities_i - opacities_j)
+        sh0_i = params["sh0"][subset_mask][row].squeeze(-2)
+        sh0_j = params["sh0"][subset_mask][col].squeeze(-2)
+        color_diff = torch.norm(sh0_i - sh0_j, dim=-1)
+        edge_attr = torch.stack([rel_dist, scale_diff, opacity_diff, color_diff], dim=-1)
+        edge_attr = torch.nan_to_num(edge_attr, 0.0)
+
+        temporal_history = state['ac_hidden_states'][original_indices]
+
+        self.gnn_net.eval()
+        motion_context, updated_history = self.gnn_net(raw_features, edge_index, edge_attr, temporal_history)
+
+        state['ac_hidden_states'][original_indices] = updated_history
+
+        return motion_context, coords, raw_features, subset_means
 
 
     @torch.no_grad()
     def _get_graph_representation(
             self, params: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
     ) -> tuple[Tensor, tuple, Tensor]:
-        raw_features, px, py, ptx, pty, valid_mask = self._get_raw_features(params, state, subset_mask, step, campos)
+        raw_features, (px, py, ptx, pty), valid_mask = self._get_raw_features(params, state, subset_mask, step, campos)
 
         if raw_features is None:
             return None, None, None
@@ -711,10 +785,10 @@ class AdaptiveStrategy(DefaultStrategy):
 
             if len(state["replay_buffer"]) < state["replay_buffer"].capacity:
                 state["replay_buffer"].add((
-                    exp["features"],
-                    exp["action"],
+                    exp["motion_features"], exp["region_features"], exp["region_assignment"],
+                    exp["gaussian_action"], exp["region_action"],
                     final_reward.clone().detach(),
-                    exp["log_prob"]
+                    exp["gaussian_log_prob"], exp["region_log_prob"]
                 ))
 
     def _train_agent(self, state: dict[str, Any]):
@@ -722,59 +796,55 @@ class AdaptiveStrategy(DefaultStrategy):
 
         self.gnn_net.train()
         self.ac_net.train()
-        if self.use_curiosity:
-            self.icm_module.train()
+        # if self.use_curiosity:
+        #     self.icm_module.train()
 
         device = next(self.ac_net.parameters()).device
+
         batch, tree_idxs, is_weights = state["replay_buffer"].sample(256)
         is_weights = torch.tensor(is_weights, device=device, dtype=torch.float32)
 
-        states = torch.stack([x[0] for x in batch]).to(device)
-        actions_taken = torch.tensor([x[1] for x in batch], device=device, dtype=torch.int64)
-        extrinsic_rewards = torch.stack([x[2] for x in batch]).to(device)
-        old_log_probs = torch.stack([x[3] for x in batch]).to(device)
+        motion_features = torch.stack([x[0] for x in batch]).to(device)
+        region_features = torch.stack([x[1] for x in batch]).to(device)
+        region_assignments = torch.stack([x[2] for x in batch]).to(device)
+        gauss_actions = torch.stack([x[3] for x in batch]).to(device)
+        region_actions = torch.stack([x[4] for x in batch]).to(device)
+        rewards = torch.stack([x[5] for x in batch]).to(device)
+        old_gauss_log_probs = torch.stack([x[6] for x in batch]).to(device)
+        old_region_log_probs = torch.stack([x[7] for x in batch]).to(device)
 
-        total_reward = extrinsic_rewards
+        (gauss_logits, gauss_values, _, _,
+         region_logits, region_values) = self.ac_net(motion_features, region_features, region_assignments)
 
-        if self.use_curiosity:
-            next_states = torch.roll(states, -1, dims=0)
-            actions_one_hot = F.one_hot(actions_taken, num_classes=self.icm_action_dim).float()
+        # --- Gaussian-Level PPO Loss ---
+        gauss_advantage = rewards - gauss_values.detach()
+        gauss_advantage = (gauss_advantage - gauss_advantage.mean()) / (gauss_advantage.std() + 1e-8)
 
-            pred_next_state, pred_action_logits = self.icm_module(states, next_states, actions_one_hot)
+        new_gauss_dist = Categorical(logits=gauss_logits)
+        new_gauss_log_probs = new_gauss_dist.log_prob(gauss_actions)
+        ratio_gauss = torch.exp(new_gauss_log_probs - old_gauss_log_probs)
 
-            forward_loss = F.mse_loss(pred_next_state, next_states.detach())
-            inverse_loss = F.cross_entropy(pred_action_logits, actions_taken.detach())
-            icm_loss = forward_loss + inverse_loss
+        surr1_gauss = ratio_gauss * gauss_advantage
+        surr2_gauss = torch.clamp(ratio_gauss, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * gauss_advantage
+        actor_loss_gauss = -torch.min(surr1_gauss, surr2_gauss)
+        critic_loss_gauss = F.mse_loss(gauss_values, rewards, reduction="none")
+        entropy_loss_gauss = -self.entropy_loss_weight * new_gauss_dist.entropy()
 
-            self.icm_optimizer.zero_grad()
-            icm_loss.backward()
-            self.icm_optimizer.step()
+        region_advantage = rewards - region_values.detach()
+        region_advantage = (region_advantage - region_advantage.mean()) / (region_advantage.std() + 1e-8)
 
-            intrinsic_reward = F.mse_loss(pred_next_state.detach(), next_states.detach(), reduction='none').mean(dim=-1)
-            norm_intrinsic_reward = (intrinsic_reward - intrinsic_reward.mean()) / (intrinsic_reward.std() + 1e-8)
-            total_reward = extrinsic_rewards + self.curiosity_weight * norm_intrinsic_reward
+        new_region_dist = Categorical(logits=region_logits)
+        new_region_log_probs = new_region_dist.log_prob(region_actions)
+        ratio_region = torch.exp(new_region_log_probs - old_region_log_probs)
 
-        action_logits, predicted_values, _, _, _ = self.ac_net(states, torch.zeros(states.shape[0], self.ac_hidden_dim, device=device))
+        surr1_region = ratio_region * region_advantage
+        surr2_region = torch.clamp(ratio_region, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * region_advantage
+        actor_loss_region = -torch.min(surr1_region, surr2_region)
+        critic_loss_region = F.mse_loss(region_values, rewards, reduction="none")
+        entropy_loss_region = -self.region_entropy_weight * new_region_dist.entropy()
 
-        advantage = total_reward - predicted_values.detach()
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-
-        critic_loss_unreduced = F.mse_loss(predicted_values, total_reward, reduction="none")
-
-        new_dist = Categorical(logits=action_logits)
-        new_log_probs = new_dist.log_prob(actions_taken)
-        ratio = torch.exp(new_log_probs - old_log_probs)
-
-        surr1 = ratio * advantage
-        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantage
-        actor_loss_unreduced = -torch.min(surr1, surr2)
-        entropy_loss_unreduced = -self.entropy_loss_weight * new_dist.entropy()
-
-        total_loss_unreduced = (
-                critic_loss_unreduced +
-                self.actor_loss_weight * actor_loss_unreduced +
-                entropy_loss_unreduced
-        )
+        total_loss_unreduced = (actor_loss_gauss + critic_loss_gauss + entropy_loss_gauss +
+                                self.region_loss_weight * (actor_loss_region + critic_loss_region + entropy_loss_region))
 
         loss = (total_loss_unreduced * is_weights).mean()
 
@@ -784,9 +854,8 @@ class AdaptiveStrategy(DefaultStrategy):
         torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
         self.optimizer.step()
 
-        td_errors = (total_reward - predicted_values).abs().detach().cpu().numpy()
+        td_errors = (rewards - gauss_values).abs().detach().cpu().numpy()
         state["replay_buffer"].update_priorities(tree_idxs, td_errors)
-
 
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> Tuple[int, int, int, int, int]:
@@ -800,15 +869,16 @@ class AdaptiveStrategy(DefaultStrategy):
         if state.get("view_matrix") is None: return 0, 0, 0, 0, 0
 
         if state.get("ac_hidden_states") is None or state["ac_hidden_states"].shape[0] != initial_num_gaussians:
+            hidden_dim = self.gnn_hidden_dim * 2
             state["ac_hidden_states"] = torch.zeros(
-                (initial_num_gaussians, self.ac_hidden_dim), device=device
+                (initial_num_gaussians, self.num_temporal_steps, hidden_dim), device=device
             )
 
         grad_thresh = state["dynamic_grow_grad2d"]
         candidates_by_grad = state["grad2d"] / state["count"].clamp_min(1) > grad_thresh
 
-        h = state['l1_loss_map'].shape[0]
-        w = state['l1_loss_map'].shape[1]
+        h, w = state['l1_loss_map'].shape[0], state['l1_loss_map'].shape[1]
+
         ptx, pty, px, py, valid_proj = self._project_to_patch_coords(params['means'], state['view_proj_matrix'], h, w)
 
         low_quality_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=device)
@@ -832,45 +902,72 @@ class AdaptiveStrategy(DefaultStrategy):
         camtoworld_matrix = torch.inverse(state['view_matrix'])
         campos = camtoworld_matrix[:3, 3]
 
-        graph_embeddings, coords, raw_features = self._get_graph_representation(params, state, subset_mask, step, campos)
-        if graph_embeddings is None: return 0, 0, 0, 0, 0
+        motion_features, coords, _, subset_means = self._get_motion_aware_features(params, state, subset_mask, step,
+                                                                                campos)
+        if motion_features is None: return 0, 0, 0, 0, 0
 
-        px_sub, py_sub, ptx_sub, pty_sub, valid_mask_subset = coords
-
-        avg_scale = torch.exp(params['scales']).mean() / state['scene_scale']
-        std_scale = torch.exp(params['scales']).std() / state['scene_scale']
-        global_context = torch.tensor([
-            min(initial_num_gaussians / 500_000.0, 1.0),
-            state.get("quality_heatmap", torch.zeros(1, device=device)).mean(),
-            state.get("significance", torch.zeros(1, device=device)).mean(),
-            avg_scale, std_scale
-        ], device=device).float()
-        expanded_global_context = global_context.unsqueeze(0).expand(graph_embeddings.shape[0], -1)
-        ac_input = torch.cat([graph_embeddings, expanded_global_context], dim=-1)
+        if len(subset_means) < self.num_regions: return 0,0,0,0,0
+        kmeans = MiniBatchKMeans(n_clusters=self.num_regions, random_state=step).fit(subset_means.cpu().numpy())
+        region_assignments = torch.from_numpy(kmeans.labels_).to(device)
+        region_features = scatter_mean(motion_features, region_assignments, self.num_regions)
 
         self.ac_net.eval()
-        h_prev = state['ac_hidden_states'][original_subset_indices]
-        action_logits, _, continuous_params, h_new, lr_multipliers = self.ac_net(ac_input, h_old=h_prev)
-        state['ac_hidden_states'][original_subset_indices] = h_new
+        (gaussian_logits, _, continuous_params, lr_multipliers,
+         region_logits, _) = self.ac_net(motion_features, region_features, region_assignments)
 
         progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
         epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)
-        action_dist = Categorical(logits=action_logits)
+
+        gauss_dist = Categorical(logits=gaussian_logits)
+        region_dist = Categorical(logits=region_logits)
 
         if torch.rand(1).item() < epsilon:
-            final_actions = torch.randint(0, self.icm_action_dim, (len(original_subset_indices),), device=device)
+            final_actions = torch.randint(0, 6, (len(original_subset_indices),), device=device)
+            region_actions = torch.randint(0, 3, (self.num_regions,), device=device)
         else:
-            final_actions = action_dist.sample()
+            final_actions = gauss_dist.sample()
+            region_actions = region_dist.sample()
+
+        gauss_log_probs = gauss_dist.log_prob(final_actions)
+        region_log_probs = region_dist.log_prob(region_actions)
+
+        px_sub, py_sub, ptx_sub, pty_sub, valid_mask_subset = coords
+        for i in range(len(original_subset_indices)):
+            if not valid_mask_subset[i]: continue
+
+            initial_error = state["l1_loss_map"][max(0, py_sub[i]-2):py_sub[i]+3, max(0, px_sub[i]-2):px_sub[i]+3].mean()
+            initial_quality = state["quality_heatmap"][pty_sub[i], ptx_sub[i]]
+            initial_uncertainty = state["geom_uncertainty_map"][py_sub[i], px_sub[i]]
+            initial_detail_error = state["detail_error_map"][max(0, py_sub[i]-2):py_sub[i]+3, max(0, px_sub[i]-2):px_sub[i]+3].mean()
+
+            region_idx = region_assignments[i]
+
+            exp = {
+                "step": step,
+                "motion_features": motion_features[i].detach(),
+                "region_features": region_features[region_idx].detach(),
+                "region_assignment": region_idx.detach(),
+                "gaussian_action": final_actions[i].detach(),
+                "region_action": region_actions[region_idx].detach(),
+                "gaussian_log_prob": gauss_log_probs[i].detach(),
+                "region_log_prob": region_log_probs[region_idx].detach(),
+                "initial_error": initial_error.detach(),
+                "initial_quality": initial_quality.detach(),
+                "initial_uncertainty": initial_uncertainty.detach(),
+                "initial_detail_error": initial_detail_error.detach(),
+                "px": px_sub[i], "py": py_sub[i], "ptx": ptx_sub[i], "pty": pty_sub[i]
+            }
+            state["hindsight_buffer"].append(exp)
 
         age_in_steps = state["age"][original_subset_indices]
         significance = state["significance"][original_subset_indices]
 
-        # prune_merge_veto_mask = (
-        #         (age_in_steps < self.prune_age_threshold) |
-        #         (significance > self.prune_significance_threshold)
-        # )
-        # final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
-        # final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
+        prune_merge_veto_mask = (
+                (age_in_steps < self.prune_age_threshold) |
+                (significance > self.prune_significance_threshold)
+        )
+        final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
+        final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
 
         final_finetune_mask_subset = (final_actions == 5)
         final_prune_mask_subset = (final_actions == 4)
@@ -879,11 +976,10 @@ class AdaptiveStrategy(DefaultStrategy):
         final_split_mask_subset = (final_actions == 1)
 
         finetune_indices = original_subset_indices[final_finetune_mask_subset]
-        if finetune_indices.numel() > 0:
+        n_finetune = finetune_indices.numel()
+        if n_finetune > 0:
             state["custom_lr_multipliers"][finetune_indices] = self.finetune_lr_multiplier
             state["custom_lr_timers"][finetune_indices] = self.finetune_duration
-
-        n_finetune = finetune_indices.numel()
 
         state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "significance", "ac_hidden_states", "custom_lr_multipliers", "custom_lr_timers"]}
 

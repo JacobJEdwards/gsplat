@@ -991,6 +991,7 @@ class AdaptiveStrategy(DefaultStrategy):
         )
 
         final_actions[(final_actions == 4) & prune_veto_mask] = 0
+        final_actions[(final_actions == 3) & prune_veto_mask] = 0
 
         final_prune_mask_subset = (final_actions == 4)
         final_merge_mask_subset = (final_actions == 3)

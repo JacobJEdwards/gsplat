@@ -39,7 +39,7 @@ class GaussianGraphNetwork(nn.Module):
                 x = self.prelu(x)
         return x
 
-class ActorCriticNetwork(nn.Module):
+class UnifiedActorCriticNetwork(nn.Module):
     def __init__(self, input_dim: int = 18, mlp_width: int = 64, hidden_dim: int = 64):
         super().__init__()
         self.base_net = nn.Sequential(
@@ -53,7 +53,9 @@ class ActorCriticNetwork(nn.Module):
         self.gru_cell = nn.GRUCell(mlp_width, hidden_dim)
 
         self.critic_head = nn.Linear(hidden_dim, 1)
-        self.actor_discrete_head = nn.Linear(hidden_dim, 4)
+        # --- KEY CHANGE: Unified action head for 5 actions ---
+        # 0: no-op, 1: split, 2: duplicate, 3: merge, 4: prune
+        self.actor_discrete_head = nn.Linear(hidden_dim, 5)
         self.actor_continuous_head = nn.Linear(hidden_dim, 9)
 
     def forward(self, x: Tensor, h_old: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -75,29 +77,6 @@ class ActorCriticNetwork(nn.Module):
             split_ratio.unsqueeze(-1), dupe_offset_mag.unsqueeze(-1), split_dir, dupe_dir
         ], dim=-1)
         return action_logits, value, processed_continuous_params, h_new, lr_multiplier
-
-class PruningActorCritic(nn.Module):
-    """A dedicated agent for the binary decision of pruning a Gaussian."""
-    def __init__(self, input_dim: int = 18, mlp_width: int = 64, hidden_dim: int = 64):
-        super().__init__()
-        self.base_net = nn.Sequential(
-            nn.Linear(input_dim, mlp_width),
-            nn.LayerNorm(mlp_width), nn.SELU(),
-            nn.Linear(mlp_width, mlp_width),
-            nn.LayerNorm(mlp_width), nn.SELU(),
-        )
-        self.gru_cell = nn.GRUCell(mlp_width, mlp_width)
-
-        self.critic_head = nn.Linear(mlp_width, 1)
-        self.actor_head = nn.Linear(mlp_width, 1)
-
-    def forward(self, x: Tensor, h_old: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        base_features = self.base_net(x)
-        h_new = self.gru_cell(base_features, h_old)
-
-        value = self.critic_head(h_new).squeeze(-1)
-        action_logit = self.actor_head(h_new).squeeze(-1)
-        return action_logit, value, h_new
 
 class ICMModule(nn.Module):
     """Intrinsic Curiosity Module to encourage exploration."""
@@ -134,7 +113,6 @@ class PatchBasedNRQM(nn.Module):
     def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
         if self.model_name == "brisque":
             scores = self.model(image_patches)
-            # return scores.view(scores.shape[0])
             return scores
         elif self.model_name == "clipiqa":
             scores = self.model(image_patches)
@@ -146,35 +124,11 @@ class PatchBasedNRQM(nn.Module):
 @dataclass
 class AdaptiveStrategy(DefaultStrategy):
     """
-    An advanced densification strategy that uses NRQM feedback to guide the
-    growth and pruning of Gaussians.
-
-    This strategy introduces three core NRQM-driven mechanics:
-    1.  **Spatially-Aware Densification**: Uses a quality heatmap from novel views
-        to prioritize densifying Gaussians in low-quality regions.
-    2.  **NRQM-Modulated Threshold**: Dynamically adjusts the gradient threshold for
-        densification based on the overall rendered quality.
-    3.  **Quality-Aware Pruning**: Prunes Gaussians that are "stagnant" - i.e.,
-        consistently contribute to low-quality regions without having high enough
-        gradients to be densified.
-
-    Args:
-        nrqm_every (int): How often to run the NRQM evaluation to update the
-          quality map. Default is 250 steps.
-        nrqm_patch_size (int): The size of patches to use for the spatial NRQM.
-          Default is 32.
-        nrqm_stagnation_threshold (float): A score below which a region is
-          considered low-quality for stagnation tracking. Default is 0.3.
-        nrqm_prune_stagnant_after (int): Prune stagnant Gaussians after they
-          have been observed in low-quality regions this many times. Default is 10.
-        anisotropic_split (bool): Whether to use anisotropic splitting. Default is True.
-        prune_redundant (bool): Whether to prune redundant Gaussians. Default is True.
-        redundancy_knn (int): Number of nearest neighbors to consider for redundancy pruning. Default is 5.
-        redundancy_overlap_thresh (float): Overlap threshold for redundancy pruning. Default is 0.6.
-        redundancy_color_thresh (float): Color similarity threshold for redundancy pruning. Default is 0.1.
+    An advanced densification strategy that uses a UNIFIED actor-critic network
+    to guide the growth and pruning of Gaussians, driven by NRQM feedback.
     """
     refine_every: int = 400
-    prune_every: int = 400
+    prune_every: int = 400 # Keep for compatibility, though pruning is now part of the unified policy
     nrqm_every: int = 1000
 
     gnn_knn: int = 10
@@ -186,28 +140,28 @@ class AdaptiveStrategy(DefaultStrategy):
     use_learned_strategy: bool = True
     bootstrap_steps: int = 5000
 
-    densify_learn_every: int = 200
-    densify_hindsight_delay: int = 400
+    learn_every: int = 200
+    hindsight_delay: int = 400
     actor_loss_weight: float = 1.0
     entropy_loss_weight: float = 0.1
     start_exploration_epsilon: float = 0.3
     end_exploration_epsilon: float = 0.05
     exploration_decay_steps: int = 15000
 
-    use_learned_pruning: bool = True
-    pruning_learn_every: int = 500
-    pruning_hindsight_delay: int = 800
-    prune_threshold: float = 0.6
+    # Pruning is now part of the unified model, so these are less critical
     prune_age_threshold: int = 1200
+    prune_significance_threshold: float = 0.01
 
     use_curiosity: bool = True
     curiosity_weight: float = 0.05
-    icm_action_dim: int = 4
+    # --- KEY CHANGE: Action dimension is now 5 for the unified model ---
+    icm_action_dim: int = 5
 
     subset_fraction: float = 1.0
     max_densification_subset: int = 200_000
-    prune_significance_threshold: float = 0.01
     action_cost_weight: float = 0.001
+    prune_reward_weight: float = 0.002 # Reward for simplifying the model via pruning/merging
+
     w_photometric: float = 0.8
     w_detail: float = 0.4
     w_quality: float = -1.0
@@ -216,16 +170,13 @@ class AdaptiveStrategy(DefaultStrategy):
 
     gnn_net: Any = field(default=None, repr=False)
     ac_net: Any = field(default=None, repr=False)
-    pruning_ac_net: Any = field(default=None, repr=False)
     icm_module: Any = field(default=None, repr=False)
 
-    densify_optimizer: Any = field(default=None, repr=False)
-    pruning_optimizer: Any = field(default=None, repr=False)
+    optimizer: Any = field(default=None, repr=False)
     icm_optimizer: Any = field(default=None, repr=False)
 
     rasterizer_fn: Any = field(default=None, repr=False)
     nrqm_model: Any = field(default=None, repr=False)
-
 
     nrqm_patch_size: int = 32
     nrqm_stagnation_threshold: float = 0.3
@@ -233,32 +184,14 @@ class AdaptiveStrategy(DefaultStrategy):
     nrqm_ema_decay: float = 0.9
 
     anisotropic_split: bool = True
-    prune_redundant: bool = True
-    redundancy_knn: int = 5
-    redundancy_overlap_thresh: float = 0.6
-    redundancy_color_thresh: float = 0.1
 
     use_geom_uncertainty: bool = True
     num_uncertainty_views: int = 3
     geom_uncertainty_thresh: float = 0.002
 
-    learn_every: int = 200
-    hindsight_delay: int = 400
-
     continuous_loss_weight: float = 0.5
 
-    pruning_bootstrap_steps: int = 5000
-    learned_prune_threshold: float = 0.5
-
-    pruning_net: Any = field(default=None, repr=False)
-
     knn_fn: Any = field(default=None, repr=False)
-    lpips_metric: Any = field(default=None, repr=False)
-
-    combined_optimizer: Any = field(default=None, repr=False)
-
-    start_asc_grad2d: float = 0.0002
-    end_asc_grad2d: float = 0.001
 
     meta_lr_warmup_steps: int = 300
 
@@ -272,21 +205,18 @@ class AdaptiveStrategy(DefaultStrategy):
             "view_matrix": None,
             "detail_error_map": None,
             "geom_uncertainty_map": None,
-            "densify_replay_buffer": PrioritizedReplayBuffer(capacity=20_000),
-            "densify_hindsight_buffer": deque(maxlen=5_000),
-            "pruning_replay_buffer": PrioritizedReplayBuffer(capacity=10_000),
-            "pruning_hindsight_buffer": deque(maxlen=2_500),
+            # --- KEY CHANGE: Unified replay and hindsight buffers ---
+            "replay_buffer": PrioritizedReplayBuffer(capacity=30_000),
+            "hindsight_buffer": deque(maxlen=7_500),
             "significance": None,
             "prev_grad2d": None,
             "prev_opacity": None,
             "age": None,
             "l1_loss_map": None,
             "ac_hidden_states": None,
-            "pruning_ac_hidden_states": None,
             "custom_lr_multipliers": None,
             "custom_lr_timers": None,
         })
-
         return state
 
     def _initialize_learning_components(self, device) -> None:
@@ -298,16 +228,14 @@ class AdaptiveStrategy(DefaultStrategy):
             hidden_dim=self.gnn_hidden_dim, output_dim=self.gnn_embedding_dim,
         ).to(device)
 
-        self.ac_net = ActorCriticNetwork(input_dim=ac_input_dim, mlp_width=self.ac_hidden_dim, hidden_dim=self.ac_hidden_dim).to(
-            device)
-        densify_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
-        self.densify_optimizer = torch.optim.AdamW(densify_params, lr=1e-4, weight_decay=1e-5)
+        # --- KEY CHANGE: Use the unified actor-critic network ---
+        self.ac_net = UnifiedActorCriticNetwork(
+            input_dim=ac_input_dim, mlp_width=self.ac_hidden_dim, hidden_dim=self.ac_hidden_dim
+        ).to(device)
 
-        if self.use_learned_pruning:
-            self.pruning_ac_net = PruningActorCritic(input_dim=ac_input_dim, mlp_width=self.ac_hidden_dim,
-                                                     hidden_dim=self.ac_hidden_dim).to(device)
-            pruning_params = list(self.gnn_net.parameters()) + list(self.pruning_ac_net.parameters())
-            self.pruning_optimizer = torch.optim.AdamW(pruning_params, lr=5e-5, weight_decay=1e-5)
+        # --- KEY CHANGE: Unified optimizer for GNN and AC network ---
+        unified_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
+        self.optimizer = torch.optim.AdamW(unified_params, lr=1e-4, weight_decay=1e-5)
 
         if self.use_curiosity:
             self.icm_module = ICMModule(
@@ -315,7 +243,7 @@ class AdaptiveStrategy(DefaultStrategy):
             ).to(device)
             self.icm_optimizer = torch.optim.AdamW(self.icm_module.parameters(), lr=1e-4)
 
-
+    # _get_raw_features and _get_graph_representation methods remain unchanged...
     @torch.no_grad()
     def _get_raw_features(
             self, params: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
@@ -349,12 +277,12 @@ class AdaptiveStrategy(DefaultStrategy):
             features[valid_indices, 5] = state["l1_loss_map"][pixel_coords_y[valid_indices], pixel_coords_x[
                 valid_indices]]
             if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
-                    features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+                features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
             if state.get("quality_heatmap") is not None:
-                    features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
+                features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
 
-        if self.knn_fn is not None and len(params["means"]) > self.redundancy_knn:
-            dists, idxs = self.knn_fn(means3d_subset, K=self.redundancy_knn + 1)
+        if self.knn_fn is not None and len(params["means"]) > 5:
+            dists, idxs = self.knn_fn(means3d_subset, K=5 + 1)
             neighbor_idxs = idxs[:, 1:]
 
             features[:, 8] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
@@ -437,7 +365,7 @@ class AdaptiveStrategy(DefaultStrategy):
         graph_embeddings = self.gnn_net(raw_features, edge_index, edge_attr)
 
         return graph_embeddings, (px, py, ptx, pty, valid_mask), raw_features
-
+    # step_post_backward remains mostly the same, just with updated function calls
     def step_post_backward(
             self,
             params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
@@ -498,7 +426,7 @@ class AdaptiveStrategy(DefaultStrategy):
             state["last_nrqm_step"] = step
 
 
-        self._process_hindsight_buffers(state, step)
+        self._process_hindsight_buffer(state, step)
 
         self._update_state(params, state, info, packed=packed)
 
@@ -515,16 +443,13 @@ class AdaptiveStrategy(DefaultStrategy):
                     )
 
         if step > self.bootstrap_steps:
-            if step % self.densify_learn_every == 0:
-                self._train_densification_agent(state)
-            if self.use_learned_pruning and step % self.pruning_learn_every == 0:
-                self._train_pruning_agent(state)
+            if step % self.learn_every == 0:
+                self._train_agent(state)
 
         if step % self.reset_every == 0 and step > 0:
             reset_opa(params=params, optimizers=optimizers, state=state, value=self.prune_opa * 2.0)
 
-
-
+    # _update_state, _update_quality_map, _project_to_patch_coords remain unchanged...
     def _update_state(
             self,
             params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
@@ -712,13 +637,13 @@ class AdaptiveStrategy(DefaultStrategy):
         pixel_coords_y = torch.clamp(coords_y, 0, h - 1).long()
 
         return patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask
+    def _process_hindsight_buffer(self, state: dict, current_step: int):
+        # --- KEY CHANGE: Unified hindsight processing ---
+        while state["hindsight_buffer"] and \
+                (current_step - state["hindsight_buffer"][0]["step"]) >= self.hindsight_delay:
 
-
-    def _process_hindsight_buffers(self, state: dict, current_step: int):
-        while state["densify_hindsight_buffer"] and \
-                (current_step - state["densify_hindsight_buffer"][0]["step"]) >= self.densify_hindsight_delay:
-
-            exp = state["densify_hindsight_buffer"].popleft()
+            exp = state["hindsight_buffer"].popleft()
+            action = exp["action"]
 
             if state.get("l1_loss_map") is None or \
                     state.get("quality_heatmap") is None or \
@@ -742,10 +667,10 @@ class AdaptiveStrategy(DefaultStrategy):
             reward_detail = exp["initial_detail_error"] - current_detail_error
 
             action_cost = 0.0
-            # if action == 1 or action == 2:
-            #     action_cost = -self.action_cost_weight
-            # elif action == 3:
-            #     action_cost = self.action_cost_weight
+            if action == 1 or action == 2: # Split or Duplicate
+                action_cost = -self.action_cost_weight
+            elif action == 3 or action == 4: # Merge or Prune
+                action_cost = self.prune_reward_weight
 
             final_reward = (self.w_photometric * reward_photo +
                             self.w_detail * reward_detail +
@@ -753,39 +678,17 @@ class AdaptiveStrategy(DefaultStrategy):
                             self.w_uncertainty * reward_uncertainty +
                             action_cost)
 
-            if len(state["densify_replay_buffer"]) < state["densify_replay_buffer"].capacity:
-                state["densify_replay_buffer"].add((
+            if len(state["replay_buffer"]) < state["replay_buffer"].capacity:
+                state["replay_buffer"].add((
                     exp["features"],
                     exp["action"],
                     final_reward.clone().detach(),
                     exp["log_prob"]
                 ))
 
-        if self.use_learned_pruning:
-            while state["pruning_hindsight_buffer"] and \
-                    (current_step - state["pruning_hindsight_buffer"][0]["step"]) >= self.pruning_hindsight_delay:
-
-                exp = state["pruning_hindsight_buffer"].popleft()
-
-                if state.get("l1_loss_map") is None:
-                    continue
-
-                px, py = exp["px"], exp["py"]
-
-                current_error = state["l1_loss_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
-
-                pruning_reward = exp["initial_error"] - current_error
-
-                if len(state["pruning_replay_buffer"]) < state["pruning_replay_buffer"].capacity:
-                    state["pruning_replay_buffer"].add((
-                        exp["features"],
-                        exp["action"],
-                        pruning_reward.clone().detach(),
-                        exp["log_prob"]
-                    ))
-
-    def _train_densification_agent(self, state: dict[str, Any]):
-        if len(state["densify_replay_buffer"]) < 256: return
+    def _train_agent(self, state: dict[str, Any]):
+        # --- KEY CHANGE: Unified training function ---
+        if len(state["replay_buffer"]) < 256: return
 
         self.gnn_net.train()
         self.ac_net.train()
@@ -793,7 +696,7 @@ class AdaptiveStrategy(DefaultStrategy):
             self.icm_module.train()
 
         device = next(self.ac_net.parameters()).device
-        batch, tree_idxs, is_weights = state["densify_replay_buffer"].sample(256)
+        batch, tree_idxs, is_weights = state["replay_buffer"].sample(256)
         is_weights = torch.tensor(is_weights, device=device, dtype=torch.float32)
 
         states = torch.stack([x[0] for x in batch]).to(device)
@@ -821,7 +724,9 @@ class AdaptiveStrategy(DefaultStrategy):
             norm_intrinsic_reward = (intrinsic_reward - intrinsic_reward.mean()) / (intrinsic_reward.std() + 1e-8)
             total_reward = extrinsic_rewards + self.curiosity_weight * norm_intrinsic_reward
 
-        action_logits, predicted_values, _ = self.ac_net(states)
+        # --- KEY CHANGE: Use the unified AC network ---
+        action_logits, predicted_values, _, _, _ = self.ac_net(states, torch.zeros(states.shape[0], self.ac_hidden_dim, device=device))
+
         advantage = total_reward - predicted_values.detach()
         advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
@@ -844,69 +749,22 @@ class AdaptiveStrategy(DefaultStrategy):
 
         loss = (total_loss_unreduced * is_weights).mean()
 
-        self.densify_optimizer.zero_grad()
+        # --- KEY CHANGE: Use the unified optimizer ---
+        self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
-        self.densify_optimizer.step()
+        self.optimizer.step()
 
         td_errors = (total_reward - predicted_values).abs().detach().cpu().numpy()
-        state["densify_replay_buffer"].update_priorities(tree_idxs, td_errors)
+        state["replay_buffer"].update_priorities(tree_idxs, td_errors)
 
-    def _train_pruning_agent(self, state: dict[str, Any]):
-        if len(state["pruning_replay_buffer"]) < 128: return
-
-        self.gnn_net.train()
-        self.pruning_ac_net.train()
-        device = next(self.pruning_ac_net.parameters()).device
-
-        batch, tree_idxs, is_weights = state["pruning_replay_buffer"].sample(128)
-        is_weights = torch.tensor(is_weights, device=device, dtype=torch.float32)
-
-        ac_inputs = torch.stack([x[0] for x in batch]).to(device)
-        actions_taken = torch.tensor([x[1] for x in batch], device=device, dtype=torch.float32) # Bernoulli actions are float
-        rewards = torch.stack([x[2] for x in batch]).to(device)
-        old_log_probs = torch.stack([x[3] for x in batch]).to(device)
-
-        action_logits, predicted_values = self.pruning_ac_net(ac_inputs)
-        advantage = rewards - predicted_values.detach()
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-
-        critic_loss_unreduced = F.mse_loss(predicted_values, rewards, reduction="none")
-
-        new_dist = Bernoulli(logits=action_logits)
-        new_log_probs = new_dist.log_prob(actions_taken)
-        ratio = torch.exp(new_log_probs - old_log_probs)
-
-        surr1 = ratio * advantage
-        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantage
-        actor_loss_unreduced = -torch.min(surr1, surr2)
-        entropy_loss_unreduced = -self.entropy_loss_weight * new_dist.entropy()
-
-        total_loss_unreduced = (
-                critic_loss_unreduced +
-                self.actor_loss_weight * actor_loss_unreduced +
-                entropy_loss_unreduced
-        )
-
-        loss = (total_loss_unreduced * is_weights).mean()
-
-        self.densify_optimizer.zero_grad()
-        self.pruning_optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.pruning_ac_net.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
-        self.densify_optimizer.step()
-        self.pruning_optimizer.step()
-
-        td_errors = (rewards - predicted_values).abs().detach().cpu().numpy()
-        state["pruning_replay_buffer"].update_priorities(tree_idxs, td_errors)
 
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> Tuple[int, int, int, int]:
         """
-        Robust implementation using a state-independent action resolution strategy.
-        Conflicts are resolved before any modifications, ensuring index stability.
+        Robust implementation using a state-independent action resolution strategy,
+        driven by a single unified actor-critic network.
         """
         initial_num_gaussians = len(params["means"])
         device = params["means"].device
@@ -915,15 +773,10 @@ class AdaptiveStrategy(DefaultStrategy):
             state["custom_lr_timers"] = torch.zeros(initial_num_gaussians, dtype=torch.int32, device=device)
             state["custom_lr_multipliers"] = torch.ones(initial_num_gaussians, device=device)
 
-        if state.get("view_matrix") is None: return 0,0,0,0
+        if state.get("view_matrix") is None: return 0, 0, 0, 0
 
         if state.get("ac_hidden_states") is None or state["ac_hidden_states"].shape[0] != initial_num_gaussians:
             state["ac_hidden_states"] = torch.zeros(
-                (initial_num_gaussians, self.ac_hidden_dim), device=device
-            )
-
-        if self.use_learned_pruning and (state.get("pruning_ac_hidden_states") is None or state["pruning_ac_hidden_states"].shape[0] != initial_num_gaussians):
-            state["pruning_ac_hidden_states"] = torch.zeros(
                 (initial_num_gaussians, self.ac_hidden_dim), device=device
             )
 
@@ -956,8 +809,7 @@ class AdaptiveStrategy(DefaultStrategy):
         camtoworld_matrix = torch.inverse(state['view_matrix'])
         campos = camtoworld_matrix[:3, 3]
 
-        graph_embeddings, coords, raw_features = self._get_graph_representation(params, state, subset_mask, step,
-                                                                                campos)
+        graph_embeddings, coords, raw_features = self._get_graph_representation(params, state, subset_mask, step, campos)
         if graph_embeddings is None: return 0, 0, 0, 0
 
         px_sub, py_sub, ptx_sub, pty_sub, valid_mask_subset = coords
@@ -973,57 +825,42 @@ class AdaptiveStrategy(DefaultStrategy):
         expanded_global_context = global_context.unsqueeze(0).expand(graph_embeddings.shape[0], -1)
         ac_input = torch.cat([graph_embeddings, expanded_global_context], dim=-1)
 
-        prune_actions = torch.zeros(len(original_subset_indices), dtype=torch.bool, device=device)
-        if self.use_learned_pruning:
-            self.pruning_ac_net.eval()
-            h_prev = state['pruning_ac_hidden_states'][original_subset_indices]
-
-            prune_logits, _, h_new = self.pruning_ac_net(ac_input, h_old=h_prev)
-            state['pruning_ac_hidden_states'][original_subset_indices] = h_new
-            prune_dist = Bernoulli(logits=prune_logits)
-            prune_actions = (prune_dist.sample() == 1)
-
+        # --- KEY CHANGE: Unified action selection from a single network ---
         self.ac_net.eval()
-
         h_prev = state['ac_hidden_states'][original_subset_indices]
         action_logits, _, continuous_params, h_new, lr_multipliers = self.ac_net(ac_input, h_old=h_prev)
         state['ac_hidden_states'][original_subset_indices] = h_new
 
         progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
         epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)
-        densify_dist = Categorical(logits=action_logits)
+        action_dist = Categorical(logits=action_logits)
+
         if torch.rand(1).item() < epsilon:
-            densify_actions = torch.randint(0, 4, (len(original_subset_indices),), device=device)
+            # Explore: sample from the full action space
+            final_actions = torch.randint(0, self.icm_action_dim, (len(original_subset_indices),), device=device)
         else:
-            densify_actions = densify_dist.sample()
+            # Exploit: sample from the learned policy
+            final_actions = action_dist.sample()
 
-        # 2. Resolve Action Conflicts and Create Final, Disjoint Masks
-        final_actions = torch.zeros_like(densify_actions)
-        final_actions[densify_actions == 1] = 1 # Split
-        final_actions[densify_actions == 2] = 2 # Duplicate
-        final_actions[densify_actions == 3] = 3 # Merge
-        final_actions[prune_actions] = 4      # Prune
-
+        # Apply rule-based vetos to the network's proposed actions
         age_in_steps = state["age"][original_subset_indices]
         significance = state["significance"][original_subset_indices]
 
-        quality_scores = torch.full_like(significance, 100.0)
-        quality_scores[valid_mask_subset] = state['quality_heatmap'][pty_sub[valid_mask_subset], ptx_sub[valid_mask_subset]]
-
-        prune_veto_mask = (
-                (quality_scores < self.nrqm_stagnation_threshold) |
+        # Veto pruning or merging of important or young Gaussians
+        prune_merge_veto_mask = (
                 (age_in_steps < self.prune_age_threshold) |
                 (significance > self.prune_significance_threshold)
         )
+        final_actions[(final_actions >= 3) & prune_merge_veto_mask] = 0 # Veto merge (3) and prune (4)
 
-        final_actions[(final_actions == 4) & prune_veto_mask] = 0
-        final_actions[(final_actions == 3) & prune_veto_mask] = 0
-
+        # --- KEY CHANGE: Directly create masks from the single action tensor ---
         final_prune_mask_subset = (final_actions == 4)
         final_merge_mask_subset = (final_actions == 3)
         final_split_mask_subset = (final_actions == 1)
         final_dupe_mask_subset = (final_actions == 2)
 
+        # The rest of the function performs the geometry updates based on these masks.
+        # This part is similar to the original but is now driven by a single, coordinated policy.
         state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "significance", "ac_hidden_states", "custom_lr_multipliers", "custom_lr_timers"]}
 
         # A. PRUNE
@@ -1083,7 +920,6 @@ class AdaptiveStrategy(DefaultStrategy):
         n_dupli = 0
 
         if len(dupe_orig_indices) > 0:
-            # Step-by-step filtering to find final duplication candidates
             indices_post_merge = merge_map[prune_map[dupe_orig_indices]]
 
             valid_mask_after_merge = indices_post_merge != -1
@@ -1116,7 +952,7 @@ class AdaptiveStrategy(DefaultStrategy):
                     offset_magnitudes = dupe_scales.max(dim=-1).values * offset_mags
                     duplication_offsets = dupe_dirs * offset_magnitudes.unsqueeze(-1)
                     duplicate(params, optimizers, state_to_modify, global_dupe_mask, offsets=duplication_offsets,
-                              lr_multipliers=state["custom_lr_multipliers"][original_subset_indices[final_dupe_mask_subset]],
+                              lr_multipliers=lr_multipliers[final_dupe_mask_subset],
                               warmup_steps=self.meta_lr_warmup_steps)
 
         state.update(state_to_modify)

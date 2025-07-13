@@ -173,10 +173,22 @@ def merge(
     target_indices = nn_indices[:, 1]
 
     unique_pairs = set()
-    for i, j in zip(source_indices.tolist(), target_indices.tolist()):
-        if i != j:
-            pair = tuple(sorted((i, j)))
-            unique_pairs.add(pair)
+    used_indices = torch.zeros(len(all_means), dtype=torch.bool, device=device)
+    distances, _ = knn_with_ids_two_tensor(all_means[source_indices], all_means, K=2)
+    pair_distances = distances[:, 1]
+    sorted_pair_indices = torch.argsort(pair_distances)
+
+    for idx in sorted_pair_indices:
+        i = source_indices[idx].item()
+        j = target_indices[idx].item()
+
+        if i == j or used_indices[i] or used_indices[j]:
+            continue
+
+        pair = tuple(sorted((i, j)))
+        unique_pairs.add(pair)
+        used_indices[i] = True
+        used_indices[j] = True
 
     if not unique_pairs:
         return torch.zeros_like(mask, dtype=torch.bool), 0

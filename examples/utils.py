@@ -476,10 +476,13 @@ def matrix_to_quaternion(matrix: Tensor) -> Tensor:
     return torch.stack([q_w, q_x, q_y, q_z], dim=-1)
 
 def scatter_mean(src: Tensor, index: Tensor, dim_size: int) -> Tensor:
+    index = index.to(torch.int64)
+
     out = torch.zeros((dim_size, src.size(1)), device=src.device, dtype=src.dtype)
     index_expanded = index.unsqueeze(1).expand_as(src)
     out.scatter_add_(0, index_expanded, src)
 
     counts = torch.zeros(dim_size, 1, device=src.device, dtype=src.dtype)
     counts.scatter_add_(0, index.unsqueeze(1), torch.ones_like(src[:, :1]))
+
     return out / counts.clamp(min=1)

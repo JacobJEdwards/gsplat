@@ -170,7 +170,7 @@ class AdaptiveStrategy(DefaultStrategy):
     ac_hidden_dim: int = 64
     num_global_features: int = 5
     use_learned_strategy: bool = True
-    bootstrap_steps: int = 5000
+    bootstrap_steps: int = 1000
 
     learn_every: int = 200
     hindsight_delay: int = 400

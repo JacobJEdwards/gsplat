@@ -398,45 +398,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         return motion_context, (px, py, ptx, pty, valid_mask), raw_features
 
-
-    @torch.no_grad()
-    def _get_graph_representation(
-            self, params: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
-    ) -> tuple[Tensor, tuple, Tensor]:
-        raw_features, (px, py, ptx, pty), valid_mask = self._get_raw_features(params, state, subset_mask, step, campos)
-
-        if raw_features is None:
-            return None, None, None
-
-        subset_means = params["means"][subset_mask]
-        edge_index = knn_graph(subset_means, k=self.gnn_knn, loop=True)
-
-        row, col = edge_index
-        means_i, means_j = subset_means[row], subset_means[col]
-
-        rel_dist = torch.norm(means_i - means_j, dim=-1) / state["scene_scale"]
-
-        scales_i = torch.exp(params["scales"][subset_mask][row]).mean(dim=-1)
-        scales_j = torch.exp(params["scales"][subset_mask][col]).mean(dim=-1)
-        scale_diff = torch.abs(scales_i - scales_j) / state["scene_scale"]
-
-        opacities_i = torch.sigmoid(params["opacities"][subset_mask][row].flatten())
-        opacities_j = torch.sigmoid(params["opacities"][subset_mask][col].flatten())
-        opacity_diff = torch.abs(opacities_i - opacities_j)
-
-        sh0_i = params["sh0"][subset_mask][row].squeeze(-2)
-        sh0_j = params["sh0"][subset_mask][col].squeeze(-2)
-        color_diff = torch.norm(sh0_i - sh0_j, dim=-1)
-
-        edge_attr = torch.stack([rel_dist, scale_diff, opacity_diff, color_diff], dim=-1)
-        edge_attr = torch.nan_to_num(edge_attr, 0.0)
-
-        self.gnn_net.eval()
-        graph_embeddings = self.gnn_net(raw_features, edge_index, edge_attr)
-
-        return graph_embeddings, (px, py, ptx, pty, valid_mask), raw_features
-
-
     def step_post_backward(
             self,
             params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
@@ -641,7 +602,10 @@ class AdaptiveStrategy(DefaultStrategy):
                 patch_scores[valid_patch_indices] = 100.0
 
         num_patches_h = height // p
-        quality_heatmap = patch_scores.view(num_patches_h, -1)
+        num_patches_w = width // p
+
+
+        quality_heatmap = patch_scores.view(num_patches_h, num_patches_w)
         if state["quality_heatmap"] is None:
             state["quality_heatmap"] = quality_heatmap
         else:
@@ -693,7 +657,7 @@ class AdaptiveStrategy(DefaultStrategy):
         proj_matrix[3, 2] = -1.0
         proj_matrix[2, 3] = -2.0 * zfar * znear / (zfar - znear)
 
-        state["view_proj_matrix"] = view_matrix @ proj_matrix
+        state["view_proj_matrix"] = proj_matrix @ view_matrix
 
         avg_quality = patch_scores.mean()
         normalized_quality = torch.clamp(avg_quality / 50.0, 0.0, 2.0)
@@ -702,7 +666,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
     @torch.no_grad()
     def _project_to_patch_coords(self, means3d: Tensor, view_proj_matrix: Tensor, h: int, w: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        means_h = F.pad(means3d, (0, 1), value=1.0)
         means_h = F.pad(means3d, (0, 1), value=1.0)
         p_hom = means_h @ view_proj_matrix
 

@@ -741,8 +741,12 @@ class AdaptiveStrategy(DefaultStrategy):
             initial_quality = exp["initial_quality"]
 
             action_cost = 0.0
-            if action == 1 or action == 2:  # Split or Duplicate
+            if action == 1 or action == 2:
                 action_cost = -self.action_cost_weight * torch.clamp(1.0 - initial_error / self.stable_error_threshold, 0.0, 1.0)
+
+            if action == 3:
+                action_cost += 10000
+
 
             final_reward = base_reward + action_cost
 
@@ -1013,11 +1017,11 @@ class AdaptiveStrategy(DefaultStrategy):
         final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
         final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
 
-        final_finetune_mask_subset = (final_actions == 5)
-        final_prune_mask_subset = (final_actions == 4)
-        final_merge_mask_subset = (final_actions == 3)
-        final_dupe_mask_subset = (final_actions == 2)
-        final_split_mask_subset = (final_actions == 1)
+        final_finetune_mask_subset = (final_actions == 5) # Finetune action
+        final_prune_mask_subset = (final_actions == 4) # Prune action
+        final_merge_mask_subset = (final_actions == 3) # Merge action
+        final_dupe_mask_subset = (final_actions == 2) # Duplicate action
+        final_split_mask_subset = (final_actions == 1) # Split action
 
         finetune_indices = original_subset_indices[final_finetune_mask_subset]
         n_finetune = finetune_indices.numel()

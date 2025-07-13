@@ -792,7 +792,12 @@ class AdaptiveStrategy(DefaultStrategy):
                 ))
 
     def _train_agent(self, state: dict[str, Any]):
-        if len(state["replay_buffer"]) < 256: return
+
+
+        if len(state["replay_buffer"]) < 256:
+            if self.verbose:
+                print("Not enough samples in replay buffer for training.")
+            return
 
         self.gnn_net.train()
         self.ac_net.train()

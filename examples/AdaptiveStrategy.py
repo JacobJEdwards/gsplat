@@ -731,12 +731,16 @@ class AdaptiveStrategy(DefaultStrategy):
 
         self.gnn_net.train()
         self.ac_net.train()
-        # if self.use_curiosity:
-        #     self.icm_module.train()
 
         device = next(self.ac_net.parameters()).device
 
         batch, tree_idxs, is_weights = state["replay_buffer"].sample(256)
+
+        if len(batch) == 0:
+            if self.verbose:
+                print("Warning: Replay buffer returned no samples, skipping training step. This might indicate numerical instability (e.g., priority overflow).")
+            return
+
         is_weights = torch.tensor(is_weights, device=device, dtype=torch.float32)
 
         motion_features = torch.stack([x[0] for x in batch]).to(device)

@@ -349,17 +349,29 @@ class PrioritizedReplayBuffer:
 
     def sample(self, batch_size: int) -> tuple[list, np.ndarray, np.ndarray]:
         batch, idxs, priorities = [], [], []
-        segment = self.tree.total() / batch_size
+        total_p = self.tree.total()
+        if total_p <= 0 or not np.isfinite(total_p):
+            print("Total priority is zero or not finite, returning empty batch.")
+            return [], np.array([]), np.array([])
+
+        segment = total_p / batch_size
         self.beta = np.min([1., self.beta + self.beta_increment_per_sampling])
 
         for i in range(batch_size):
             a, b = segment * i, segment * (i + 1)
+            if not np.isfinite(a) or not np.isfinite(b):
+                print(f"Invalid segment range: a={a}, b={b}. Skipping this sample.")
+                continue
+
             s = np.random.uniform(a, b)
             (idx, p, data) = self.tree.get(s)
             if data != 0 and data is not None:
                 priorities.append(p)
                 batch.append(data)
                 idxs.append(idx)
+
+        if not batch:
+            return [], np.array([]), np.array([])
 
         sampling_probabilities = np.array(priorities) / self.tree.total()
         is_weights = np.power(self.tree.size * sampling_probabilities, -self.beta)

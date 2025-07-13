@@ -192,7 +192,7 @@ class AdaptiveStrategy(DefaultStrategy):
     curiosity_weight: float = 0.05
     icm_action_dim: int = 4
 
-    subset_fraction: float = 0.2
+    subset_fraction: float = 1.0
     max_densification_subset: int = 1_000_000
     prune_significance_threshold: float = 0.01
     action_cost_weight: float = 0.001

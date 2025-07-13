@@ -177,7 +177,7 @@ class AdaptiveStrategy(DefaultStrategy):
     learn_every: int = 200
     hindsight_delay: int = 300
     actor_loss_weight: float = 1.0
-    entropy_loss_weight: float = 0.3
+    entropy_loss_weight: float = 1.0
 
     start_exploration_epsilon: float = 0.3
     end_exploration_epsilon: float = 0.05
@@ -186,7 +186,7 @@ class AdaptiveStrategy(DefaultStrategy):
     prune_age_threshold: int = 600
     prune_significance_threshold: float = 0.01
 
-    subset_fraction: float = 0.6
+    subset_fraction: float = 1.0
     max_densification_subset: int = 200_000
     action_cost_weight: float = 0.001
 
@@ -198,7 +198,7 @@ class AdaptiveStrategy(DefaultStrategy):
     w_quality: float = -1.0
     w_uncertainty: float = 1.0
 
-    ppo_clip_epsilon: float = 0.3
+    ppo_clip_epsilon: float = 0.2
 
     gnn_net: Any = field(default=None, repr=False)
     ac_net: Any = field(default=None, repr=False)
@@ -217,10 +217,10 @@ class AdaptiveStrategy(DefaultStrategy):
     anisotropic_split: bool = True
 
     use_geom_uncertainty: bool = True
-    num_uncertainty_views: int = 3
+    num_uncertainty_views: int = 5
     geom_uncertainty_thresh: float = 0.05
 
-    continuous_loss_weight: float = 0.6
+    continuous_loss_weight: float = 1.0
 
     knn_fn: Any = field(default=None, repr=False)
 

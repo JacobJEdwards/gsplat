@@ -749,7 +749,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         device = next(self.ac_net.parameters()).device
 
-        sampled_td = state["replay_buffer"].sample().to(device)
+        sampled_td = state["replay_buffer"].sample(return_info=True).to(device)
         raw_is_weights = sampled_td.get("importance_weights", None)
         if raw_is_weights is None:
             is_weights = torch.ones(sampled_td.shape[0], device=device)

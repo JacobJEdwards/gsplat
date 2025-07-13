@@ -15,14 +15,16 @@ from torch_geometric.nn import knn_graph, TransformerConv
 
 from utils import knn_with_ids, scatter_mean
 from gsplat.utils import normalized_quat_to_rotmat
-from utils import PrioritizedReplayBuffer
 from gsplat.strategy.ops import (
     remove,
     reset_opa,
 )
 from gsplat.strategy.default import DefaultStrategy
 from ops import split, duplicate, merge
-from torchrl import data
+from torchrl.data import TensorDictReplayBuffer
+from torchrl.data.replay_buffers.samplers import PrioritizedSampler
+from torchrl.data.replay_buffers.storages import LazyMemmapStorage
+from tensordict import TensorDict
 
 class TemporalGaussianGNN(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, edge_dim: int, num_temporal_steps: int = 5):
@@ -233,13 +235,20 @@ class AdaptiveStrategy(DefaultStrategy):
 
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
+        storage = LazyMemmapStorage(max_size=30_000)
+        sample = PrioritizedSampler(max_capacity=30_000, alpha=0.7, beta=0.5)
+        replay_buffer = TensorDictReplayBuffer(
+            storage=storage,
+            sampler=sample,
+            batch_size=256
+        )
         state.update({
             "quality_heatmap": None,
             "view_proj_matrix": None,
             "view_matrix": None,
             "detail_error_map": None,
             "geom_uncertainty_map": None,
-            "replay_buffer": PrioritizedReplayBuffer(capacity=30_000),
+            "replay_buffer": replay_buffer,
             "hindsight_buffer": deque(maxlen=7_500),
             "significance": None,
             "prev_grad2d": None,
@@ -716,13 +725,18 @@ class AdaptiveStrategy(DefaultStrategy):
                             self.w_uncertainty * reward_uncertainty +
                             action_cost)
 
-            if len(state["replay_buffer"]) < state["replay_buffer"].capacity:
-                state["replay_buffer"].add((
-                    exp["motion_features"], exp["region_features"], exp["region_assignment"],
-                    exp["gaussian_action"], exp["region_action"],
-                    final_reward.clone().detach(),
-                    exp["gaussian_log_prob"], exp["region_log_prob"]
-                ))
+            if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
+                experience_tensordict = TensorDict({
+                    "motion_features": exp["motion_features"],
+                    "region_features": exp["region_features"],
+                    "region_assignment": exp["region_assignment"],
+                    "gaussian_action": exp["gaussian_action"],
+                    "region_action": exp["region_action"],
+                    "reward": final_reward.clone().detach(),
+                    "gaussian_log_prob": exp["gaussian_log_prob"],
+                    "region_log_prob": exp["region_log_prob"],
+                }, batch_size=[])
+                state["replay_buffer"].add(experience_tensordict)
 
     def _train_agent(self, state: dict[str, Any]):
         if len(state["replay_buffer"]) < 256:
@@ -735,23 +749,17 @@ class AdaptiveStrategy(DefaultStrategy):
 
         device = next(self.ac_net.parameters()).device
 
-        batch, tree_idxs, is_weights = state["replay_buffer"].sample(256)
+        sampled_td = state["replay_buffer"].sample()
+        is_weights = sampled_td.get("importance_weights").to(device)
 
-        if len(batch) == 0:
-            if self.verbose:
-                print("Warning: Replay buffer returned no samples, skipping training step. This might indicate numerical instability (e.g., priority overflow).")
-            return
-
-        is_weights = torch.tensor(is_weights, device=device, dtype=torch.float32)
-
-        motion_features = torch.stack([x[0] for x in batch]).to(device)
-        region_features = torch.stack([x[1] for x in batch]).to(device)
-        region_assignments = torch.stack([x[2] for x in batch]).to(device)
-        gauss_actions = torch.stack([x[3] for x in batch]).to(device)
-        region_actions = torch.stack([x[4] for x in batch]).to(device)
-        rewards = torch.stack([x[5] for x in batch]).to(device)
-        old_gauss_log_probs = torch.stack([x[6] for x in batch]).to(device)
-        old_region_log_probs = torch.stack([x[7] for x in batch]).to(device)
+        motion_features = sampled_td.get("motion_features").to(device)
+        region_features = sampled_td.get("region_features").to(device)
+        region_assignments = sampled_td.get("region_assignment").to(device)
+        gauss_actions = sampled_td.get("gaussian_action").to(device)
+        region_actions = sampled_td.get("region_action").to(device)
+        rewards = sampled_td.get("reward").to(device)
+        old_gauss_log_probs = sampled_td.get("gaussian_log_prob").to(device)
+        old_region_log_probs = sampled_td.get("region_log_prob").to(device)
 
         rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0, neginf=-1.0)
         rewards = torch.clamp(rewards, -5.0, 5.0)
@@ -805,9 +813,10 @@ class AdaptiveStrategy(DefaultStrategy):
 
         td_errors = (rewards - gauss_values).abs().detach()
         td_errors = torch.nan_to_num(td_errors, nan=0.0, posinf=1.0, neginf=0.0)
-        td_errors = td_errors.cpu().numpy()
 
-        state["replay_buffer"].update_priorities(tree_idxs, td_errors)
+        sampled_td.set("priority", td_errors)
+
+        state["replay_buffer"].update_priorities(sampled_td)
 
         if self.verbose:
             print(f"Agent trained: Loss = {loss.item():.4f}, Actor Loss = {actor_loss_gauss.mean().item():.4f}, "

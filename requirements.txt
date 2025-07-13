@@ -19,3 +19,6 @@ torchmetrics~=1.7.2
 piq~=0.8.0
 torch-geometric~=2.6.1
 setuptools~=80.9.0
+typing_extensions~=4.13.2
+torchrl~=0.9.1
+tensordict~=0.9.0

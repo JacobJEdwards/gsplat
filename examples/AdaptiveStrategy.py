@@ -365,7 +365,7 @@ class AdaptiveStrategy(DefaultStrategy):
             self, params: dict, state: dict, subset_mask: Tensor, step: int, campos: Tensor
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         original_indices = torch.where(subset_mask)[0]
-        raw_features, coords, _ = self._get_raw_features(params, state, subset_mask, step, campos)
+        raw_features, coords, valid_mask = self._get_raw_features(params, state, subset_mask, step, campos)
 
         if raw_features is None:
             return None, None, None, None
@@ -396,7 +396,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         state['ac_hidden_states'][original_indices] = updated_history
 
-        return motion_context, coords, raw_features, subset_means
+        return motion_context, coords, raw_features, subset_means, valid_mask
 
 
     @torch.no_grad()
@@ -902,7 +902,8 @@ class AdaptiveStrategy(DefaultStrategy):
         camtoworld_matrix = torch.inverse(state['view_matrix'])
         campos = camtoworld_matrix[:3, 3]
 
-        motion_features, coords, _, subset_means = self._get_motion_aware_features(params, state, subset_mask, step,
+        motion_features, coords, _, subset_means, valid_mask_subset = self._get_motion_aware_features(params, state,
+                                                                                             subset_mask, step,
                                                                                 campos)
         if motion_features is None: return 0, 0, 0, 0, 0
 
@@ -931,7 +932,7 @@ class AdaptiveStrategy(DefaultStrategy):
         gauss_log_probs = gauss_dist.log_prob(final_actions)
         region_log_probs = region_dist.log_prob(region_actions)
 
-        px_sub, py_sub, ptx_sub, pty_sub, valid_mask_subset = coords
+        px_sub, py_sub, ptx_sub, pty_sub = coords
         for i in range(len(original_subset_indices)):
             if not valid_mask_subset[i]: continue
 

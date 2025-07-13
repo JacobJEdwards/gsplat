@@ -747,6 +747,8 @@ class AdaptiveStrategy(DefaultStrategy):
         while state["hindsight_buffer"] and \
                 (current_step - state["hindsight_buffer"][0]["step"]) >= self.hindsight_delay:
 
+            print("Processing hindsight buffer...")
+
             exp = state["hindsight_buffer"].popleft()
             action = exp["action"]
 

@@ -67,10 +67,13 @@ def split(
             p_split = (p[sel] + samples).reshape(-1, 3)
         elif name == "scales":
             current_split_ratios = split_ratios if split_ratios is not None else torch.full((len(scales),), 1.6, device=device)
-            largest_scale_idx = torch.argmax(scales, dim=1)
-            new_scales_val = scales.clone()
-            new_scales_val[torch.arange(len(scales)), largest_scale_idx] /= current_split_ratios
-            p_split = torch.log(new_scales_val).repeat(2, 1)
+            if directions is not None:
+                p_split = torch.log(scales / current_split_ratios.unsqueeze(-1)).repeat(2,1)
+            else:
+                largest_scale_idx = torch.argmax(scales, dim=1)
+                new_scales_val = scales.clone()
+                new_scales_val[torch.arange(len(scales)), largest_scale_idx] /= current_split_ratios
+                p_split = torch.log(new_scales_val).repeat(2, 1)
         elif name == "opacities" and revised_opacity:
             original_alpha = torch.sigmoid(p[sel])
             original_alpha = torch.clamp(original_alpha, 0.0, 1.0 - 1e-6)

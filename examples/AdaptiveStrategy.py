@@ -335,13 +335,14 @@ class AdaptiveStrategy(DefaultStrategy):
 
             sh0_subset = params["sh0"][subset_mask]
 
-            neighbor_means = params["means"][neighbor_idxs]
-            centered_neighbors = neighbor_means - means3d_subset.unsqueeze(1)
-            cov_neighbors = torch.einsum('nki,nkj->nij', centered_neighbors, centered_neighbors) / 5
-
             features[:, 9] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
             features[:, 10] = neighbor_opacities.mean(dim=-1)
             features[:, 11] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
+
+            neighbor_means = params["means"][neighbor_idxs]
+            centered_neighbors = neighbor_means - means3d_subset.unsqueeze(1)
+            cov_neighbors = torch.einsum('nki,nkj->nij', centered_neighbors, centered_neighbors) / (5 - 1)
+
             features[:, 12] = cov_neighbors.mean(dim=(1, 2)).norm(dim=-1) / state["scene_scale"]
             features[:, 13] = torch.det(cov_neighbors)
 
@@ -730,32 +731,26 @@ class AdaptiveStrategy(DefaultStrategy):
             current_detail_error = state["detail_error_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
             reward_detail = exp["initial_detail_error"] - current_detail_error
 
+            base_reward = (self.w_photometric * reward_photo +
+                           self.w_detail * reward_detail +
+                           self.w_quality * reward_quality +
+                           self.w_uncertainty * reward_uncertainty)
+
             action = exp["gaussian_action"]
             initial_error = exp["initial_error"]
             initial_quality = exp["initial_quality"]
 
             action_cost = 0.0
-            if action == 1 or action == 2:
+            if action == 1 or action == 2:  # Split or Duplicate
                 action_cost = -self.action_cost_weight * torch.clamp(1.0 - initial_error / self.stable_error_threshold, 0.0, 1.0)
-            elif action == 0:
-                action_cost = -self.action_cost_weight * torch.clamp(1.0 - initial_quality / self.stable_quality_threshold, 0.0, 1.0)
-            elif action == 3:
-                action_cost = -self.action_cost_weight * torch.clamp(1.0 - current_uncertainty / self.geom_uncertainty_thresh, 0.0, 1.0)
-            elif action == 4:
-                action_cost = -self.action_cost_weight * torch.clamp(1.0 - current_detail_error / 0.1, 0.0, 1.0)
-            elif action == 5:
-                action_cost = -self.action_cost_weight * torch.clamp(1.0 - current_quality / self.stable_quality_threshold, 0.0, 1.0)
 
-            final_reward = (self.w_photometric * reward_photo +
-                            self.w_detail * reward_detail +
-                            self.w_quality * reward_quality +
-                            self.w_uncertainty * reward_uncertainty +
-                            action_cost)
+            final_reward = base_reward + action_cost
 
             if action == 0:
                 if initial_error < self.stable_error_threshold and \
                         initial_quality < self.stable_quality_threshold:
-                    final_reward += self.stability_reward_bonus
+                    stability_bonus = self.stability_reward_bonus * (1.0 - initial_error / self.stable_error_threshold)
+                    final_reward += stability_bonus
 
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
                 experience_tensordict = TensorDict({

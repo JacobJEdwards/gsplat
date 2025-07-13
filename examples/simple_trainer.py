@@ -925,7 +925,7 @@ class Runner:
                 info["pixels"] = pixels
                 info["image_ids"] = image_ids
                 info["l1_loss_map"] = l1_loss_map
-                info["detail_loss_map"] = detail_loss_map
+                info["detail_error_map"] = detail_loss_map
 
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,

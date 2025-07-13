@@ -743,6 +743,9 @@ class AdaptiveStrategy(DefaultStrategy):
             action_cost = 0.0
             if action == 1 or action == 2:
                 action_cost = -self.action_cost_weight * torch.clamp(1.0 - initial_error / self.stable_error_threshold, 0.0, 1.0)
+            if action == 3:
+                action_cost += 100
+
 
             final_reward = base_reward + action_cost
 
@@ -751,6 +754,7 @@ class AdaptiveStrategy(DefaultStrategy):
                         initial_quality < self.stable_quality_threshold:
                     stability_bonus = self.stability_reward_bonus * (1.0 - initial_error / self.stable_error_threshold)
                     final_reward += stability_bonus
+
 
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
                 experience_tensordict = TensorDict({
@@ -1020,7 +1024,7 @@ class AdaptiveStrategy(DefaultStrategy):
         final_split_mask_subset = (final_actions == 1) # Split action
 
         # no merge:
-        final_merge_mask_subset = torch.zeros_like(final_merge_mask_subset, dtype=torch.bool)
+        # final_merge_mask_subset = torch.zeros_like(final_merge_mask_subset, dtype=torch.bool)
 
         finetune_indices = original_subset_indices[final_finetune_mask_subset]
         n_finetune = finetune_indices.numel()

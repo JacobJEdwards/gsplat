@@ -8,7 +8,7 @@ import piq
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Bernoulli
 
 from torch_geometric.nn import knn_graph, TransformerConv
 
@@ -21,14 +21,6 @@ from gsplat.strategy.ops import (
 )
 from gsplat.strategy.default import DefaultStrategy
 from ops import split, duplicate, merge
-
-# Action space definition for the new unified agent
-ACTION_PRUNE = 0
-ACTION_DO_NOTHING = 1
-ACTION_SPLIT = 2
-ACTION_DUPLICATE = 3
-ACTION_MERGE = 4
-UNIFIED_ACTION_SPACE_SIZE = 5
 
 class GaussianGraphNetwork(nn.Module):
     def __init__(self, input_dim: int, edge_dim: int, hidden_dim: int, output_dim: int, num_layers: int = 2):
@@ -47,11 +39,7 @@ class GaussianGraphNetwork(nn.Module):
                 x = self.prelu(x)
         return x
 
-class UnifiedActorCritic(nn.Module):
-    """
-    A unified actor-critic network for handling all actions:
-    prune, do_nothing, split, duplicate, merge.
-    """
+class ActorCriticNetwork(nn.Module):
     def __init__(self, input_dim: int = 18, mlp_width: int = 64, hidden_dim: int = 64):
         super().__init__()
         self.base_net = nn.Sequential(
@@ -65,7 +53,7 @@ class UnifiedActorCritic(nn.Module):
         self.gru_cell = nn.GRUCell(mlp_width, hidden_dim)
 
         self.critic_head = nn.Linear(hidden_dim, 1)
-        self.actor_discrete_head = nn.Linear(hidden_dim, UNIFIED_ACTION_SPACE_SIZE) # 5 actions
+        self.actor_discrete_head = nn.Linear(hidden_dim, 4)
         self.actor_continuous_head = nn.Linear(hidden_dim, 9)
 
     def forward(self, x: Tensor, h_old: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -80,6 +68,7 @@ class UnifiedActorCritic(nn.Module):
         dupe_offset_mag = torch.sigmoid(continuous_params[:, 1])
         split_dir = F.normalize(continuous_params[:, 2:5], dim=-1)
         dupe_dir = F.normalize(continuous_params[:, 5:8], dim=-1)
+
         lr_multiplier = 0.5 + 1.5 * torch.sigmoid(continuous_params[:, 8])
 
         processed_continuous_params = torch.cat([
@@ -87,6 +76,28 @@ class UnifiedActorCritic(nn.Module):
         ], dim=-1)
         return action_logits, value, processed_continuous_params, h_new, lr_multiplier
 
+class PruningActorCritic(nn.Module):
+    """A dedicated agent for the binary decision of pruning a Gaussian."""
+    def __init__(self, input_dim: int = 18, mlp_width: int = 64, hidden_dim: int = 64):
+        super().__init__()
+        self.base_net = nn.Sequential(
+            nn.Linear(input_dim, mlp_width),
+            nn.LayerNorm(mlp_width), nn.SELU(),
+            nn.Linear(mlp_width, mlp_width),
+            nn.LayerNorm(mlp_width), nn.SELU(),
+        )
+        self.gru_cell = nn.GRUCell(mlp_width, mlp_width)
+
+        self.critic_head = nn.Linear(mlp_width, 1)
+        self.actor_head = nn.Linear(mlp_width, 1)
+
+    def forward(self, x: Tensor, h_old: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        base_features = self.base_net(x)
+        h_new = self.gru_cell(base_features, h_old)
+
+        value = self.critic_head(h_new).squeeze(-1)
+        action_logit = self.actor_head(h_new).squeeze(-1)
+        return action_logit, value, h_new
 
 class ICMModule(nn.Module):
     """Intrinsic Curiosity Module to encourage exploration."""
@@ -123,6 +134,7 @@ class PatchBasedNRQM(nn.Module):
     def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
         if self.model_name == "brisque":
             scores = self.model(image_patches)
+            # return scores.view(scores.shape[0])
             return scores
         elif self.model_name == "clipiqa":
             scores = self.model(image_patches)
@@ -134,25 +146,32 @@ class PatchBasedNRQM(nn.Module):
 @dataclass
 class AdaptiveStrategy(DefaultStrategy):
     """
-    An advanced densification strategy that uses a unified RL agent, pre-trained on
-    expert demonstrations, and guided by causal rewards to optimize the geometry.
+    An advanced densification strategy that uses NRQM feedback to guide the
+    growth and pruning of Gaussians.
 
-    This strategy introduces several SOTA improvements:
-    1.  **Unified Agent Architecture**: A single actor-critic network decides on all
-        possible actions (prune, split, duplicate, merge, none), leading to more
-        efficient and coordinated policies.
-    2.  **Offline Pre-training on Expert Demonstrations**: The agent is first trained
-        on data from a classic heuristic densification strategy, allowing it to
-        learn a strong baseline policy before online exploration.
-    3.  **Causal Credit Assignment**: The reward mechanism is enhanced to calculate
-        the true causal impact of an action by comparing the outcome to a
-        counterfactual scenario where the action was not taken. This provides a
-        cleaner, more accurate learning signal.
+    This strategy introduces three core NRQM-driven mechanics:
+    1.  **Spatially-Aware Densification**: Uses a quality heatmap from novel views
+        to prioritize densifying Gaussians in low-quality regions.
+    2.  **NRQM-Modulated Threshold**: Dynamically adjusts the gradient threshold for
+        densification based on the overall rendered quality.
+    3.  **Quality-Aware Pruning**: Prunes Gaussians that are "stagnant" - i.e.,
+        consistently contribute to low-quality regions without having high enough
+        gradients to be densified.
 
     Args:
-        (Inherited and new args)
-        use_causal_reward (bool): Enables the counterfactual reward calculation.
-        pretrain_steps (int): Number of steps for behavioral cloning pre-training.
+        nrqm_every (int): How often to run the NRQM evaluation to update the
+          quality map. Default is 250 steps.
+        nrqm_patch_size (int): The size of patches to use for the spatial NRQM.
+          Default is 32.
+        nrqm_stagnation_threshold (float): A score below which a region is
+          considered low-quality for stagnation tracking. Default is 0.3.
+        nrqm_prune_stagnant_after (int): Prune stagnant Gaussians after they
+          have been observed in low-quality regions this many times. Default is 10.
+        anisotropic_split (bool): Whether to use anisotropic splitting. Default is True.
+        prune_redundant (bool): Whether to prune redundant Gaussians. Default is True.
+        redundancy_knn (int): Number of nearest neighbors to consider for redundancy pruning. Default is 5.
+        redundancy_overlap_thresh (float): Overlap threshold for redundancy pruning. Default is 0.6.
+        redundancy_color_thresh (float): Color similarity threshold for redundancy pruning. Default is 0.1.
     """
     refine_every: int = 400
     prune_every: int = 400
@@ -167,15 +186,6 @@ class AdaptiveStrategy(DefaultStrategy):
     use_learned_strategy: bool = True
     bootstrap_steps: int = 5000
 
-    # New: Parameters for pre-training with behavioral cloning
-    pretrain_steps: int = 2000
-    use_expert_pretraining: bool = True
-    bc_loss_weight: float = 0.5
-
-    # New: Causal reward calculation
-    use_causal_reward: bool = True
-
-
     densify_learn_every: int = 200
     densify_hindsight_delay: int = 400
     actor_loss_weight: float = 1.0
@@ -184,10 +194,15 @@ class AdaptiveStrategy(DefaultStrategy):
     end_exploration_epsilon: float = 0.05
     exploration_decay_steps: int = 15000
 
+    use_learned_pruning: bool = True
+    pruning_learn_every: int = 500
+    pruning_hindsight_delay: int = 800
+    prune_threshold: float = 0.6
+    prune_age_threshold: int = 1200
 
     use_curiosity: bool = True
     curiosity_weight: float = 0.05
-    icm_action_dim: int = UNIFIED_ACTION_SPACE_SIZE
+    icm_action_dim: int = 4
 
     subset_fraction: float = 1.0
     max_densification_subset: int = 200_000
@@ -201,15 +216,16 @@ class AdaptiveStrategy(DefaultStrategy):
 
     gnn_net: Any = field(default=None, repr=False)
     ac_net: Any = field(default=None, repr=False)
-    # PRUNING AGENT REMOVED - MERGED INTO UNIFIED AGENT
+    pruning_ac_net: Any = field(default=None, repr=False)
     icm_module: Any = field(default=None, repr=False)
 
-    # RENAMED OPTIMIZER FOR CLARITY
-    agent_optimizer: Any = field(default=None, repr=False)
+    densify_optimizer: Any = field(default=None, repr=False)
+    pruning_optimizer: Any = field(default=None, repr=False)
     icm_optimizer: Any = field(default=None, repr=False)
 
     rasterizer_fn: Any = field(default=None, repr=False)
     nrqm_model: Any = field(default=None, repr=False)
+
 
     nrqm_patch_size: int = 32
     nrqm_stagnation_threshold: float = 0.3
@@ -226,14 +242,23 @@ class AdaptiveStrategy(DefaultStrategy):
     num_uncertainty_views: int = 3
     geom_uncertainty_thresh: float = 0.002
 
+    learn_every: int = 200
+    hindsight_delay: int = 400
+
     continuous_loss_weight: float = 0.5
 
+    pruning_bootstrap_steps: int = 5000
     learned_prune_threshold: float = 0.5
-    prune_age_threshold: int = 1200
 
+    pruning_net: Any = field(default=None, repr=False)
 
     knn_fn: Any = field(default=None, repr=False)
     lpips_metric: Any = field(default=None, repr=False)
+
+    combined_optimizer: Any = field(default=None, repr=False)
+
+    start_asc_grad2d: float = 0.0002
+    end_asc_grad2d: float = 0.001
 
     meta_lr_warmup_steps: int = 300
 
@@ -249,14 +274,15 @@ class AdaptiveStrategy(DefaultStrategy):
             "geom_uncertainty_map": None,
             "densify_replay_buffer": PrioritizedReplayBuffer(capacity=20_000),
             "densify_hindsight_buffer": deque(maxlen=5_000),
-            "expert_replay_buffer": deque(maxlen=20_000), # New: For expert demonstrations
-            "is_pretraining_done": False, # New: Flag to control training phase
+            "pruning_replay_buffer": PrioritizedReplayBuffer(capacity=10_000),
+            "pruning_hindsight_buffer": deque(maxlen=2_500),
             "significance": None,
             "prev_grad2d": None,
             "prev_opacity": None,
             "age": None,
             "l1_loss_map": None,
             "ac_hidden_states": None,
+            "pruning_ac_hidden_states": None,
             "custom_lr_multipliers": None,
             "custom_lr_timers": None,
         })
@@ -272,14 +298,16 @@ class AdaptiveStrategy(DefaultStrategy):
             hidden_dim=self.gnn_hidden_dim, output_dim=self.gnn_embedding_dim,
         ).to(device)
 
-        # Use the new UnifiedActorCritic
-        self.ac_net = UnifiedActorCritic(
-            input_dim=ac_input_dim, mlp_width=self.ac_hidden_dim, hidden_dim=self.ac_hidden_dim
-        ).to(device)
+        self.ac_net = ActorCriticNetwork(input_dim=ac_input_dim, mlp_width=self.ac_hidden_dim, hidden_dim=self.ac_hidden_dim).to(
+            device)
+        densify_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
+        self.densify_optimizer = torch.optim.AdamW(densify_params, lr=1e-4, weight_decay=1e-5)
 
-        # Optimizer now covers both GNN and the unified AC net
-        agent_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
-        self.agent_optimizer = torch.optim.AdamW(agent_params, lr=1e-4, weight_decay=1e-5)
+        if self.use_learned_pruning:
+            self.pruning_ac_net = PruningActorCritic(input_dim=ac_input_dim, mlp_width=self.ac_hidden_dim,
+                                                     hidden_dim=self.ac_hidden_dim).to(device)
+            pruning_params = list(self.gnn_net.parameters()) + list(self.pruning_ac_net.parameters())
+            self.pruning_optimizer = torch.optim.AdamW(pruning_params, lr=5e-5, weight_decay=1e-5)
 
         if self.use_curiosity:
             self.icm_module = ICMModule(
@@ -321,9 +349,9 @@ class AdaptiveStrategy(DefaultStrategy):
             features[valid_indices, 5] = state["l1_loss_map"][pixel_coords_y[valid_indices], pixel_coords_x[
                 valid_indices]]
             if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
-                features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+                    features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
             if state.get("quality_heatmap") is not None:
-                features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
+                    features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
 
         if self.knn_fn is not None and len(params["means"]) > self.redundancy_knn:
             dists, idxs = self.knn_fn(means3d_subset, K=self.redundancy_knn + 1)
@@ -470,7 +498,7 @@ class AdaptiveStrategy(DefaultStrategy):
             state["last_nrqm_step"] = step
 
 
-        self._process_hindsight_buffers(params, state, step, info)
+        self._process_hindsight_buffers(state, step)
 
         self._update_state(params, state, info, packed=packed)
 
@@ -478,11 +506,7 @@ class AdaptiveStrategy(DefaultStrategy):
         if step > self.refine_start_iter:
             if step % self.refine_every == 0:
                 t = time.time()
-                # Decide whether to use heuristic or learned agent based on step
-                use_heuristic = step < self.bootstrap_steps
-                n_dupli, n_split, n_prune, n_merge = self._update_geometry(
-                    params, optimizers, state, step, use_heuristic=use_heuristic
-                )
+                n_dupli, n_split, n_prune, n_merge = self._update_geometry(params, optimizers, state, step)
 
                 if self.verbose:
                     print(f"Geometry updated at step {step}. Now having {len(params['means'])} GSs. Took {time.time() - t:.2f}s.")
@@ -490,18 +514,11 @@ class AdaptiveStrategy(DefaultStrategy):
                         f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split, {n_prune} GSs pruned, {n_merge} GSs merged."
                     )
 
-        # Control learning phases
-        if self.use_expert_pretraining and step == self.bootstrap_steps:
-            print("--- Starting Behavioral Cloning Pre-training Phase ---")
-            self._pretrain_agent_with_bc(state)
-            state["is_pretraining_done"] = True
-            print("--- Pre-training Finished. Starting Online RL Training. ---")
-
-        # Start online RL training after bootstrap (and pre-training if enabled)
         if step > self.bootstrap_steps:
             if step % self.densify_learn_every == 0:
-                self._train_agent_online(state)
-
+                self._train_densification_agent(state)
+            if self.use_learned_pruning and step % self.pruning_learn_every == 0:
+                self._train_pruning_agent(state)
 
         if step % self.reset_every == 0 and step > 0:
             reset_opa(params=params, optimizers=optimizers, state=state, value=self.prune_opa * 2.0)
@@ -697,7 +714,7 @@ class AdaptiveStrategy(DefaultStrategy):
         return patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask
 
 
-    def _process_hindsight_buffers(self, params: dict, state: dict, current_step: int, info: dict):
+    def _process_hindsight_buffers(self, state: dict, current_step: int):
         while state["densify_hindsight_buffer"] and \
                 (current_step - state["densify_hindsight_buffer"][0]["step"]) >= self.densify_hindsight_delay:
 
@@ -712,53 +729,8 @@ class AdaptiveStrategy(DefaultStrategy):
             px, py = exp["px"], exp["py"]
             ptx, pty = exp["ptx"], exp["pty"]
 
-            current_error_patch = state["l1_loss_map"][max(0, py-2):py+3, max(0, px-2):px+3]
-            if current_error_patch.numel() == 0: continue
-            current_error = current_error_patch.mean()
-
-            # --- Causal Reward Calculation ---
-            if self.use_causal_reward and exp.get("is_action_taken", False):
-                # Temporarily revert the action to get a counterfactual rendering
-                temp_params = {k: v.clone() for k, v in params.items()}
-
-                # Identify which gaussians to remove (the new ones) and which to revert (the parent)
-                parent_idx = exp["original_index"]
-                children_indices = exp["children_indices"]
-
-                # Create a mask to keep all gaussians except the new children
-                keep_mask = torch.ones(len(temp_params["means"]), dtype=torch.bool, device=temp_params["means"].device)
-                keep_mask[children_indices] = False
-
-                # Apply the keep mask
-                for k in temp_params:
-                    temp_params[k] = temp_params[k][keep_mask]
-
-                # Add the original parent gaussian back in its pre-action state
-                for k, v in exp["parent_state"].items():
-                    temp_params[k] = torch.cat([temp_params[k], v.unsqueeze(0)], dim=0)
-
-                # Perform counterfactual rendering of the local patch
-                # This is a simplified rendering call for a single view on a small patch
-                # Note: A full rendering might be slow; this is a conceptual implementation.
-                # For performance, one might only re-rasterize the affected tile.
-                with torch.no_grad():
-                    counterfactual_render, _, _ = self.rasterizer_fn(
-                        means=temp_params["means"], quats=temp_params["quats"],
-                        scales=temp_params["scales"], opacities=temp_params["opacities"],
-                        colors=torch.cat([temp_params["sh0"], temp_params["shN"]], 1),
-                        camtoworlds=exp["camtoworlds"], Ks=exp["Ks"],
-                        width=info['width'], height=info['height'],
-                        render_mode="RGB"
-                    )
-                counterfactual_patch = counterfactual_render[0, max(0, py-2):py+3, max(0, px-2):px+3, :]
-                gt_patch = info['pixels'][0, max(0, py-2):py+3, max(0, px-2):px+3, :]
-                counterfactual_error = torch.abs(counterfactual_patch - gt_patch).mean()
-
-                # Causal reward is the reduction in error attributable only to the action
-                reward_photo = counterfactual_error - current_error
-            else:
-                # Fallback to standard hindsight reward
-                reward_photo = exp["initial_error"] - current_error
+            current_error = state["l1_loss_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
+            reward_photo = exp["initial_error"] - current_error
 
             current_quality = state["quality_heatmap"][pty, ptx]
             reward_quality = exp["initial_quality"] - current_quality
@@ -770,10 +742,10 @@ class AdaptiveStrategy(DefaultStrategy):
             reward_detail = exp["initial_detail_error"] - current_detail_error
 
             action_cost = 0.0
-            if exp["action"] in [ACTION_SPLIT, ACTION_DUPLICATE]:
-                action_cost = -self.action_cost_weight
-            elif exp["action"] == ACTION_MERGE:
-                action_cost = self.action_cost_weight
+            # if action == 1 or action == 2:
+            #     action_cost = -self.action_cost_weight
+            # elif action == 3:
+            #     action_cost = self.action_cost_weight
 
             final_reward = (self.w_photometric * reward_photo +
                             self.w_detail * reward_detail +
@@ -789,43 +761,30 @@ class AdaptiveStrategy(DefaultStrategy):
                     exp["log_prob"]
                 ))
 
-    def _pretrain_agent_with_bc(self, state: dict[str, Any]):
-        """Trains the agent using Behavioral Cloning on the expert replay buffer."""
-        if len(state["expert_replay_buffer"]) < 256:
-            print("Not enough expert samples to pre-train. Skipping.")
-            return
+        if self.use_learned_pruning:
+            while state["pruning_hindsight_buffer"] and \
+                    (current_step - state["pruning_hindsight_buffer"][0]["step"]) >= self.pruning_hindsight_delay:
 
-        self.gnn_net.train()
-        self.ac_net.train()
-        device = next(self.ac_net.parameters()).device
+                exp = state["pruning_hindsight_buffer"].popleft()
 
-        # Simple batching from deque
-        all_data = list(state["expert_replay_buffer"])
+                if state.get("l1_loss_map") is None:
+                    continue
 
-        for i in range(self.pretrain_steps):
-            indices = torch.randint(0, len(all_data), (256,))
-            batch = [all_data[i] for i in indices]
+                px, py = exp["px"], exp["py"]
 
-            features = torch.stack([x[0] for x in batch]).to(device)
-            expert_actions = torch.tensor([x[1] for x in batch], device=device, dtype=torch.int64)
+                current_error = state["l1_loss_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
 
-            # Forward pass to get action logits from the policy
-            action_logits, _, _, _, _ = self.ac_net(features, torch.zeros(features.shape[0], self.ac_hidden_dim, device=device))
+                pruning_reward = exp["initial_error"] - current_error
 
-            # Behavioral Cloning loss
-            bc_loss = F.cross_entropy(action_logits, expert_actions)
+                if len(state["pruning_replay_buffer"]) < state["pruning_replay_buffer"].capacity:
+                    state["pruning_replay_buffer"].add((
+                        exp["features"],
+                        exp["action"],
+                        pruning_reward.clone().detach(),
+                        exp["log_prob"]
+                    ))
 
-            self.agent_optimizer.zero_grad()
-            bc_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
-            self.agent_optimizer.step()
-
-            if i % 100 == 0:
-                print(f"Pre-training Step {i}/{self.pretrain_steps}, BC Loss: {bc_loss.item():.4f}")
-
-    def _train_agent_online(self, state: dict[str, Any]):
-        """Performs one step of online PPO training."""
+    def _train_densification_agent(self, state: dict[str, Any]):
         if len(state["densify_replay_buffer"]) < 256: return
 
         self.gnn_net.train()
@@ -837,33 +796,32 @@ class AdaptiveStrategy(DefaultStrategy):
         batch, tree_idxs, is_weights = state["densify_replay_buffer"].sample(256)
         is_weights = torch.tensor(is_weights, device=device, dtype=torch.float32)
 
-        features = torch.stack([x[0] for x in batch]).to(device)
+        states = torch.stack([x[0] for x in batch]).to(device)
         actions_taken = torch.tensor([x[1] for x in batch], device=device, dtype=torch.int64)
         extrinsic_rewards = torch.stack([x[2] for x in batch]).to(device)
         old_log_probs = torch.stack([x[3] for x in batch]).to(device)
 
-        # NOTE: Using placeholder hidden states for training. For stateful training,
-        # these would need to be stored and retrieved from the replay buffer.
-        h_state = torch.zeros(features.shape[0], self.ac_hidden_dim, device=device)
-
         total_reward = extrinsic_rewards
 
         if self.use_curiosity:
-            # ICM logic remains similar
-            next_features = torch.roll(features, -1, dims=0)
+            next_states = torch.roll(states, -1, dims=0)
             actions_one_hot = F.one_hot(actions_taken, num_classes=self.icm_action_dim).float()
-            pred_next_state, pred_action_logits = self.icm_module(features, next_features, actions_one_hot)
-            forward_loss = F.mse_loss(pred_next_state, next_features.detach())
+
+            pred_next_state, pred_action_logits = self.icm_module(states, next_states, actions_one_hot)
+
+            forward_loss = F.mse_loss(pred_next_state, next_states.detach())
             inverse_loss = F.cross_entropy(pred_action_logits, actions_taken.detach())
             icm_loss = forward_loss + inverse_loss
+
             self.icm_optimizer.zero_grad()
             icm_loss.backward()
             self.icm_optimizer.step()
-            intrinsic_reward = F.mse_loss(pred_next_state.detach(), next_features.detach(), reduction='none').mean(dim=-1)
+
+            intrinsic_reward = F.mse_loss(pred_next_state.detach(), next_states.detach(), reduction='none').mean(dim=-1)
             norm_intrinsic_reward = (intrinsic_reward - intrinsic_reward.mean()) / (intrinsic_reward.std() + 1e-8)
             total_reward = extrinsic_rewards + self.curiosity_weight * norm_intrinsic_reward
 
-        action_logits, predicted_values, _, _, _ = self.ac_net(features, h_state)
+        action_logits, predicted_values, _ = self.ac_net(states)
         advantage = total_reward - predicted_values.detach()
         advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
@@ -883,20 +841,73 @@ class AdaptiveStrategy(DefaultStrategy):
                 self.actor_loss_weight * actor_loss_unreduced +
                 entropy_loss_unreduced
         )
+
         loss = (total_loss_unreduced * is_weights).mean()
 
-        self.agent_optimizer.zero_grad()
+        self.densify_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
-        self.agent_optimizer.step()
+        self.densify_optimizer.step()
 
         td_errors = (total_reward - predicted_values).abs().detach().cpu().numpy()
         state["densify_replay_buffer"].update_priorities(tree_idxs, td_errors)
 
+    def _train_pruning_agent(self, state: dict[str, Any]):
+        if len(state["pruning_replay_buffer"]) < 128: return
+
+        self.gnn_net.train()
+        self.pruning_ac_net.train()
+        device = next(self.pruning_ac_net.parameters()).device
+
+        batch, tree_idxs, is_weights = state["pruning_replay_buffer"].sample(128)
+        is_weights = torch.tensor(is_weights, device=device, dtype=torch.float32)
+
+        ac_inputs = torch.stack([x[0] for x in batch]).to(device)
+        actions_taken = torch.tensor([x[1] for x in batch], device=device, dtype=torch.float32) # Bernoulli actions are float
+        rewards = torch.stack([x[2] for x in batch]).to(device)
+        old_log_probs = torch.stack([x[3] for x in batch]).to(device)
+
+        action_logits, predicted_values = self.pruning_ac_net(ac_inputs)
+        advantage = rewards - predicted_values.detach()
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+
+        critic_loss_unreduced = F.mse_loss(predicted_values, rewards, reduction="none")
+
+        new_dist = Bernoulli(logits=action_logits)
+        new_log_probs = new_dist.log_prob(actions_taken)
+        ratio = torch.exp(new_log_probs - old_log_probs)
+
+        surr1 = ratio * advantage
+        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantage
+        actor_loss_unreduced = -torch.min(surr1, surr2)
+        entropy_loss_unreduced = -self.entropy_loss_weight * new_dist.entropy()
+
+        total_loss_unreduced = (
+                critic_loss_unreduced +
+                self.actor_loss_weight * actor_loss_unreduced +
+                entropy_loss_unreduced
+        )
+
+        loss = (total_loss_unreduced * is_weights).mean()
+
+        self.densify_optimizer.zero_grad()
+        self.pruning_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.pruning_ac_net.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
+        self.densify_optimizer.step()
+        self.pruning_optimizer.step()
+
+        td_errors = (rewards - predicted_values).abs().detach().cpu().numpy()
+        state["pruning_replay_buffer"].update_priorities(tree_idxs, td_errors)
 
     @torch.no_grad()
-    def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int, use_heuristic: bool = False) -> Tuple[int, int, int, int]:
+    def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> Tuple[int, int, int, int]:
+        """
+        Robust implementation using a state-independent action resolution strategy.
+        Conflicts are resolved before any modifications, ensuring index stability.
+        """
         initial_num_gaussians = len(params["means"])
         device = params["means"].device
 
@@ -911,19 +922,23 @@ class AdaptiveStrategy(DefaultStrategy):
                 (initial_num_gaussians, self.ac_hidden_dim), device=device
             )
 
+        if self.use_learned_pruning and (state.get("pruning_ac_hidden_states") is None or state["pruning_ac_hidden_states"].shape[0] != initial_num_gaussians):
+            state["pruning_ac_hidden_states"] = torch.zeros(
+                (initial_num_gaussians, self.ac_hidden_dim), device=device
+            )
+
         grad_thresh = state["dynamic_grow_grad2d"]
         candidates_by_grad = state["grad2d"] / state["count"].clamp_min(1) > grad_thresh
 
-        h, w = state['l1_loss_map'].shape
+        h = state['l1_loss_map'].shape[0]
+        w = state['l1_loss_map'].shape[1]
         ptx, pty, px, py, valid_proj = self._project_to_patch_coords(params['means'], state['view_proj_matrix'], h, w)
 
         low_quality_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=device)
-        if state.get("quality_heatmap") is not None:
-            low_quality_mask[valid_proj] = state["quality_heatmap"][pty[valid_proj], ptx[valid_proj]] < self.nrqm_stagnation_threshold
+        low_quality_mask[valid_proj] = state["quality_heatmap"][pty[valid_proj], ptx[valid_proj]] < self.nrqm_stagnation_threshold
 
         high_uncertainty_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=device)
-        if state.get("geom_uncertainty_map") is not None:
-            high_uncertainty_mask[valid_proj] = state["geom_uncertainty_map"][py[valid_proj], px[valid_proj]] > self.geom_uncertainty_thresh
+        high_uncertainty_mask[valid_proj] = state["geom_uncertainty_map"][py[valid_proj], px[valid_proj]] > self.geom_uncertainty_thresh
 
         subset_mask = (candidates_by_grad | low_quality_mask | high_uncertainty_mask)
 
@@ -941,7 +956,8 @@ class AdaptiveStrategy(DefaultStrategy):
         camtoworld_matrix = torch.inverse(state['view_matrix'])
         campos = camtoworld_matrix[:3, 3]
 
-        graph_embeddings, coords, raw_features = self._get_graph_representation(params, state, subset_mask, step, campos)
+        graph_embeddings, coords, raw_features = self._get_graph_representation(params, state, subset_mask, step,
+                                                                                campos)
         if graph_embeddings is None: return 0, 0, 0, 0
 
         px_sub, py_sub, ptx_sub, pty_sub, valid_mask_subset = coords
@@ -957,61 +973,57 @@ class AdaptiveStrategy(DefaultStrategy):
         expanded_global_context = global_context.unsqueeze(0).expand(graph_embeddings.shape[0], -1)
         ac_input = torch.cat([graph_embeddings, expanded_global_context], dim=-1)
 
-        # --- Action Selection: Heuristic or Learned ---
-        if use_heuristic:
-            # Use classic 3DGS heuristics for bootstrapping and collecting expert data
-            actions = torch.full((len(original_subset_indices),), ACTION_DO_NOTHING, dtype=torch.long, device=device)
+        prune_actions = torch.zeros(len(original_subset_indices), dtype=torch.bool, device=device)
+        if self.use_learned_pruning:
+            self.pruning_ac_net.eval()
+            h_prev = state['pruning_ac_hidden_states'][original_subset_indices]
 
-            # Heuristic for splitting: high gradient
-            split_heuristic_mask = (state["grad2d"][original_subset_indices] / state["count"][original_subset_indices].clamp_min(1)) > self.grow_grad2d
-            actions[split_heuristic_mask] = ACTION_SPLIT
+            prune_logits, _, h_new = self.pruning_ac_net(ac_input, h_old=h_prev)
+            state['pruning_ac_hidden_states'][original_subset_indices] = h_new
+            prune_dist = Bernoulli(logits=prune_logits)
+            prune_actions = (prune_dist.sample() == 1)
 
-            # Heuristic for pruning: low opacity AND large size
-            opa_heuristic_mask = torch.sigmoid(params["opacities"][original_subset_indices].flatten()) < self.prune_opa
-            scale_heuristic_mask = torch.exp(params["scales"][original_subset_indices]).mean(dim=-1) > (self.grow_scale2d *
-                                                                                                        state['scene_scale'])
-            prune_heuristic_mask = opa_heuristic_mask & scale_heuristic_mask
-            actions[prune_heuristic_mask] = ACTION_PRUNE
+        self.ac_net.eval()
 
-            # Store demonstration in expert buffer
-            if self.use_expert_pretraining:
-                for i in range(len(actions)):
-                    if actions[i] != ACTION_DO_NOTHING: # Only store meaningful actions
-                        state["expert_replay_buffer"].append((ac_input[i].cpu(), actions[i].cpu(), 0.0)) # reward is calculated later
+        h_prev = state['ac_hidden_states'][original_subset_indices]
+        action_logits, _, continuous_params, h_new, lr_multipliers = self.ac_net(ac_input, h_old=h_prev)
+        state['ac_hidden_states'][original_subset_indices] = h_new
 
-            continuous_params = torch.zeros((len(original_subset_indices), 5), device=device)  # Placeholder for split params
-            h_new = torch.zeros((len(original_subset_indices), self.ac_hidden_dim), device=device)  # Placeholder for hidden states
-            lr_multipliers = torch.ones((len(original_subset_indices),), device=device)  # Placeholder for LR multipliers
+        progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
+        epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)
+        densify_dist = Categorical(logits=action_logits)
+        if torch.rand(1).item() < epsilon:
+            densify_actions = torch.randint(0, 4, (len(original_subset_indices),), device=device)
+        else:
+            densify_actions = densify_dist.sample()
 
-        else: # Use the learned RL agent
-            self.ac_net.eval()
-            h_prev = state['ac_hidden_states'][original_subset_indices]
-            action_logits, value, continuous_params, h_new, lr_multipliers = self.ac_net(ac_input, h_old=h_prev)
-            state['ac_hidden_states'][original_subset_indices] = h_new
+        # 2. Resolve Action Conflicts and Create Final, Disjoint Masks
+        final_actions = torch.zeros_like(densify_actions)
+        final_actions[densify_actions == 1] = 1 # Split
+        final_actions[densify_actions == 2] = 2 # Duplicate
+        final_actions[densify_actions == 3] = 3 # Merge
+        final_actions[prune_actions] = 4      # Prune
 
-            progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
-            epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)
-            dist = Categorical(logits=action_logits)
-            if torch.rand(1).item() < epsilon:
-                actions = torch.randint(0, UNIFIED_ACTION_SPACE_SIZE, (len(original_subset_indices),), device=device)
-            else:
-                actions = dist.sample()
-
-        # --- Action Resolution ---
-        final_prune_mask_subset = (actions == ACTION_PRUNE)
-        final_merge_mask_subset = (actions == ACTION_MERGE)
-        final_split_mask_subset = (actions == ACTION_SPLIT)
-        final_dupe_mask_subset = (actions == ACTION_DUPLICATE)
-
-        # Veto logic for pruning/merging
         age_in_steps = state["age"][original_subset_indices]
         significance = state["significance"][original_subset_indices]
-        prune_veto_mask = (age_in_steps < self.prune_age_threshold) | (significance > self.prune_significance_threshold)
 
-        final_prune_mask_subset &= ~prune_veto_mask
-        final_merge_mask_subset &= ~prune_veto_mask
+        quality_scores = torch.full_like(significance, 100.0)
+        quality_scores[valid_mask_subset] = state['quality_heatmap'][pty_sub[valid_mask_subset], ptx_sub[valid_mask_subset]]
 
-        # --- State update and Action execution (similar to before but using new masks) ---
+        prune_veto_mask = (
+                (quality_scores < self.nrqm_stagnation_threshold) |
+                (age_in_steps < self.prune_age_threshold) |
+                (significance > self.prune_significance_threshold)
+        )
+
+        final_actions[(final_actions == 4) & prune_veto_mask] = 0
+        final_actions[(final_actions == 3) & prune_veto_mask] = 0
+
+        final_prune_mask_subset = (final_actions == 4)
+        final_merge_mask_subset = (final_actions == 3)
+        final_split_mask_subset = (final_actions == 1)
+        final_dupe_mask_subset = (final_actions == 2)
+
         state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "significance", "ac_hidden_states", "custom_lr_multipliers", "custom_lr_timers"]}
 
         # A. PRUNE
@@ -1021,11 +1033,12 @@ class AdaptiveStrategy(DefaultStrategy):
         n_prune = global_prune_mask.sum().item()
         if n_prune > 0:
             remove(params, optimizers, state_to_modify, global_prune_mask)
+
         prune_map = torch.full((initial_num_gaussians,), -1, dtype=torch.long, device=device)
         prune_map[~global_prune_mask] = torch.arange(initial_num_gaussians - n_prune, device=device)
         num_gaussians_post_prune = len(params["means"])
 
-        # B. MERGE, C. SPLIT, D. DUPLICATE (logic remains largely the same, just driven by the new unified action masks)
+        # B. MERGE
         merge_orig_indices = original_subset_indices[final_merge_mask_subset]
         global_merge_mask = torch.zeros(num_gaussians_post_prune, dtype=torch.bool, device=device)
         if len(merge_orig_indices) > 0:
@@ -1033,37 +1046,36 @@ class AdaptiveStrategy(DefaultStrategy):
             valid_mask = remapped_indices != -1
             if valid_mask.any():
                 global_merge_mask[remapped_indices[valid_mask]] = True
+
         removed_by_merge_mask, n_merge_pairs = merge(params, optimizers, state_to_modify, global_merge_mask) if global_merge_mask.any() else (torch.zeros_like(global_merge_mask), 0)
         num_gaussians_post_merge = len(params["means"])
 
         merge_map = torch.full((num_gaussians_post_prune,), -1, dtype=torch.long, device=device)
         if removed_by_merge_mask.any():
-            merge_map[~removed_by_merge_mask] = torch.arange(num_gaussians_post_merge, device=device) # Corrected size
-        else:
-            merge_map[~removed_by_merge_mask] = torch.arange(num_gaussians_post_merge, device=device)
+            merge_map[~removed_by_merge_mask] = torch.arange(num_gaussians_post_merge - n_merge_pairs, device=device)
+        else: # If nothing merged, it's an identity map for prune survivors
+            valid_prune_indices = (prune_map != -1)
+            merge_map[valid_prune_indices] = prune_map[valid_prune_indices]
 
         # C. SPLIT
         split_orig_indices = original_subset_indices[final_split_mask_subset]
-        n_split = 0
-        if not use_heuristic and split_orig_indices.numel() > 0:
-            split_continuous_params = continuous_params[final_split_mask_subset]
-            global_split_mask = torch.zeros(num_gaussians_post_merge, dtype=torch.bool, device=device)
+        split_continuous_params = continuous_params[final_split_mask_subset]
+        global_split_mask = torch.zeros(num_gaussians_post_merge, dtype=torch.bool, device=device)
+        if len(split_orig_indices) > 0:
             remapped_indices = merge_map[prune_map[split_orig_indices]]
             valid_mask = remapped_indices != -1
             if valid_mask.any():
                 global_split_mask[remapped_indices[valid_mask]] = True
                 split_continuous_params = split_continuous_params[valid_mask]
 
-            n_split = global_split_mask.sum().item()
-            if n_split > 0:
-                split(params, optimizers, state_to_modify, global_split_mask,
-                      split_ratios=split_continuous_params[:, 0],
-                      directions=split_continuous_params[:, 2:5],
-                      lr_multipliers=lr_multipliers[final_split_mask_subset],
-                      warmup_steps=self.meta_lr_warmup_steps)
+        n_split = global_split_mask.sum().item()
+        if n_split > 0:
+            split(params, optimizers, state_to_modify, global_split_mask,
+                  split_ratios=split_continuous_params[:, 0],
+                  directions=split_continuous_params[:, 2:5],
+                  lr_multipliers=lr_multipliers[final_split_mask_subset],
+                  warmup_steps=self.meta_lr_warmup_steps)
         num_gaussians_post_split = len(params["means"])
-
-        # ... (Duplicate logic remains the same)
 
         # D. DUPLICATE
         dupe_orig_indices = original_subset_indices[final_dupe_mask_subset]

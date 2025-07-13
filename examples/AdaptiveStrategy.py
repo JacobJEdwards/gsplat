@@ -431,12 +431,13 @@ class AdaptiveStrategy(DefaultStrategy):
         if step > self.refine_start_iter:
             if step % self.refine_every == 0:
                 t = time.time()
-                n_dupli, n_split, n_prune, n_merge = self._update_geometry(params, optimizers, state, step)
+                n_dupli, n_split, n_prune, n_merge, n_finetune = self._update_geometry(params, optimizers, state, step)
 
                 if self.verbose:
                     print(f"Geometry updated at step {step}. Now having {len(params['means'])} GSs. Took {time.time() - t:.2f}s.")
                     print(
-                        f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split, {n_prune} GSs pruned, {n_merge} GSs merged."
+                        f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split, {n_prune} GSs pruned, "
+                        f"{n_merge} GSs merged, {n_finetune} GSs fine-tuned."
                     )
 
         if step > self.bootstrap_steps:
@@ -788,7 +789,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
 
     @torch.no_grad()
-    def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> Tuple[int, int, int, int]:
+    def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> Tuple[int, int, int, int, int]:
         initial_num_gaussians = len(params["means"])
         device = params["means"].device
 
@@ -796,7 +797,7 @@ class AdaptiveStrategy(DefaultStrategy):
             state["custom_lr_timers"] = torch.zeros(initial_num_gaussians, dtype=torch.int32, device=device)
             state["custom_lr_multipliers"] = torch.ones(initial_num_gaussians, device=device)
 
-        if state.get("view_matrix") is None: return 0, 0, 0, 0
+        if state.get("view_matrix") is None: return 0, 0, 0, 0, 0
 
         if state.get("ac_hidden_states") is None or state["ac_hidden_states"].shape[0] != initial_num_gaussians:
             state["ac_hidden_states"] = torch.zeros(
@@ -819,7 +820,7 @@ class AdaptiveStrategy(DefaultStrategy):
         subset_mask = (candidates_by_grad | low_quality_mask | high_uncertainty_mask)
 
         num_candidates = subset_mask.sum().item()
-        if num_candidates == 0: return 0, 0, 0, 0
+        if num_candidates == 0: return 0, 0, 0, 0, 0
 
         if num_candidates > self.max_densification_subset:
             candidate_indices = torch.where(subset_mask)[0]
@@ -832,7 +833,7 @@ class AdaptiveStrategy(DefaultStrategy):
         campos = camtoworld_matrix[:3, 3]
 
         graph_embeddings, coords, raw_features = self._get_graph_representation(params, state, subset_mask, step, campos)
-        if graph_embeddings is None: return 0, 0, 0, 0
+        if graph_embeddings is None: return 0, 0, 0, 0, 0
 
         px_sub, py_sub, ptx_sub, pty_sub, valid_mask_subset = coords
 
@@ -882,6 +883,7 @@ class AdaptiveStrategy(DefaultStrategy):
             state["custom_lr_multipliers"][finetune_indices] = self.finetune_lr_multiplier
             state["custom_lr_timers"][finetune_indices] = self.finetune_duration
 
+        n_finetune = finetune_indices.numel()
 
         state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "significance", "ac_hidden_states", "custom_lr_multipliers", "custom_lr_timers"]}
 
@@ -980,4 +982,4 @@ class AdaptiveStrategy(DefaultStrategy):
         if n_dupli > 0: state["age"][-n_dupli:] = 0
         if n_split > 0: state["age"][-(n_split*2):-n_split] = 0; state["age"][-n_split:] = 0
 
-        return n_dupli, n_split, n_prune, n_merge_pairs
+        return n_dupli, n_split, n_prune, n_merge_pairs, n_finetune

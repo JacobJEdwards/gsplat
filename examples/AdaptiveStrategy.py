@@ -795,8 +795,6 @@ class AdaptiveStrategy(DefaultStrategy):
                 ))
 
     def _train_agent(self, state: dict[str, Any]):
-
-
         if len(state["replay_buffer"]) < 256:
             if self.verbose:
                 print("Not enough samples in replay buffer for training.")
@@ -945,7 +943,10 @@ class AdaptiveStrategy(DefaultStrategy):
 
         px_sub, py_sub, ptx_sub, pty_sub = coords
         for i in range(len(original_subset_indices)):
-            if not valid_mask_subset[i]: continue
+            print(f"Processing Gaussian {i+1}/{len(original_subset_indices)}...")
+            if not valid_mask_subset[i]:
+                print(f"Skipping Gaussian {i+1} due to invalid projection.")
+                continue
 
             initial_error = state["l1_loss_map"][max(0, py_sub[i]-2):py_sub[i]+3, max(0, px_sub[i]-2):px_sub[i]+3].mean()
             initial_quality = state["quality_heatmap"][pty_sub[i], ptx_sub[i]]

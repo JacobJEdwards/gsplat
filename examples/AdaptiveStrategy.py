@@ -195,8 +195,11 @@ class AdaptiveStrategy(DefaultStrategy):
     w_quality: float = -1.0
     w_uncertainty: float = 1.0
 
-    ppo_clip_epsilon: float = 0.2
+    stable_error_threshold: float = 0.01
+    stable_quality_threshold: float = 0.05
+    stability_reward_bonus: float = 0.1
 
+    ppo_clip_epsilon: float = 0.2
     gnn_net: Any = field(default=None, repr=False)
     ac_net: Any = field(default=None, repr=False)
     icm_module: Any = field(default=None, repr=False)
@@ -721,6 +724,8 @@ class AdaptiveStrategy(DefaultStrategy):
             current_detail_error = state["detail_error_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
             reward_detail = exp["initial_detail_error"] - current_detail_error
 
+            action = exp["gaussian_action"]
+
             action_cost = 0.0
             # if action in [1, 2, 5]:
             #     action_cost = -self.action_cost_weight
@@ -732,6 +737,14 @@ class AdaptiveStrategy(DefaultStrategy):
                             self.w_quality * reward_quality +
                             self.w_uncertainty * reward_uncertainty +
                             action_cost)
+
+            if action == 0:
+                initial_error = exp["initial_error"]
+                initial_quality = exp["initial_quality"]
+
+                if initial_error < self.stable_error_threshold and \
+                        initial_quality < self.stable_quality_threshold:
+                    final_reward += self.stable_reward_bonus
 
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
                 experience_tensordict = TensorDict({
@@ -969,11 +982,20 @@ class AdaptiveStrategy(DefaultStrategy):
             }
             state["hindsight_buffer"].append(exp)
 
+        region_decision_for_each_gaussian = region_actions[region_assignments]
+        stable_mask = (region_decision_for_each_gaussian == 0)
+        final_actions[stable_mask & (final_actions != 5)] = 0
+
+        refine_mask = (region_decision_for_each_gaussian == 1)
+        final_actions[refine_mask & ((final_actions == 3) | (final_actions == 4))] = 0
+
+        prune_mask = (region_decision_for_each_gaussian == 2)
+        final_actions[prune_mask & ((final_actions == 1) | (final_actions == 2))] = 0
+
         age_in_steps = state["age"][original_subset_indices]
         significance = state["significance"][original_subset_indices]
         scales_mag = torch.exp(params["scales"][original_subset_indices]).norm(dim=-1)
         opacities = torch.sigmoid(params["opacities"][original_subset_indices])
-
 
         prune_merge_veto_mask = (
                 (age_in_steps < self.prune_age_threshold) |

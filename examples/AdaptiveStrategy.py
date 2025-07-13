@@ -981,14 +981,14 @@ class AdaptiveStrategy(DefaultStrategy):
             self.pruning_ac_net.eval()
             h_prev = state['pruning_ac_hidden_states'][original_subset_indices]
 
-            prune_logits, _, h_new = self.pruning_ac_net(ac_input, h_prev=h_prev)
+            prune_logits, _, h_new = self.pruning_ac_net(ac_input, h_old=h_prev)
             state['pruning_ac_hidden_states'][original_subset_indices] = h_new
             prune_dist = Bernoulli(logits=prune_logits)
             prune_actions = (prune_dist.sample() == 1)
 
         self.ac_net.eval()
         h_prev = state['ac_hidden_states'][original_subset_indices]
-        action_logits, _, continuous_params, h_new = self.ac_net(ac_input, h_prev=h_prev)
+        action_logits, _, continuous_params, h_new = self.ac_net(ac_input, h_old=h_prev)
         state['ac_hidden_states'][original_subset_indices] = h_new
         progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
         epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)

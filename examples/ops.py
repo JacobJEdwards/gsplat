@@ -88,8 +88,12 @@ def split(
     for k, v in state.items():
         if isinstance(v, torch.Tensor):
             repeats = [2] + [1] * (v.dim() - 1)
-            v_new = v[sel].repeat(repeats)
-            state[k] = torch.cat((v[rest], v_new))
+            if k == 'ac_hidden_states':
+                v_split = torch.zeros_like(v[sel].repeat(repeats))
+                state[k] = torch.cat((v[rest], v_split))
+            else:
+                v_new = v[sel].repeat(repeats)
+                state[k] = torch.cat((v[rest], v_new))
 
 @torch.no_grad()
 def duplicate(
@@ -121,7 +125,11 @@ def duplicate(
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
     for k, v in state.items():
         if isinstance(v, torch.Tensor):
-            state[k] = torch.cat((v, v[sel]))
+            if k == 'ac_hidden_states':
+                v_new = torch.zeros_like(v[sel])
+                state[k] = torch.cat((v, v_new))
+            else:
+                state[k] = torch.cat((v, v[sel]))
 
 
 @torch.no_grad()

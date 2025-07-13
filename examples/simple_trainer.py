@@ -28,7 +28,7 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
-from AdaptiveStrategy import AdaptiveStrategy, PatchBasedNRQM
+from AdaptiveStrategy import AdaptiveStrategy
 from utils import (
     AppearanceOptModule,
     CameraOptModule,

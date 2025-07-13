@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
-from utils import knn_with_ids_two_tensor
+from utils import knn_with_ids_two_tensor, matrix_to_quaternion
 from gsplat.strategy.ops import _update_param_with_optimizer
 from gsplat.utils import normalized_quat_to_rotmat
 
@@ -154,6 +154,7 @@ def merge(
         optimizers: dict[str, torch.optim.Optimizer],
         state: dict[str, Tensor],
         mask: Tensor,
+        num_samples_for_pca: int = 100,
 ) -> tuple[Tensor, int]:
     """
     In-place merges selected Gaussians with their nearest neighbors.
@@ -180,6 +181,8 @@ def merge(
     pairs = torch.tensor(list(unique_pairs), device=device)
     indices_i, indices_j = pairs[:, 0], pairs[:, 1]
 
+    num_pairs = len(indices_i)
+
     opacities_i = torch.sigmoid(params["opacities"][indices_i])
     opacities_j = torch.sigmoid(params["opacities"][indices_j])
     alpha_sum = opacities_i + opacities_j + 1e-8
@@ -189,17 +192,37 @@ def merge(
     new_opacities_alpha = 1.0 - (1.0 - opacities_i) * (1.0 - opacities_j)
     new_opacities = torch.logit(torch.clamp(new_opacities_alpha, 1e-6, 1.0 - 1e-6))
 
-    new_means = w_i.unsqueeze(-1) * params["means"][indices_i] + w_j.unsqueeze(-1) * params["means"][indices_j]
-    new_scales = w_i.unsqueeze(-1) * torch.exp(params["scales"][indices_i]) + w_j.unsqueeze(-1) * torch.exp(params["scales"][indices_j])
-    new_scales = torch.log(torch.clamp(new_scales, min=1e-8))
-
-    quat_mask = (opacities_i > opacities_j).unsqueeze(-1)
-    new_quats = torch.where(quat_mask, params["quats"][indices_i], params["quats"][indices_j])
-
     colors_i = torch.cat([params["sh0"][indices_i], params["shN"][indices_i]], dim=1)
     colors_j = torch.cat([params["sh0"][indices_j], params["shN"][indices_j]], dim=1)
     new_colors = w_i.unsqueeze(-1).unsqueeze(-1) * colors_i + w_j.unsqueeze(-1).unsqueeze(-1) * colors_j
     new_sh0, new_shN = new_colors[:, :1], new_colors[:, 1:]
+
+    means_i, means_j = params["means"][indices_i], params["means"][indices_j]
+    scales_i, scales_j = torch.exp(params["scales"][indices_i]), torch.exp(params["scales"][indices_j])
+    quats_i, quats_j = F.normalize(params["quats"][indices_i]), F.normalize(params["quats"][indices_j])
+    rotmats_i, rotmats_j = normalized_quat_to_rotmat(quats_i), normalized_quat_to_rotmat(quats_j)
+
+    noise = torch.randn(num_samples_for_pca, num_pairs, 3, device=device) # [Num_Samples, Num_Pairs, 3]
+
+    samples_i = torch.einsum("nij,snj->sni", rotmats_i, noise * scales_i) + means_i
+    samples_j = torch.einsum("nij,snj->sni", rotmats_j, noise * scales_j) + means_j
+
+    all_samples = torch.cat([samples_i, samples_j])  # [2 * Num_Samples, Num_Pairs, 3]
+
+    new_means = torch.mean(all_samples, dim=0) # [Num_Pairs, 3]
+    centered_samples = all_samples - new_means
+
+    covariances = torch.einsum("sni,snj->nij", centered_samples, centered_samples) / (2 * num_samples_for_pca - 1)
+
+    try:
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariances)
+    except torch.linalg.LinAlgError:
+        identity = torch.eye(3, device=device).expand(num_pairs, -1, -1)
+        eigenvalues = torch.ones(num_pairs, 3, device=device) * 1e-8
+        eigenvectors = identity
+
+    new_scales = torch.log(torch.sqrt(torch.clamp(eigenvalues, min=1e-8)))
+    new_quats = matrix_to_quaternion(eigenvectors)
 
     new_params_dict = {
         "means": new_means, "scales": new_scales, "opacities": new_opacities,

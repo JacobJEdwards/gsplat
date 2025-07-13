@@ -452,3 +452,25 @@ def generate_novel_views(
         novel_poses.append(novel_pose)
 
     return np.array(novel_poses)
+
+@torch.no_grad()
+def matrix_to_quaternion(matrix: Tensor) -> Tensor:
+    if matrix.size(-1) != 3 or matrix.size(-2) != 3:
+        raise ValueError(f"Invalid rotation matrix shape {matrix.shape}.")
+
+    m00, m01, m02 = matrix[..., 0, 0], matrix[..., 0, 1], matrix[..., 0, 2]
+    m10, m11, m12 = matrix[..., 1, 0], matrix[..., 1, 1], matrix[..., 1, 2]
+    m20, m21, m22 = matrix[..., 2, 0], matrix[..., 2, 1], matrix[..., 2, 2]
+
+    t = m00 + m11 + m22
+
+    q_w = 0.5 * torch.sqrt(torch.clamp(t + 1.0, min=1e-8))
+    q_x = 0.5 * torch.sqrt(torch.clamp(1.0 + m00 - m11 - m22, min=1e-8))
+    q_y = 0.5 * torch.sqrt(torch.clamp(1.0 - m00 + m11 - m22, min=1e-8))
+    q_z = 0.5 * torch.sqrt(torch.clamp(1.0 - m00 - m11 + m22, min=1e-8))
+
+    q_x = torch.copysign(q_x, m21 - m12)
+    q_y = torch.copysign(q_y, m02 - m20)
+    q_z = torch.copysign(q_z, m10 - m01)
+
+    return torch.stack([q_w, q_x, q_y, q_z], dim=-1)

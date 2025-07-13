@@ -857,6 +857,9 @@ class AdaptiveStrategy(DefaultStrategy):
         td_errors = (rewards - gauss_values).abs().detach().cpu().numpy()
         state["replay_buffer"].update_priorities(tree_idxs, td_errors)
 
+        if self.verbose:
+            print(f"Step {state['step']}: PPO Loss: {loss.item():.4f}")
+
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> Tuple[int, int, int, int, int]:
         initial_num_gaussians = len(params["means"])

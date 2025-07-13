@@ -52,11 +52,6 @@ class TemporalGaussianGNN(nn.Module):
         return self.norm2(motion_context), updated_history
 
 class HierarchicalActorCritic(nn.Module):
-    """
-    An Actor-Critic module that makes decisions on two scales: coarse regions and fine Gaussians.
-    It uses Transformer encoders for both levels and a cross-attention mechanism to allow
-    region-level decisions to inform Gaussian-level decisions.
-    """
     def __init__(self, feature_dim: int, hidden_dim: int, action_dim: int = 6, continuous_dim: int = 9):
         super().__init__()
         region_encoder_layer = nn.TransformerEncoderLayer(d_model=feature_dim, nhead=4, dim_feedforward=hidden_dim, batch_first=True)
@@ -95,10 +90,12 @@ class HierarchicalActorCritic(nn.Module):
         gaussian_action_logits = self.gaussian_actor_discrete_head(gaussian_features_encoded)
 
         continuous_params = self.gaussian_actor_continuous_head(gaussian_features_encoded)
+
         split_ratio = 1.2 + 2.0 * torch.sigmoid(continuous_params[:, 0])
         dupe_offset_mag = torch.sigmoid(continuous_params[:, 1])
         split_dir = F.normalize(continuous_params[:, 2:5], dim=-1)
         dupe_dir = F.normalize(continuous_params[:, 5:8], dim=-1)
+
         processed_continuous_params = torch.cat([
             split_ratio.unsqueeze(-1), dupe_offset_mag.unsqueeze(-1), split_dir, dupe_dir
         ], dim=-1)
@@ -204,7 +201,8 @@ class AdaptiveStrategy(DefaultStrategy):
     ac_net: Any = field(default=None, repr=False)
     icm_module: Any = field(default=None, repr=False)
 
-    optimizer: Any = field(default=None, repr=False)
+    ac_optimizer: Any = field(default=None, repr=False)
+    gnn_optimizer: Any = field(default=None, repr=False)
     icm_optimizer: Any = field(default=None, repr=False)
 
     rasterizer_fn: Any = field(default=None, repr=False)
@@ -273,8 +271,11 @@ class AdaptiveStrategy(DefaultStrategy):
             hidden_dim=self.ac_hidden_dim,
         ).to(device)
 
-        unified_params = list(self.gnn_net.parameters()) + list(self.ac_net.parameters())
-        self.optimizer = torch.optim.AdamW(unified_params, lr=1e-4, weight_decay=1e-5)
+        ac_params = list(self.ac_net.parameters())
+        self.ac_optimizer = torch.optim.AdamW(ac_params, lr=1e-4, weight_decay=1e-5)
+
+        gnn_params = list(self.gnn_net.parameters())
+        self.gnn_optimizer = torch.optim.AdamW(gnn_params, lr=1e-4, weight_decay=1e-5)
 
         # if self.use_curiosity:
         #     self.icm_module = ICMModule(
@@ -776,7 +777,7 @@ class AdaptiveStrategy(DefaultStrategy):
         rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0, neginf=-1.0)
         rewards = torch.clamp(rewards, -5.0, 5.0)
 
-        (gauss_logits, gauss_values, _, _,
+        (gauss_logits, gauss_values, new_continuous_params, _,
          region_logits, region_values) = self.ac_net(motion_features, region_features, region_assignments)
 
         gauss_advantage = rewards - gauss_values.detach()
@@ -811,17 +812,34 @@ class AdaptiveStrategy(DefaultStrategy):
         total_loss_unreduced = (actor_loss_gauss + critic_loss_gauss + entropy_loss_gauss +
                                 self.region_loss_weight * (actor_loss_region + critic_loss_region + entropy_loss_region))
 
+        sampled_continuous_params = sampled_td.get("continuous_params")
+
+        is_continuous_action: Tensor = (gauss_actions == 1) | (gauss_actions == 2)
+
+        if is_continuous_action.any():
+            continuous_loss = F.mse_loss(
+                new_continuous_params[is_continuous_action],
+                sampled_continuous_params[is_continuous_action],
+                reduction="none"
+            ).mean(dim=-1)
+
+            weighted_continuous_loss = - (continuous_loss * gauss_advantage.detach()[is_continuous_action])
+
+            total_loss_unreduced += self.continuous_loss_weight * weighted_continuous_loss.mean()
+
         loss = (total_loss_unreduced * is_weights).mean()
 
         if torch.isnan(loss).any():
             print("NaN loss detected, skipping training step to prevent model corruption.")
             return
 
-        self.optimizer.zero_grad()
+        self.ac_optimizer.zero_grad()
+        self.gnn_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
-        self.optimizer.step()
+        self.ac_optimizer.step()
+        self.gnn_optimizer.step()
 
         td_errors = (rewards - gauss_values).abs().detach()
         td_errors = torch.nan_to_num(td_errors, nan=0.0, posinf=1.0, neginf=0.0)
@@ -836,7 +854,9 @@ class AdaptiveStrategy(DefaultStrategy):
                   f"Entropy Loss = {entropy_loss_gauss.mean().item():.4f}, "
                   f"Region Actor Loss = {actor_loss_region.mean().item():.4f}, "
                   f"Region Critic Loss = {critic_loss_region.mean().item():.4f}, "
-                  f"Region Entropy Loss = {entropy_loss_region.mean().item():.4f}, ")
+                  f"Region Entropy Loss = {entropy_loss_region.mean().item():.4f}, "
+                    f"Continuous Loss = {weighted_continuous_loss.mean().item() if is_continuous_action.any() else 0.0:.4f}")
+
 
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> Tuple[int, int, int, int, int]:
@@ -868,7 +888,12 @@ class AdaptiveStrategy(DefaultStrategy):
         high_uncertainty_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=device)
         high_uncertainty_mask[valid_proj] = state["geom_uncertainty_map"][py[valid_proj], px[valid_proj]] > self.geom_uncertainty_thresh
 
-        subset_mask = (candidates_by_grad | low_quality_mask | high_uncertainty_mask)
+        if state.get("age") is not None:
+            age_mask = state["age"] < 300
+        else:
+            age_mask = torch.zeros_like(params["means"], dtype=torch.bool, device=device)
+
+        subset_mask = (candidates_by_grad | low_quality_mask | high_uncertainty_mask | age_mask)
 
         num_candidates = subset_mask.sum().item()
         if num_candidates == 0: return 0, 0, 0, 0, 0
@@ -938,6 +963,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 "initial_quality": initial_quality.detach(),
                 "initial_uncertainty": initial_uncertainty.detach(),
                 "initial_detail_error": initial_detail_error.detach(),
+                "continuous_params": continuous_params[i].detach(),
                 "px": px_sub[i], "py": py_sub[i], "ptx": ptx_sub[i], "pty": pty_sub[i]
             }
             state["hindsight_buffer"].append(exp)
@@ -946,6 +972,7 @@ class AdaptiveStrategy(DefaultStrategy):
         significance = state["significance"][original_subset_indices]
         scales_mag = torch.exp(params["scales"][original_subset_indices]).norm(dim=-1)
         opacities = torch.sigmoid(params["opacities"][original_subset_indices])
+
 
         prune_merge_veto_mask = (
                 (age_in_steps < self.prune_age_threshold) |

@@ -944,7 +944,6 @@ class AdaptiveStrategy(DefaultStrategy):
         px_sub, py_sub, ptx_sub, pty_sub = coords
         for i in range(len(original_subset_indices)):
             if not valid_mask_subset[i]:
-                print(f"Skipping Gaussian {i+1} due to invalid projection.")
                 continue
 
             print(f"Processing Gaussian {i+1}/{len(original_subset_indices)}...")

@@ -998,30 +998,30 @@ class AdaptiveStrategy(DefaultStrategy):
             }
             state["hindsight_buffer"].append(exp)
 
-        region_decision_for_each_gaussian = region_actions[region_assignments]
-        stable_mask = (region_decision_for_each_gaussian == 0)
-        final_actions[stable_mask & (final_actions != 5)] = 0
+        # region_decision_for_each_gaussian = region_actions[region_assignments]
+        # stable_mask = (region_decision_for_each_gaussian == 0)
+        # final_actions[stable_mask & (final_actions != 5)] = 0
+        #
+        # refine_mask = (region_decision_for_each_gaussian == 1)
+        # final_actions[refine_mask & ((final_actions == 3) | (final_actions == 4))] = 0
+        #
+        # prune_mask = (region_decision_for_each_gaussian == 2)
+        # final_actions[prune_mask & ((final_actions == 1) | (final_actions == 2))] = 0
 
-        refine_mask = (region_decision_for_each_gaussian == 1)
-        final_actions[refine_mask & ((final_actions == 3) | (final_actions == 4))] = 0
+        # age_in_steps = state["age"][original_subset_indices]
+        # significance = state["significance"][original_subset_indices]
+        # scales_mag = torch.exp(params["scales"][original_subset_indices]).norm(dim=-1)
+        # opacities = torch.sigmoid(params["opacities"][original_subset_indices])
+        #
+        # prune_merge_veto_mask = (
+        #         (age_in_steps < self.prune_age_threshold) |
+        #         (significance > self.prune_significance_threshold) |
+        #         (opacities > self.prune_opa) |
+        #         (scales_mag > self.prune_scale3d * state["scene_scale"])
+        # )
 
-        prune_mask = (region_decision_for_each_gaussian == 2)
-        final_actions[prune_mask & ((final_actions == 1) | (final_actions == 2))] = 0
-
-        age_in_steps = state["age"][original_subset_indices]
-        significance = state["significance"][original_subset_indices]
-        scales_mag = torch.exp(params["scales"][original_subset_indices]).norm(dim=-1)
-        opacities = torch.sigmoid(params["opacities"][original_subset_indices])
-
-        prune_merge_veto_mask = (
-                (age_in_steps < self.prune_age_threshold) |
-                (significance > self.prune_significance_threshold) |
-                (opacities > self.prune_opa) |
-                (scales_mag > self.prune_scale3d * state["scene_scale"])
-        )
-
-        final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
-        final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
+        # final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
+        # final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
 
         final_finetune_mask_subset = (final_actions == 5) # Finetune action
         final_prune_mask_subset = (final_actions == 4) # Prune action
@@ -1083,11 +1083,11 @@ class AdaptiveStrategy(DefaultStrategy):
 
         n_split = global_split_mask.sum().item()
         if n_split > 0:
-            split(params, optimizers, state_to_modify, global_split_mask,
-                  split_ratios=split_continuous_params[:, 0],
-                  directions=split_continuous_params[:, 2:5],
-                  lr_multipliers=lr_multipliers[final_split_mask_subset],
-                  warmup_steps=self.meta_lr_warmup_steps)
+            split(params, optimizers, state_to_modify, global_split_mask)
+                  # split_ratios=split_continuous_params[:, 0],
+                  # directions=split_continuous_params[:, 2:5],
+                  # lr_multipliers=lr_multipliers[final_split_mask_subset],
+                  # warmup_steps=self.meta_lr_warmup_steps)
         num_gaussians_post_split = len(params["means"])
 
         # D. DUPLICATE
@@ -1127,9 +1127,9 @@ class AdaptiveStrategy(DefaultStrategy):
                     dupe_dirs = final_dupe_params[:, 5:8]
                     offset_magnitudes = dupe_scales.max(dim=-1).values * offset_mags
                     duplication_offsets = dupe_dirs * offset_magnitudes.unsqueeze(-1)
-                    duplicate(params, optimizers, state_to_modify, global_dupe_mask, offsets=duplication_offsets,
-                              lr_multipliers=lr_multipliers[final_dupe_mask_subset],
-                              warmup_steps=self.meta_lr_warmup_steps)
+                    duplicate(params, optimizers, state_to_modify, global_dupe_mask) # offsets=duplication_offsets,
+                              # lr_multipliers=lr_multipliers[final_dupe_mask_subset],
+                              # warmup_steps=self.meta_lr_warmup_steps)
 
         state.update(state_to_modify)
         if n_dupli > 0: state["age"][-n_dupli:] = 0

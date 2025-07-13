@@ -124,7 +124,8 @@ class PatchBasedNRQM(nn.Module):
     def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
         if self.model_name == "brisque":
             scores = self.model(image_patches)
-            return scores.view(scores.shape[0])
+            # return scores.view(scores.shape[0])
+            return scores
         elif self.model_name == "clipiqa":
             scores = self.model(image_patches)
             return -scores.view(scores.shape[0])
@@ -764,22 +765,43 @@ class AdaptiveStrategy(DefaultStrategy):
 
         self.gnn_net.train()
         self.ac_net.train()
-        device = next(self.ac_net.parameters()).device
+        if self.use_curiosity:
+            self.icm_module.train()
 
+        device = next(self.ac_net.parameters()).device
         batch, tree_idxs, is_weights = state["densify_replay_buffer"].sample(256)
         is_weights = torch.tensor(is_weights, device=device, dtype=torch.float32)
 
-        ac_inputs = torch.stack([x[0] for x in batch]).to(device)
+        states = torch.stack([x[0] for x in batch]).to(device)
         actions_taken = torch.tensor([x[1] for x in batch], device=device, dtype=torch.int64)
-        rewards = torch.stack([x[2] for x in batch]).to(device)
+        extrinsic_rewards = torch.stack([x[2] for x in batch]).to(device)
         old_log_probs = torch.stack([x[3] for x in batch]).to(device)
 
-        action_logits, predicted_values, _ = self.ac_net(ac_inputs)
+        total_reward = extrinsic_rewards
 
-        advantage = rewards - predicted_values.detach()
+        if self.use_curiosity:
+            next_states = torch.roll(states, -1, dims=0)
+            actions_one_hot = F.one_hot(actions_taken, num_classes=self.icm_action_dim).float()
+
+            pred_next_state, pred_action_logits = self.icm_module(states, next_states, actions_one_hot)
+
+            forward_loss = F.mse_loss(pred_next_state, next_states.detach())
+            inverse_loss = F.cross_entropy(pred_action_logits, actions_taken.detach())
+            icm_loss = forward_loss + inverse_loss
+
+            self.icm_optimizer.zero_grad()
+            icm_loss.backward()
+            self.icm_optimizer.step()
+
+            intrinsic_reward = F.mse_loss(pred_next_state.detach(), next_states.detach(), reduction='none').mean(dim=-1)
+            norm_intrinsic_reward = (intrinsic_reward - intrinsic_reward.mean()) / (intrinsic_reward.std() + 1e-8)
+            total_reward = extrinsic_rewards + self.curiosity_weight * norm_intrinsic_reward
+
+        action_logits, predicted_values, _ = self.ac_net(states)
+        advantage = total_reward - predicted_values.detach()
         advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
-        critic_loss_unreduced = F.mse_loss(predicted_values, rewards, reduction="none")
+        critic_loss_unreduced = F.mse_loss(predicted_values, total_reward, reduction="none")
 
         new_dist = Categorical(logits=action_logits)
         new_log_probs = new_dist.log_prob(actions_taken)
@@ -788,7 +810,6 @@ class AdaptiveStrategy(DefaultStrategy):
         surr1 = ratio * advantage
         surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantage
         actor_loss_unreduced = -torch.min(surr1, surr2)
-
         entropy_loss_unreduced = -self.entropy_loss_weight * new_dist.entropy()
 
         total_loss_unreduced = (
@@ -805,7 +826,7 @@ class AdaptiveStrategy(DefaultStrategy):
         torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
         self.densify_optimizer.step()
 
-        td_errors = (rewards - predicted_values).abs().detach().cpu().numpy()
+        td_errors = (total_reward - predicted_values).abs().detach().cpu().numpy()
         state["densify_replay_buffer"].update_priorities(tree_idxs, td_errors)
 
     def _train_pruning_agent(self, state: dict[str, Any]):
@@ -824,7 +845,6 @@ class AdaptiveStrategy(DefaultStrategy):
         old_log_probs = torch.stack([x[3] for x in batch]).to(device)
 
         action_logits, predicted_values = self.pruning_ac_net(ac_inputs)
-
         advantage = rewards - predicted_values.detach()
         advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
@@ -837,7 +857,6 @@ class AdaptiveStrategy(DefaultStrategy):
         surr1 = ratio * advantage
         surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantage
         actor_loss_unreduced = -torch.min(surr1, surr2)
-
         entropy_loss_unreduced = -self.entropy_loss_weight * new_dist.entropy()
 
         total_loss_unreduced = (

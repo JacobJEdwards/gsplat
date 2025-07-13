@@ -369,6 +369,7 @@ class PrioritizedReplayBuffer:
 
     def update_priorities(self, tree_idxs: np.ndarray, td_errors: np.ndarray):
         priorities = (np.abs(td_errors) + self.epsilon) ** self.alpha
+        priorities = np.clip(priorities, a_min=1e-6, a_max=self.max_priority)
         self.max_priority = max(self.max_priority, np.max(priorities))
         for i, idx in enumerate(tree_idxs):
             self.tree.update(int(idx), priorities[i])

@@ -854,7 +854,7 @@ class AdaptiveStrategy(DefaultStrategy):
         low_quality_mask[valid_proj] = state["quality_heatmap"][pty[valid_proj], ptx[valid_proj]] < self.nrqm_stagnation_threshold
 
         high_uncertainty_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=device)
-        high_uncertainty_mask[valid_proj] = state["geom_uncertainty_map"][py[valid_proj], px[valid_proj]] > self.geom_uncertainty_thresh
+        # high_uncertainty_mask[valid_proj] = state["geom_uncertainty_map"][py[valid_proj], px[valid_proj]] > self.geom_uncertainty_thresh
 
         if state.get("age") is not None:
             age_mask = state["age"] < 300

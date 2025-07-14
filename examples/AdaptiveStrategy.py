@@ -69,6 +69,7 @@ class SimplifiedAdaptiveStrategy(DefaultStrategy):
         self.optimizer = torch.optim.AdamW(self.q_net.parameters(), lr=self.learning_rate)
         print("Initialized Action-Value (Q-Learning) Network.")
 
+
     def step_post_backward(
             self, params: dict, optimizers: dict, state: dict, step: int, info: dict, **kwargs
     ) -> None:
@@ -94,6 +95,7 @@ class SimplifiedAdaptiveStrategy(DefaultStrategy):
         if step % self.reset_every == 0 and step > 0:
             reset_opa(params, optimizers, state, self.prune_opa * 2.0)
 
+
     @torch.no_grad()
     def _get_simplified_features(self, params: dict, state: dict, subset_mask: Tensor) -> Tensor:
         n_subset = subset_mask.sum()
@@ -113,6 +115,7 @@ class SimplifiedAdaptiveStrategy(DefaultStrategy):
             features[:, 4] = dists / state["scene_scale"]
 
         return torch.nan_to_num(features, 0.0)
+
 
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> None:
@@ -182,6 +185,7 @@ class SimplifiedAdaptiveStrategy(DefaultStrategy):
             split(params, optimizers, state_to_modify, global_split_mask)
             state_to_modify["age"][-n_split:] = 0
 
+
     def _process_rewards(self, state: dict, current_step: int):
         while state["reward_queue"] and (current_step - state["reward_queue"][0]["step"]) >= self.reward_delay:
             exp = state["reward_queue"].popleft()
@@ -221,3 +225,5 @@ class SimplifiedAdaptiveStrategy(DefaultStrategy):
 
         if self.verbose:
             print(f"Agent trained at step {state.get('step', -1)}: Reward Prediction Loss (MSE) = {loss.item():.4f}")
+
+        self.writer.add_scalar("train/loss", loss.item(), state["step"])

@@ -105,7 +105,10 @@ class AdaptiveStrategy(DefaultStrategy):
         self._process_rewards(state, step)
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
-            self._update_geometry(params, optimizers, state, step)
+            n_prune, n_split, n_duplicate = self._update_geometry(params, optimizers, state, step)
+            if self.verbose:
+                print(f"Step {step}: Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}. Now "
+                      f"{len(params['means'])} Gs.")
 
         if step > self.refine_start_iter and step % self.learn_every == 0:
             self._train_agent(state)
@@ -152,14 +155,14 @@ class AdaptiveStrategy(DefaultStrategy):
 
 
     @torch.no_grad()
-    def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> None:
+    def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> tuple[int, int, int]:
         device = params["means"].device
 
         normalized_grads = state["grad2d"] / state["count"].clamp_min(1.0)
         candidate_mask = normalized_grads > self.grow_grad2d
 
         if candidate_mask.sum() == 0:
-            return
+            return 0,0,0
 
         if candidate_mask.sum() > self.max_densification_subset:
             candidate_indices = torch.where(candidate_mask)[0]
@@ -206,7 +209,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
         global_prune_mask = torch.zeros(params["means"].shape[0], dtype=torch.bool, device=device)
         global_prune_mask[original_indices[prune_mask_subset]] = True
-        if global_prune_mask.sum() > 0:
+        n_prune = global_prune_mask.sum().item()
+        if n_prune > 0:
             remove(params, optimizers, state_to_modify, global_prune_mask)
 
         split_mask_subset = (actions == 2)
@@ -226,18 +230,22 @@ class AdaptiveStrategy(DefaultStrategy):
 
         global_duplicate_mask = torch.zeros(params["means"].shape[0], dtype=torch.bool, device=device)
         global_duplicate_mask[remapped_duplicate_indices[valid_duplicate_mask]] = True
+        n_split = global_split_mask.sum().item()
 
-        if global_split_mask.sum() > 0:
+        if n_split > 0:
             n_split = global_split_mask.sum().item()
             split(params, optimizers, state_to_modify, global_split_mask)
             state_to_modify["age"][-n_split:] = 0
 
-        if global_duplicate_mask.sum() > 0:
+        n_duplicate = global_duplicate_mask.sum().item()
+        if n_duplicate > 0:
             n_duplicate = global_duplicate_mask.sum().item()
             duplicate(params, optimizers, state_to_modify, global_duplicate_mask)
             state_to_modify["age"][-n_duplicate:] = 0
 
         state.update(state_to_modify)
+
+        return n_prune, n_split, n_duplicate
 
 
     def _process_rewards(self, state: dict, current_step: int):

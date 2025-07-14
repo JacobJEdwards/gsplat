@@ -593,7 +593,9 @@ class AdaptiveStrategy(DefaultStrategy):
         main_novel_camtoworld = novel_camtoworlds[0].unsqueeze(0)
         main_novel_K = novel_Ks[0].unsqueeze(0)
 
-        view_matrix = torch.inverse(main_novel_camtoworld)
+        previous_cam = info["camtoworlds"][0].unsqueeze(0)
+
+        view_matrix = torch.inverse(previous_cam)
         state["view_matrix"] = view_matrix[0]
 
         fx, fy = main_novel_K[0, 0, 0], main_novel_K[0, 1, 1]

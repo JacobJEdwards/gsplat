@@ -197,7 +197,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     anisotropic_split: bool = True
 
-    use_geom_uncertainty: bool = True
+    use_geom_uncertainty: bool = False
     num_uncertainty_views: int = 5
     geom_uncertainty_thresh: float = 0.05
 
@@ -301,8 +301,8 @@ class AdaptiveStrategy(DefaultStrategy):
         if valid_indices.numel() > 0:
             features[valid_indices, 5] = state["l1_loss_map"][pixel_coords_y[valid_indices], pixel_coords_x[
                 valid_indices]]
-            if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
-                features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+            # if self.use_geom_uncertainty and state.get("geom_uncertainty_map") is not None:
+            #     features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
             if state.get("quality_heatmap") is not None:
                 features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
             # if state.get("detail_error_map") is not None:
@@ -702,7 +702,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
             if state.get("l1_loss_map") is None or \
                     state.get("quality_heatmap") is None or \
-                    state.get("geom_uncertainty_map") is None \
+                    (state.get("geom_uncertainty_map") is None and self.use_geom_uncertainty) \
                     or state.get("detail_error_map") is None:
                 print("Skipping hindsight processing due to missing maps.")
                 continue
@@ -716,8 +716,8 @@ class AdaptiveStrategy(DefaultStrategy):
             current_quality = state["quality_heatmap"][pty, ptx]
             reward_quality = exp["initial_quality"] - current_quality
 
-            current_uncertainty = state["geom_uncertainty_map"][py, px]
-            reward_uncertainty = exp["initial_uncertainty"] - current_uncertainty
+            # current_uncertainty = state["geom_uncertainty_map"][py, px]
+            # reward_uncertainty = exp["initial_uncertainty"] - current_uncertainty
 
             current_detail_error = state["detail_error_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
             reward_detail = exp["initial_detail_error"] - current_detail_error

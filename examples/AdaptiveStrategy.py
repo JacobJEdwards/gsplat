@@ -690,13 +690,13 @@ class AdaptiveStrategy(DefaultStrategy):
             shaped_reward = 0.0
 
             action = exp["gaussian_action"]
-            initial_uncertainty = exp["initial_uncertainty"]
+            # initial_uncertainty = exp["initial_uncertainty"]
 
-            if initial_uncertainty > self.geom_uncertainty_thresh:
-                if action == 1 or action == 2:
-                    shaped_reward += 0.05
-                elif action == 0:
-                    shaped_reward -= 0.02
+            # if initial_uncertainty > self.geom_uncertainty_thresh:
+            #     if action == 1 or action == 2:
+            #         shaped_reward += 0.05
+            #     elif action == 0:
+            #         shaped_reward -= 0.02
 
             action = exp["gaussian_action"]
             initial_error = exp["initial_error"]
@@ -709,6 +709,14 @@ class AdaptiveStrategy(DefaultStrategy):
                         initial_quality < self.stable_quality_threshold:
                     stability_bonus = self.stability_reward_bonus * (1.0 - initial_error / self.stable_error_threshold)
                     final_reward += stability_bonus
+
+            rewards_stats = {
+                'mean': base_reward.mean().item(),
+                'std': base_reward.std().item(),
+                'min': base_reward.min().item(),
+                'max': base_reward.max().item()
+            }
+            print(f"Reward stats: {rewards_stats}")
 
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
                 experience_tensordict = TensorDict({
@@ -916,7 +924,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
             initial_error = state["l1_loss_map"][max(0, py_sub[i]-2):py_sub[i]+3, max(0, px_sub[i]-2):px_sub[i]+3].mean()
             initial_quality = state["quality_heatmap"][pty_sub[i], ptx_sub[i]]
-            initial_uncertainty = state["geom_uncertainty_map"][py_sub[i], px_sub[i]]
+            # initial_uncertainty = state["geom_uncertainty_map"][py_sub[i], px_sub[i]]
             initial_detail_error = state["detail_error_map"][max(0, py_sub[i]-2):py_sub[i]+3, max(0, px_sub[i]-2):px_sub[i]+3].mean()
 
             region_idx = region_assignments[i]
@@ -930,7 +938,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 "gaussian_log_prob": gauss_log_probs[i].detach(),
                 "initial_error": initial_error.detach(),
                 "initial_quality": initial_quality.detach(),
-                "initial_uncertainty": initial_uncertainty.detach(),
+                # "initial_uncertainty": initial_uncertainty.detach(),
                 "initial_detail_error": initial_detail_error.detach(),
                 "continuous_params": continuous_params[i].detach(),
                 "px": px_sub[i], "py": py_sub[i], "ptx": ptx_sub[i], "pty": pty_sub[i]

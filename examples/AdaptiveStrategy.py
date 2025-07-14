@@ -198,7 +198,7 @@ class AdaptiveStrategy(DefaultStrategy):
     anisotropic_split: bool = True
 
     use_geom_uncertainty: bool = False
-    num_uncertainty_views: int = 5
+    num_uncertainty_views: int = 3
     geom_uncertainty_thresh: float = 0.05
 
     continuous_loss_weight: float = 1.0

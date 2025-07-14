@@ -152,7 +152,7 @@ class AdaptiveStrategy(DefaultStrategy):
     bootstrap_steps: int = 0
 
     learn_every: int = 200
-    hindsight_delay: int = 100
+    hindsight_delay: int = 5
     actor_loss_weight: float = 1.0
     entropy_loss_weight: float = 0.1
 
@@ -725,7 +725,7 @@ class AdaptiveStrategy(DefaultStrategy):
             #                self.w_quality * reward_quality +
             #                self.w_uncertainty * reward_uncertainty)
             # base_reward = exp["initial_error"] - current_error
-            base_reward = reward_detail
+            base_reward = reward_photo
 
             action = exp["gaussian_action"]
             initial_error = exp["initial_error"]
@@ -824,23 +824,24 @@ class AdaptiveStrategy(DefaultStrategy):
         critic_loss_region = F.mse_loss(region_values, rewards, reduction="none")
         entropy_loss_region = -self.region_entropy_weight * new_region_dist.entropy()
 
-        total_loss_unreduced = (actor_loss_gauss + critic_loss_gauss + entropy_loss_gauss +
-                                self.region_loss_weight * (actor_loss_region + critic_loss_region + entropy_loss_region))
+        total_loss_unreduced = (actor_loss_gauss + critic_loss_gauss + entropy_loss_gauss)
+                                # self.region_loss_weight * (actor_loss_region + critic_loss_region + entropy_loss_region))
 
         sampled_continuous_params = sampled_td.get("continuous_params")
 
         is_continuous_action: Tensor = (gauss_actions == 1) | (gauss_actions == 2)
 
         if is_continuous_action.any():
-            continuous_loss = F.mse_loss(
-                new_continuous_params[is_continuous_action],
-                sampled_continuous_params[is_continuous_action],
-                reduction="none"
-            ).mean(dim=-1)
-
-            weighted_continuous_loss = - (continuous_loss * gauss_advantage.detach()[is_continuous_action])
-
-            total_loss_unreduced += self.continuous_loss_weight * weighted_continuous_loss.mean()
+            # continuous_loss = F.mse_loss(
+            #     new_continuous_params[is_continuous_action],
+            #     sampled_continuous_params[is_continuous_action],
+            #     reduction="none"
+            # ).mean(dim=-1)
+            #
+            # weighted_continuous_loss = - (continuous_loss * gauss_advantage.detach()[is_continuous_action])
+            #
+            # total_loss_unreduced += self.continuous_loss_weight * weighted_continuous_loss.mean()
+            pass
 
         loss = (total_loss_unreduced * is_weights).mean()
 
@@ -867,19 +868,19 @@ class AdaptiveStrategy(DefaultStrategy):
             print(f"Agent trained: Loss = {loss.item():.4f}, Actor Loss = {actor_loss_gauss.mean().item():.4f}, "
                   f"Critic Loss = {critic_loss_gauss.mean().item():.4f}, "
                   f"Entropy Loss = {entropy_loss_gauss.mean().item():.4f}, "
-                  f"Region Actor Loss = {actor_loss_region.mean().item():.4f}, "
-                  f"Region Critic Loss = {critic_loss_region.mean().item():.4f}, "
-                  f"Region Entropy Loss = {entropy_loss_region.mean().item():.4f}, "
-                    f"Continuous Loss = {weighted_continuous_loss.mean().item() if is_continuous_action.any() else 0.0:.4f}")
+                  # f"Region Actor Loss = {actor_loss_region.mean().item():.4f}, "
+                  # f"Region Critic Loss = {critic_loss_region.mean().item():.4f}, "
+                  # f"Region Entropy Loss = {entropy_loss_region.mean().item():.4f}, "
+                    # f"Continuous Loss = {weighted_continuous_loss.mean().item() if is_continuous_action.any() else 0.0:.4f}")
 
         self.writer.add_scalar("agent/loss", loss.item(), state["step"])
         self.writer.add_scalar("agent/actor_loss", actor_loss_gauss.mean().item(), state["step"])
         self.writer.add_scalar("agent/critic_loss", critic_loss_gauss.mean().item(), state["step"])
         self.writer.add_scalar("agent/entropy_loss", entropy_loss_gauss.mean().item(), state["step"])
-        self.writer.add_scalar("agent/region_actor_loss", actor_loss_region.mean().item(), state["step"])
-        self.writer.add_scalar("agent/region_critic_loss", critic_loss_region.mean().item(), state["step"])
-        self.writer.add_scalar("agent/region_entropy_loss", entropy_loss_region.mean().item(), state["step"])
-        self.writer.add_scalar("agent/continuous_loss", weighted_continuous_loss.mean().item() if is_continuous_action.any() else 0.0, state["step"])
+        # self.writer.add_scalar("agent/region_actor_loss", actor_loss_region.mean().item(), state["step"])
+        # self.writer.add_scalar("agent/region_critic_loss", critic_loss_region.mean().item(), state["step"])
+        # self.writer.add_scalar("agent/region_entropy_loss", entropy_loss_region.mean().item(), state["step"])
+        # self.writer.add_scalar("agent/continuous_loss", weighted_continuous_loss.mean().item() if is_continuous_action.any() else 0.0, state["step"])
 
 
     @torch.no_grad()

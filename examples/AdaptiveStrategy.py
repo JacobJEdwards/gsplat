@@ -105,26 +105,6 @@ class HierarchicalActorCritic(nn.Module):
                 region_action_logits, region_values)
 
 
-class ICMModule(nn.Module):
-    """Intrinsic Curiosity Module to encourage exploration."""
-    def __init__(self, feature_dim: int, action_dim: int, mlp_width: int = 64):
-        super().__init__()
-        # s_t, s_{t+1} -> a_t
-        self.inverse_model = nn.Sequential(
-            nn.Linear(feature_dim * 2, mlp_width), nn.SELU(),
-            nn.Linear(mlp_width, action_dim)
-        )
-        # s_t, a_t -> s_{t+1}
-        self.forward_model = nn.Sequential(
-            nn.Linear(feature_dim + action_dim, mlp_width), nn.SELU(),
-            nn.Linear(mlp_width, feature_dim)
-        )
-
-    def forward(self, state, next_state, action_one_hot):
-        pred_next_state = self.forward_model(torch.cat([state, action_one_hot], dim=-1))
-        pred_action_logits = self.inverse_model(torch.cat([state, next_state], dim=-1))
-        return pred_next_state, pred_action_logits
-
 class PatchBasedNRQM(nn.Module):
     def __init__(self, model_name: str = "brisque"):
         super().__init__()
@@ -178,7 +158,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     start_exploration_epsilon: float = 0.3
     end_exploration_epsilon: float = 0.05
-    exploration_decay_steps: int = 15000
+    exploration_decay_steps: int = 5000
 
     prune_age_threshold: int = 1000
     prune_significance_threshold: float = 0.01

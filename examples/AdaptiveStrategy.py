@@ -152,7 +152,7 @@ class AdaptiveStrategy(DefaultStrategy):
     learn_every: int = 200
     hindsight_delay: int = 300
     actor_loss_weight: float = 1.0
-    entropy_loss_weight: float = 0.1
+    entropy_loss_weight: float = 0.3
 
     start_exploration_epsilon: float = 0.3
     end_exploration_epsilon: float = 0.05
@@ -178,6 +178,8 @@ class AdaptiveStrategy(DefaultStrategy):
     stability_reward_bonus: float = 0.05
 
     ppo_clip_epsilon: float = 0.2
+
+    max_kl_div_threshold: float = 0.05
     gnn_net: Any = field(default=None, repr=False)
     ac_net: Any = field(default=None, repr=False)
     icm_module: Any = field(default=None, repr=False)
@@ -679,13 +681,13 @@ class AdaptiveStrategy(DefaultStrategy):
             # base_reward = exp["initial_error"] - current_error
 
             if exp["gaussian_action"] == 0:  # No action
-                base_reward = reward_photo
+                base_reward = reward_quality
             elif exp["gaussian_action"] in [1, 2]:
-                base_reward = reward_photo * 2.0
+                base_reward = reward_quality
             elif exp["gaussian_action"] == 4:
-                base_reward = reward_photo + (0.1 if exp["initial_error"] < self.stable_error_threshold else -0.1)
+                base_reward = reward_quality + (0.1 if exp["initial_error"] < self.stable_error_threshold else -0.1)
             else:
-                base_reward = reward_photo
+                base_reward = reward_quality
 
             shaped_reward = 0.0
 
@@ -702,21 +704,13 @@ class AdaptiveStrategy(DefaultStrategy):
             initial_error = exp["initial_error"]
             initial_quality = exp["initial_quality"]
 
-            final_reward = torch.tanh(base_reward * 10.0)
+            final_reward = torch.tanh(base_reward * 2.0)
 
             if action == 0:
                 if initial_error < self.stable_error_threshold and \
                         initial_quality < self.stable_quality_threshold:
                     stability_bonus = self.stability_reward_bonus * (1.0 - initial_error / self.stable_error_threshold)
                     final_reward += stability_bonus
-
-            rewards_stats = {
-                'mean': base_reward.mean().item(),
-                'std': base_reward.std().item(),
-                'min': base_reward.min().item(),
-                'max': base_reward.max().item()
-            }
-            print(f"Reward stats: {rewards_stats}")
 
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
                 experience_tensordict = TensorDict({
@@ -759,13 +753,11 @@ class AdaptiveStrategy(DefaultStrategy):
         rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0, neginf=-1.0)
         rewards = torch.clamp(rewards, -2.0, 2.0)
 
+        if rewards.std() > 1e-6:
+            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
+
         (gauss_logits, gauss_values, new_continuous_params, _,
          region_logits, region_values) = self.ac_net(motion_features, region_features, region_assignments)
-
-        if hasattr(state, 'value_baseline'):
-            state['value_baseline'] = 0.99 * state['value_baseline'] + 0.01 * rewards.mean()
-        else:
-            state['value_baseline'] = rewards.mean()
 
         gauss_advantage = rewards - gauss_values.detach()
         gauss_advantage = torch.clamp(gauss_advantage, -5.0, 5.0)
@@ -775,11 +767,25 @@ class AdaptiveStrategy(DefaultStrategy):
 
         new_gauss_dist = Categorical(logits=gauss_logits)
         new_gauss_log_probs = new_gauss_dist.log_prob(gauss_actions)
+
+        with torch.no_grad():
+            log_ratio = new_gauss_log_probs - old_gauss_log_probs
+            approx_kl = torch.exp(log_ratio) - 1 - log_ratio
+            mean_kl = approx_kl.mean()
+
+        if mean_kl > self.max_kl_div_threshold:
+            if self.verbose:
+                print(f"Warning: High KL divergence ({mean_kl.item():.4f} > {self.max_kl_div_threshold}). Skipping training step.")
+            self.writer.add_scalar("agent/skipped_updates_kl", 1, state["step"])
+            return
+        self.writer.add_scalar("agent/skipped_updates_kl", 0, state["step"])
+
         ratio_gauss = torch.exp(new_gauss_log_probs - old_gauss_log_probs)
 
         surr1_gauss = ratio_gauss * gauss_advantage
         surr2_gauss = torch.clamp(ratio_gauss, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * gauss_advantage
         actor_loss_gauss = -torch.min(surr1_gauss, surr2_gauss)
+
         critic_loss_gauss = F.mse_loss(gauss_values, rewards, reduction="none")
         entropy_loss_gauss = -self.entropy_loss_weight * new_gauss_dist.entropy()
 
@@ -833,6 +839,12 @@ class AdaptiveStrategy(DefaultStrategy):
         self.writer.add_scalar("agent/actor_loss", actor_loss_gauss.mean().item(), state["step"])
         self.writer.add_scalar("agent/critic_loss", critic_loss_gauss.mean().item(), state["step"])
         self.writer.add_scalar("agent/entropy_loss", entropy_loss_gauss.mean().item(), state["step"])
+        self.writer.add_scalar("agent/reward_mean", rewards.mean().item(), state["step"])
+        self.writer.add_scalar("agent/reward_std", rewards.std().item(), state["step"])
+        self.writer.add_scalar("agent/advantage_mean", gauss_advantage.mean().item(), state["step"])
+        self.writer.add_scalar("agent/advantage_std", gauss_advantage.std().item(), state["step"])
+        self.writer.add_scalar("agent/mean_kl_div", mean_kl.item(), state["step"])
+
 
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> Tuple[int, int, int, int, int]:

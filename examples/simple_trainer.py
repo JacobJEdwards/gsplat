@@ -1207,7 +1207,6 @@ if __name__ == "__main__":
             Config(
                 strategy=AdaptiveStrategy(
                     verbose=True,
-                    anisotropic_split=True,
                 ),
             ),
         ),

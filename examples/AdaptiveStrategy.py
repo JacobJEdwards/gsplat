@@ -39,7 +39,7 @@ class AdaptiveStrategy(DefaultStrategy):
     refine_every: int = 400
     learn_every: int = 200
 
-    feature_dim: int = 8
+    feature_dim: int = 5
     hidden_dim: int = 64
     action_dim: int = 4  # 0: No-op, 1: Prune, 2: Split, 3: Duplicate
     learning_rate: float = 3e-4
@@ -137,19 +137,19 @@ class AdaptiveStrategy(DefaultStrategy):
         if n_subset > 5:
             means3d_subset = params["means"][subset_mask]
             dists, idxs = knn_with_ids(means3d_subset, K=5 + 1)
-            neighbor_idxs = idxs[:, 1:]
+            # neighbor_idxs = idxs[:, 1:]
 
             features[:, 4] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
 
-            neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
-            neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
-            neighbor_sh0 = params["sh0"][neighbor_idxs].squeeze(-2)
+            # neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
+            # neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
+            # neighbor_sh0 = params["sh0"][neighbor_idxs].squeeze(-2)
+            #
+            # sh0_subset = params["sh0"][subset_mask]
 
-            sh0_subset = params["sh0"][subset_mask]
-
-            features[:, 5] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
-            features[:, 6] = neighbor_opacities.mean(dim=-1)
-            features[:, 7] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
+            # features[:, 5] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
+            # features[:, 6] = neighbor_opacities.mean(dim=-1)
+            # features[:, 7] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
 
         return torch.nan_to_num(features, 0.0)
 

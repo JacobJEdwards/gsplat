@@ -242,7 +242,7 @@ class AdaptiveStrategy(DefaultStrategy):
         return state
 
     def _initialize_learning_components(self, device) -> None:
-        raw_feature_dim = 24
+        raw_feature_dim = 25
         ac_feature_dim = self.gnn_hidden_dim * 2
 
         self.gnn_net = TemporalGaussianGNN(
@@ -286,7 +286,7 @@ class AdaptiveStrategy(DefaultStrategy):
             means3d_subset, state["view_proj_matrix"], h, w
         )
 
-        feature_dim = 24
+        feature_dim = 25
         features = torch.zeros(num_subset, feature_dim, device=device)
 
         opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
@@ -305,12 +305,14 @@ class AdaptiveStrategy(DefaultStrategy):
                 features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
             if state.get("quality_heatmap") is not None:
                 features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
+            if state.get("detail_error_map") is not None:
+                features[valid_indices, 8] = state["detail_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
 
         if self.knn_fn is not None and len(params["means"]) > 5:
             dists, idxs = self.knn_fn(means3d_subset, K=5 + 1)
             neighbor_idxs = idxs[:, 1:]
 
-            features[:, 8] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
+            features[:, 9] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
 
             neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
             neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
@@ -318,35 +320,35 @@ class AdaptiveStrategy(DefaultStrategy):
 
             sh0_subset = params["sh0"][subset_mask]
 
-            features[:, 9] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
-            features[:, 10] = neighbor_opacities.mean(dim=-1)
-            features[:, 11] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
+            features[:, 10] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
+            features[:, 11] = neighbor_opacities.mean(dim=-1)
+            features[:, 12] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
 
-            neighbor_means = params["means"][neighbor_idxs]
-            centered_neighbors = neighbor_means - means3d_subset.unsqueeze(1)
-            cov_neighbors = torch.einsum('nki,nkj->nij', centered_neighbors, centered_neighbors) / (5 - 1)
+            # neighbor_means = params["means"][neighbor_idxs]
+            # centered_neighbors = neighbor_means - means3d_subset.unsqueeze(1)
+            # cov_neighbors = torch.einsum('nki,nkj->nij', centered_neighbors, centered_neighbors) / (5 - 1)
 
-            features[:, 12] = cov_neighbors.mean(dim=(1, 2)).norm(dim=-1) / state["scene_scale"]
-            features[:, 13] = torch.det(cov_neighbors)
+            # features[:, 13] = cov_neighbors.mean(dim=(1, 2)).norm(dim=-1) / state["scene_scale"]
+            # features[:, 13] = torch.det(cov_neighbors)
 
-        current_grad = state["grad2d"][subset_mask] / state["count"][subset_mask].clamp_min(1)
-        features[:, 14] = current_grad
+        # current_grad = state["grad2d"][subset_mask] / state["count"][subset_mask].clamp_min(1)
+        # features[:, 15] = current_grad
 
         if state.get("prev_grad2d") is not None and state.get("prev_opacity") is not None:
             time_delta = self.refine_every
             prev_grad_subset = state["prev_grad2d"][subset_mask]
             prev_opacity_subset = state["prev_opacity"][subset_mask]
 
-            features[:, 15] = (current_grad - prev_grad_subset) / time_delta
-            features[:, 16] = (opacities_subset - prev_opacity_subset) / time_delta
+            # features[:, 16] = (current_grad - prev_grad_subset) / time_delta
+            # features[:, 17] = (opacities_subset - prev_opacity_subset) / time_delta
 
-        if state.get("significance") is not None and state["significance"].numel() == len(subset_mask):
-            features[:, 17] = state["significance"][subset_mask]
+        # if state.get("significance") is not None and state["significance"].numel() == len(subset_mask):
+        #     features[:, 18] = state["significance"][subset_mask]
 
-        features[:, 18] = step / self.refine_stop_iter
+        features[:, 19] = step / self.refine_stop_iter
 
-        if state.get("age") is not None:
-            features[:, 19] = state["age"][subset_mask].float() / self.refine_stop_iter
+        # if state.get("age") is not None:
+        #     features[:, 20] = state["age"][subset_mask].float() / self.refine_stop_iter
 
         view_dirs = F.normalize(means3d_subset - campos, dim=-1)
         quats_subset = F.normalize(params["quats"][subset_mask], dim=-1)
@@ -356,22 +358,22 @@ class AdaptiveStrategy(DefaultStrategy):
         largest_axis = rotmats[torch.arange(num_subset), :, largest_scale_indices]
 
         view_alignment = torch.abs((largest_axis * view_dirs).sum(dim=-1))
-        features[:, 20] = view_alignment
+        features[:, 21] = view_alignment
 
-        if state.get("prev_means") is not None and state["prev_means"].shape == params["means"].shape:
-            mean_velocity = torch.norm(params["means"][subset_mask] - state["prev_means"][subset_mask], dim=-1)
-            features[:, 21] = mean_velocity / state["scene_scale"]
+        # if state.get("prev_means") is not None and state["prev_means"].shape == params["means"].shape:
+        #     mean_velocity = torch.norm(params["means"][subset_mask] - state["prev_means"][subset_mask], dim=-1)
+        #     features[:, 22] = mean_velocity / state["scene_scale"]
 
-        mean_optimizer = optimizers.get("means")
+        # mean_optimizer = optimizers.get("means")
+        #
+        # if mean_optimizer is not None and 'exp_avg_sq' in mean_optimizer.state[params['means']]:
+        #     optimizer_state_mag = torch.norm(mean_optimizer.state[params['means']]['exp_avg_sq'][subset_mask], dim=-1)
+        #     features[:, 23] = torch.log1p(optimizer_state_mag)
 
-        if mean_optimizer is not None and 'exp_avg_sq' in mean_optimizer.state[params['means']]:
-            optimizer_state_mag = torch.norm(mean_optimizer.state[params['means']]['exp_avg_sq'][subset_mask], dim=-1)
-            features[:, 22] = torch.log1p(optimizer_state_mag)
-
-        if valid_indices.numel() > 0:
-            l1_error = state["l1_loss_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
-            max_scale = scales[valid_indices].max(dim=-1).values
-            features[valid_indices, 23] = l1_error * max_scale
+        # if valid_indices.numel() > 0:
+        #     l1_error = state["l1_loss_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+        #     max_scale = scales[valid_indices].max(dim=-1).values
+        #     features[valid_indices, 24] = l1_error * max_scale
 
         return torch.nan_to_num(features, 0.0), (pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y), valid_mask
 

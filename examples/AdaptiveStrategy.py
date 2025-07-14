@@ -867,7 +867,7 @@ class AdaptiveStrategy(DefaultStrategy):
         if self.verbose:
             print(f"Agent trained: Loss = {loss.item():.4f}, Actor Loss = {actor_loss_gauss.mean().item():.4f}, "
                   f"Critic Loss = {critic_loss_gauss.mean().item():.4f}, "
-                  f"Entropy Loss = {entropy_loss_gauss.mean().item():.4f}, "
+                  f"Entropy Loss = {entropy_loss_gauss.mean().item():.4f}, ")
                   # f"Region Actor Loss = {actor_loss_region.mean().item():.4f}, "
                   # f"Region Critic Loss = {critic_loss_region.mean().item():.4f}, "
                   # f"Region Entropy Loss = {entropy_loss_region.mean().item():.4f}, "

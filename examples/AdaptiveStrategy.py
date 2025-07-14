@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.distributions import Categorical
 
-from examples.utils import knn_with_ids
+from utils import knn_with_ids
 from gsplat.strategy.default import DefaultStrategy
 from gsplat.strategy.ops import remove, split, reset_opa
 from tensordict import TensorDict

@@ -24,6 +24,48 @@ from torchrl.data import TensorDictReplayBuffer, RandomSampler
 from torchrl.data.replay_buffers.storages import LazyMemmapStorage
 from tensordict import TensorDict
 
+def create_view_proj_matrix(camtoworld, K, width, height, near=0.1, far=100.0):
+    device = camtoworld.device
+
+    view_matrix = torch.inverse(camtoworld)
+
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    proj_matrix = torch.zeros(4, 4, device=device)
+
+    proj_matrix[0, 0] = 2.0 * fx / width
+    proj_matrix[1, 1] = 2.0 * fy / height
+    proj_matrix[0, 2] = (2.0 * cx - width) / width
+    proj_matrix[1, 2] = (2.0 * cy - height) / height
+    proj_matrix[2, 2] = -(far + near) / (far - near)
+    proj_matrix[2, 3] = -2.0 * far * near / (far - near)
+    proj_matrix[3, 2] = -1.0
+
+    view_proj_matrix = proj_matrix @ view_matrix
+
+    return view_proj_matrix, view_matrix, proj_matrix
+
+def project_points(points_3d, view_proj_matrix, width, height):
+    points_h = F.pad(points_3d, (0, 1), value=1.0)  # [N, 4]
+
+    projected = points_h @ view_proj_matrix.T  # [N, 4]
+
+    w = projected[:, 3]
+    valid_mask = w > 1e-6
+
+    w_safe = torch.where(valid_mask, w, torch.ones_like(w))
+    ndc_coords = projected[:, :3] / w_safe.unsqueeze(-1)  # [N, 3]
+
+    screen_x = (ndc_coords[:, 0] + 1.0) * 0.5 * width
+    screen_y = (ndc_coords[:, 1] + 1.0) * 0.5 * height
+
+    valid_mask = valid_mask & (ndc_coords[:, 0].abs() <= 1.0) & (ndc_coords[:, 1].abs() <= 1.0)
+
+    screen_coords = torch.stack([screen_x, screen_y], dim=-1)
+
+    return screen_coords, valid_mask
+
 class TemporalGaussianGNN(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, edge_dim: int, num_temporal_steps: int = 5):
         super().__init__()
@@ -590,25 +632,16 @@ class AdaptiveStrategy(DefaultStrategy):
                 state["geom_uncertainty_map"] = torch.lerp(
                     geom_uncertainty_map, state["geom_uncertainty_map"], self.nrqm_ema_decay)
 
-        main_novel_camtoworld = novel_camtoworlds[0].unsqueeze(0)
-        main_novel_K = novel_Ks[0].unsqueeze(0)
+        main_camtoworld = info["camtoworlds"][0]
+        main_K = info["Ks"][0]
 
-        previous_cam = info["camtoworlds"][0].unsqueeze(0)
+        view_proj_matrix, view_matrix, proj_matrix = create_view_proj_matrix(
+            main_camtoworld, main_K, width, height
+        )
 
-        view_matrix = torch.inverse(previous_cam)
-        state["view_matrix"] = view_matrix[0]
-
-        fx, fy = main_novel_K[0, 0, 0], main_novel_K[0, 1, 1]
-        cx, cy = main_novel_K[0, 0, 2], main_novel_K[0, 1, 2]
-
-        proj_matrix = torch.zeros(4, 4, device=view_matrix.device)
-        proj_matrix[0, 0] = 2 * fx / width
-        proj_matrix[1, 1] = 2 * fy / height
-        proj_matrix[2, 0] = 1.0 - 2 * cx / width
-        proj_matrix[2, 1] = 1.0 - 2 * cy / height
-        proj_matrix[2, 3] = 1.0
-        proj_matrix[3, 2] = 1.0
-        state["view_proj_matrix"] = view_matrix[0] @ proj_matrix
+        state["view_matrix"] = view_matrix
+        state["view_proj_matrix"] = view_proj_matrix
+        state["proj_matrix"] = proj_matrix
 
         avg_quality = patch_scores.mean()
         normalized_quality = torch.clamp(avg_quality / 50.0, 0.0, 2.0)
@@ -617,26 +650,27 @@ class AdaptiveStrategy(DefaultStrategy):
 
     @torch.no_grad()
     def _project_to_patch_coords(self, means3d: Tensor, view_proj_matrix: Tensor, h: int, w: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        means_h = F.pad(means3d, (0, 1), value=1.0)
-        p_hom = means_h @ view_proj_matrix
+        screen_coords, valid_mask = project_points(means3d, view_proj_matrix, w, h)
 
-        w_coord = p_hom[:, 3]
-        w_coord_safe = torch.clamp(w_coord, min=1e-6)
-        p_w = 1.0 / w_coord_safe
-        p_proj = p_hom[:, :2] * p_w[:, None]
+        coords_x = screen_coords[:, 0]
+        coords_y = screen_coords[:, 1]
 
-        valid_mask = (torch.isfinite(p_proj).all(dim=1) &
-                      (torch.abs(p_proj) < 10.0).all(dim=1) &
-                      (w_coord > 1e-6))
+        coords_x = torch.clamp(coords_x, 0, w - 1)
+        coords_y = torch.clamp(coords_y, 0, h - 1)
 
-        coords_x = (p_proj[:, 0] * 0.5 + 0.5) * w
-        coords_y = (p_proj[:, 1] * 0.5 + 0.5) * h
+        patch_coords_x = torch.clamp(
+            torch.floor(coords_x / self.nrqm_patch_size),
+            0, (w // self.nrqm_patch_size) - 1
+        ).long()
+        patch_coords_y = torch.clamp(
+            torch.floor(coords_y / self.nrqm_patch_size),
+            0, (h // self.nrqm_patch_size) - 1
+        ).long()
 
-        patch_coords_x = torch.clamp(torch.floor(coords_x / self.nrqm_patch_size), 0, (w // self.nrqm_patch_size) - 1).long()
-        patch_coords_y = torch.clamp(torch.floor(coords_y / self.nrqm_patch_size), 0, (h // self.nrqm_patch_size) - 1).long()
+        pixel_coords_x = coords_x.long()
+        pixel_coords_y = coords_y.long()
 
-        pixel_coords_x = torch.clamp(coords_x, 0, w - 1).long()
-        pixel_coords_y = torch.clamp(coords_y, 0, h - 1).long()
+        valid_mask = valid_mask & (coords_x >= 0) & (coords_x < w) & (coords_y >= 0) & (coords_y < h)
 
         return patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask
 

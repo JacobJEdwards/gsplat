@@ -150,7 +150,7 @@ class AdaptiveStrategy(DefaultStrategy):
     bootstrap_steps: int = 0
 
     learn_every: int = 200
-    hindsight_delay: int = 300
+    hindsight_delay: int = 10
     actor_loss_weight: float = 1.0
     entropy_loss_weight: float = 0.3
 

@@ -206,8 +206,21 @@ class AdaptiveStrategy(DefaultStrategy):
 
         # Feature 4: Normalized distance to nearest neighbor
         if n_subset > 5:
-            dists, _ = knn_with_ids(subset_mask, K=5 + 1)
-            features[:, 4] = dists / state["scene_scale"]
+            means3d_subset = params["means"][subset_mask]
+            dists, idxs = knn_with_ids(means3d_subset, K=5 + 1)
+            neighbor_idxs = idxs[:, 1:]
+
+            features[:, 4] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
+
+            # neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
+            # neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
+            # neighbor_sh0 = params["sh0"][neighbor_idxs].squeeze(-2)
+            #
+            # sh0_subset = params["sh0"][subset_mask]
+            #
+            # features[:, 10] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
+            # features[:, 11] = neighbor_opacities.mean(dim=-1)
+            # features[:, 12] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
 
         return torch.nan_to_num(features, 0.0)
 

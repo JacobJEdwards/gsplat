@@ -2,8 +2,7 @@ import random
 
 import numpy as np
 import torch
-from sklearn.neighbors import NearestNeighbors
-from torch import Tensor, nn
+from torch import Tensor
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
@@ -284,111 +283,6 @@ def apply_depth_colormap(
         img = img * acc + (1.0 - acc)
     return img
 
-
-class SumTree:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.tree = np.zeros(2 * capacity - 1)
-        self.data = np.zeros(capacity, dtype=object)
-        self.data_pointer = 0
-        self.size = 0
-
-    def _propagate(self, idx: int, change: float):
-        parent = (idx - 1) // 2
-        self.tree[parent] += change
-        if parent != 0:
-            self._propagate(parent, change)
-
-    def _retrieve(self, idx: int, s: float) -> int:
-        left = 2 * idx + 1
-        right = left + 1
-        if left >= len(self.tree):
-            return idx
-        if s <= self.tree[left]:
-            return self._retrieve(left, s)
-        else:
-            return self._retrieve(right, s - self.tree[left])
-
-    def total(self) -> float:
-        return self.tree[0]
-
-    def add(self, p: float, data: object):
-        idx = self.data_pointer + self.capacity - 1
-        self.data[self.data_pointer] = data
-        self.update(idx, p)
-        self.data_pointer += 1
-        if self.data_pointer >= self.capacity:
-            self.data_pointer = 0
-        if self.size < self.capacity:
-            self.size += 1
-
-    def update(self, idx: int, p: float):
-        change = p - self.tree[idx]
-        self.tree[idx] = p
-        self._propagate(idx, change)
-
-    def get(self, s: float) -> tuple[int, float, object]:
-        idx = self._retrieve(0, s)
-        data_idx = idx - self.capacity + 1
-        return idx, self.tree[idx], self.data[data_idx]
-
-
-class PrioritizedReplayBuffer:
-    """A Replay Buffer that uses a SumTree to sample experiences based on priority."""
-    def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4, beta_increment_per_sampling: float = 0.001):
-        self.tree = SumTree(capacity)
-        self.capacity = capacity
-        self.alpha = alpha
-        self.beta = beta
-        self.beta_increment_per_sampling = beta_increment_per_sampling
-        self.epsilon = 1e-5
-        self.max_priority = 1.0
-
-    def add(self, experience: object):
-        self.tree.add(self.max_priority, experience)
-
-    def sample(self, batch_size: int) -> tuple[list, np.ndarray, np.ndarray]:
-        batch, idxs, priorities = [], [], []
-        total_p = self.tree.total()
-        if total_p <= 0 or not np.isfinite(total_p):
-            print("Total priority is zero or not finite, returning empty batch.")
-            return [], np.array([]), np.array([])
-
-        segment = total_p / batch_size
-        self.beta = np.min([1., self.beta + self.beta_increment_per_sampling])
-
-        for i in range(batch_size):
-            a, b = segment * i, segment * (i + 1)
-            if not np.isfinite(a) or not np.isfinite(b):
-                print(f"Invalid segment range: a={a}, b={b}. Skipping this sample.")
-                continue
-
-            s = np.random.uniform(a, b)
-            (idx, p, data) = self.tree.get(s)
-            if data != 0 and data is not None:
-                priorities.append(p)
-                batch.append(data)
-                idxs.append(idx)
-
-        if not batch:
-            return [], np.array([]), np.array([])
-
-        sampling_probabilities = np.array(priorities) / self.tree.total()
-        is_weights = np.power(self.tree.size * sampling_probabilities, -self.beta)
-        is_weights /= is_weights.max()
-
-        return batch, np.array(idxs), is_weights
-
-    def update_priorities(self, tree_idxs: np.ndarray, td_errors: np.ndarray):
-        priorities = (np.abs(td_errors) + self.epsilon) ** self.alpha
-        priorities = np.clip(priorities, a_min=1e-6, a_max=self.max_priority)
-        self.max_priority = max(self.max_priority, np.max(priorities))
-        for i, idx in enumerate(tree_idxs):
-            self.tree.update(int(idx), priorities[i])
-
-    def __len__(self):
-        return self.tree.size
-
 def generate_variational_intrinsics(
         base_K: Tensor,
         num_intrinsics: int,
@@ -499,3 +393,44 @@ def scatter_mean(src: Tensor, index: Tensor, dim_size: int) -> Tensor:
     counts.scatter_add_(0, index.unsqueeze(1), torch.ones_like(src[:, :1]))
 
     return out / counts.clamp(min=1)
+def create_view_proj_matrix(camtoworld, K, width, height, near=0.1, far=100.0):
+    device = camtoworld.device
+
+    view_matrix = torch.inverse(camtoworld)
+
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    proj_matrix = torch.zeros(4, 4, device=device)
+
+    proj_matrix[0, 0] = 2.0 * fx / width
+    proj_matrix[1, 1] = 2.0 * fy / height
+    proj_matrix[0, 2] = (2.0 * cx - width) / width
+    proj_matrix[1, 2] = (2.0 * cy - height) / height
+    proj_matrix[2, 2] = -(far + near) / (far - near)
+    proj_matrix[2, 3] = -2.0 * far * near / (far - near)
+    proj_matrix[3, 2] = -1.0
+
+    view_proj_matrix = proj_matrix @ view_matrix
+
+    return view_proj_matrix, view_matrix, proj_matrix
+
+def project_points(points_3d, view_proj_matrix, width, height):
+    points_h = F.pad(points_3d, (0, 1), value=1.0)  # [N, 4]
+
+    projected = points_h @ view_proj_matrix.T  # [N, 4]
+
+    w = projected[:, 3]
+    valid_mask = w > 1e-6
+
+    w_safe = torch.where(valid_mask, w, torch.ones_like(w))
+    ndc_coords = projected[:, :3] / w_safe.unsqueeze(-1)  # [N, 3]
+
+    screen_x = (ndc_coords[:, 0] + 1.0) * 0.5 * width
+    screen_y = (ndc_coords[:, 1] + 1.0) * 0.5 * height
+
+    valid_mask = valid_mask & (ndc_coords[:, 0].abs() <= 1.0) & (ndc_coords[:, 1].abs() <= 1.0)
+
+    screen_coords = torch.stack([screen_x, screen_y], dim=-1)
+
+    return screen_coords, valid_mask

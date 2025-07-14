@@ -723,7 +723,8 @@ class AdaptiveStrategy(DefaultStrategy):
             #                self.w_detail * reward_detail +
             #                self.w_quality * reward_quality +
             #                self.w_uncertainty * reward_uncertainty)
-            base_reward = exp["initial_error"] - current_error
+            # base_reward = exp["initial_error"] - current_error
+            base_reward = reward_detail
 
             action = exp["gaussian_action"]
             initial_error = exp["initial_error"]

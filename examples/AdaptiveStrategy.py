@@ -9,7 +9,7 @@ from torch import Tensor, nn
 from torch.distributions import Categorical
 
 from gsplat.strategy.default import DefaultStrategy
-from gsplat.strategy.ops import remove, split
+from gsplat.strategy.ops import remove, split, reset_opa
 from tensordict import TensorDict
 from torchrl.data import RandomSampler, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyMemmapStorage
@@ -99,7 +99,13 @@ class AdaptiveStrategy(DefaultStrategy):
         print("Initialized Simple Actor-Critic network.")
 
     def step_post_backward(
-            self, params: dict, optimizers: dict, state: dict, step: int, info: dict, **kwargs
+            self,
+            params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
+            optimizers: dict[str, torch.optim.Optimizer],
+            state: dict[str, Any],
+            step: int,
+            info: dict[str, Any],
+            packed: bool = False,
     ) -> None:
         """The main hook that runs after each backward pass."""
         if step >= self.refine_stop_iter:
@@ -115,6 +121,7 @@ class AdaptiveStrategy(DefaultStrategy):
         state["l1_loss_map"] = info.get("l1_loss_map") # Keep track of the latest loss map
         state["view_proj_matrix"] = info.get("view_proj_matrix")
 
+        self._update_state(params, state, info, packed=packed)
         # Process the reward queue to see if any actions are old enough to have a reward calculated.
         self._process_rewards(state, step)
 
@@ -127,7 +134,7 @@ class AdaptiveStrategy(DefaultStrategy):
             self._train_agent(state)
 
         if step % self.reset_every == 0 and step > 0:
-            self.reset_opacities(params, optimizers, state, self.prune_opa * 2.0)
+            reset_opa(params, optimizers, state, self.prune_opa * 2.0)
 
 
     @torch.no_grad()

@@ -163,7 +163,7 @@ class AdaptiveStrategy(DefaultStrategy):
     prune_age_threshold: int = 1000
     prune_significance_threshold: float = 0.01
 
-    subset_fraction: float = 1.0
+    subset_fraction: float = 0.2
     max_densification_subset: int = 200_000
     action_cost_weight: float = 0.0001
 

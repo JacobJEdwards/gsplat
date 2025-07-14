@@ -221,7 +221,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     ppo_clip_epsilon: float = 0.2
 
-    max_kl_div_threshold: float = 0.05
+    max_kl_div_threshold: float = 1.0
     gnn_net: Any = field(default=None, repr=False)
     ac_net: Any = field(default=None, repr=False)
     icm_module: Any = field(default=None, repr=False)

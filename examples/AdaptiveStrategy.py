@@ -817,8 +817,6 @@ class AdaptiveStrategy(DefaultStrategy):
         new_gauss_log_probs = new_gauss_dist.log_prob(gauss_actions)
         ratio_gauss = torch.exp(new_gauss_log_probs - old_gauss_log_probs)
 
-        ratio_gauss = torch.clamp(ratio_gauss, 0.0, 10.0)
-
         surr1_gauss = ratio_gauss * gauss_advantage
         surr2_gauss = torch.clamp(ratio_gauss, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * gauss_advantage
         actor_loss_gauss = -torch.min(surr1_gauss, surr2_gauss)

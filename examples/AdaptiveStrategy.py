@@ -21,7 +21,7 @@ from gsplat.strategy.ops import (
 )
 from gsplat.strategy.default import DefaultStrategy
 from ops import split, duplicate, merge
-from torchrl.data import TensorDictReplayBuffer
+from torchrl.data import TensorDictReplayBuffer, RandomSampler
 from torchrl.data.replay_buffers.samplers import PrioritizedSampler
 from torchrl.data.replay_buffers.storages import LazyMemmapStorage
 from tensordict import TensorDict
@@ -214,7 +214,8 @@ class AdaptiveStrategy(DefaultStrategy):
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
         storage = LazyMemmapStorage(max_size=30_000)
-        sample = PrioritizedSampler(max_capacity=30_000, alpha=0.7, beta=0.5)
+        # sample = PrioritizedSampler(max_capacity=30_000, alpha=0.7, beta=0.5)
+        sample = RandomSampler()
         replay_buffer = TensorDictReplayBuffer(
             storage=storage,
             sampler=sample,

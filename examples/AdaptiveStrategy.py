@@ -711,7 +711,7 @@ class AdaptiveStrategy(DefaultStrategy):
             ptx, pty = exp["ptx"], exp["pty"]
 
             current_error = state["l1_loss_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
-            reward_photo = exp["initial_error"] - current_error
+            reward_photo =(exp["initial_error"] - current_error) / (exp["initial_error"] + 1e-8)
 
             current_quality = state["quality_heatmap"][pty, ptx]
             reward_quality = exp["initial_quality"] - current_quality
@@ -728,6 +728,14 @@ class AdaptiveStrategy(DefaultStrategy):
             #                self.w_uncertainty * reward_uncertainty)
             # base_reward = exp["initial_error"] - current_error
             base_reward = reward_photo
+            if exp["gaussian_action"] == 0:  # No action
+                base_reward = reward_photo
+            elif exp["gaussian_action"] in [1, 2]:
+                base_reward = reward_photo * 2.0
+            elif exp["gaussian_action"] == 4:
+                base_reward = reward_photo + (0.1 if exp["initial_error"] < self.stable_error_threshold else -0.1)
+            else:
+                base_reward = reward_photo
 
             shaped_reward = 0.0
 
@@ -755,7 +763,7 @@ class AdaptiveStrategy(DefaultStrategy):
             #     action_cost += 100
 
 
-            final_reward = base_reward + action_cost + shaped_reward
+            final_reward = torch.tanh(base_reward * 10.0)
 
             if action == 0:
                 if initial_error < self.stable_error_threshold and \
@@ -770,10 +778,10 @@ class AdaptiveStrategy(DefaultStrategy):
                     "region_features": exp["region_features"],
                     "region_assignment": exp["region_assignment"],
                     "gaussian_action": exp["gaussian_action"],
-                    "region_action": exp["region_action"],
+                    # "region_action": exp["region_action"],
                     "reward": final_reward.clone().detach(),
                     "gaussian_log_prob": exp["gaussian_log_prob"],
-                    "region_log_prob": exp["region_log_prob"],
+                    # "region_log_prob": exp["region_log_prob"],
                     "continuous_params": exp["continuous_params"],
                 }, batch_size=[])
                 state["replay_buffer"].add(experience_tensordict)
@@ -801,10 +809,10 @@ class AdaptiveStrategy(DefaultStrategy):
         region_features = sampled_td.get("region_features")
         region_assignments = sampled_td.get("region_assignment")
         gauss_actions = sampled_td.get("gaussian_action")
-        region_actions = sampled_td.get("region_action")
+        # region_actions = sampled_td.get("region_action")
         rewards = sampled_td.get("reward")
         old_gauss_log_probs = sampled_td.get("gaussian_log_prob")
-        old_region_log_probs = sampled_td.get("region_log_prob")
+        # old_region_log_probs = sampled_td.get("region_log_prob")
 
         rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0, neginf=-1.0)
         rewards = torch.clamp(rewards, -5.0, 5.0)
@@ -825,19 +833,19 @@ class AdaptiveStrategy(DefaultStrategy):
         critic_loss_gauss = F.mse_loss(gauss_values, rewards, reduction="none")
         entropy_loss_gauss = -self.entropy_loss_weight * new_gauss_dist.entropy()
 
-        region_advantage = rewards - region_values.detach()
-        region_advantage = (region_advantage - region_advantage.mean()) / (region_advantage.std() + 1e-8)
+        # region_advantage = rewards - region_values.detach()
+        # region_advantage = (region_advantage - region_advantage.mean()) / (region_advantage.std() + 1e-8)
 
-        new_region_dist = Categorical(logits=region_logits)
-        new_region_log_probs = new_region_dist.log_prob(region_actions)
-        ratio_region = torch.exp(new_region_log_probs - old_region_log_probs)
-        ratio_region = torch.clamp(ratio_region, 0.0, 10.0)
+        # new_region_dist = Categorical(logits=region_logits)
+        # new_region_log_probs = new_region_dist.log_prob(region_actions)
+        # ratio_region = torch.exp(new_region_log_probs - old_region_log_probs)
+        # ratio_region = torch.clamp(ratio_region, 0.0, 10.0)
 
-        surr1_region = ratio_region * region_advantage
-        surr2_region = torch.clamp(ratio_region, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * region_advantage
-        actor_loss_region = -torch.min(surr1_region, surr2_region)
-        critic_loss_region = F.mse_loss(region_values, rewards, reduction="none")
-        entropy_loss_region = -self.region_entropy_weight * new_region_dist.entropy()
+        # surr1_region = ratio_region * region_advantage
+        # surr2_region = torch.clamp(ratio_region, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * region_advantage
+        # actor_loss_region = -torch.min(surr1_region, surr2_region)
+        # critic_loss_region = F.mse_loss(region_values, rewards, reduction="none")
+        # entropy_loss_region = -self.region_entropy_weight * new_region_dist.entropy()
 
         total_loss_unreduced = (actor_loss_gauss + critic_loss_gauss + entropy_loss_gauss)
                                 # self.region_loss_weight * (actor_loss_region + critic_loss_region + entropy_loss_region))
@@ -965,34 +973,36 @@ class AdaptiveStrategy(DefaultStrategy):
          region_logits, _) = self.ac_net(motion_features, region_features, region_assignments)
 
 
-        # age_in_steps = state["age"][original_subset_indices]
-        # significance = state["significance"][original_subset_indices]
-        # opacities = torch.sigmoid(params["opacities"][original_subset_indices])
-        #
-        # prune_merge_veto_mask = (
-        #         (age_in_steps < self.prune_age_threshold) |
-        #         (significance > self.prune_significance_threshold) |
-        #         (opacities.squeeze(-1) > self.prune_opa)
-        # )
+        age_in_steps = state["age"][original_subset_indices]
+        significance = state["significance"][original_subset_indices]
+        opacities = torch.sigmoid(params["opacities"][original_subset_indices])
 
-        # gaussian_logits[prune_merge_veto_mask, 3] = -torch.inf
-        # gaussian_logits[prune_merge_veto_mask, 4] = -torch.inf
+        prune_merge_veto_mask = (
+                (age_in_steps < self.prune_age_threshold) |
+                (significance > self.prune_significance_threshold) |
+                (opacities.squeeze(-1) > self.prune_opa)
+        )
+
+        gaussian_logits = gaussian_logits.clone()
+        gaussian_logits[prune_merge_veto_mask, 3] = -1e9
+        gaussian_logits[prune_merge_veto_mask, 4] = -1e9
 
         progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
         epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)
 
         gauss_dist = Categorical(logits=gaussian_logits)
-        region_dist = Categorical(logits=region_logits)
+        # region_dist = Categorical(logits=region_logits)
 
         if torch.rand(1).item() < epsilon:
-            final_actions = torch.randint(0, 6, (len(original_subset_indices),), device=device)
-            region_actions = torch.randint(0, 3, (self.num_regions,), device=device)
+            final_actions = gauss_dist.sample()
+            random_mask = torch.rand(len(final_actions), device=device) < 0.3
+            final_actions[random_mask] = torch.randint(0, 6, (random_mask.sum(),), device=device)
         else:
             final_actions = gauss_dist.sample()
-            region_actions = region_dist.sample()
+            # region_actions = region_dist.sample()
 
         gauss_log_probs = gauss_dist.log_prob(final_actions)
-        region_log_probs = region_dist.log_prob(region_actions)
+        # region_log_probs = region_dist.log_prob(region_actions)
 
         for i in range(len(original_subset_indices)):
             if not valid_mask_subset[i]:
@@ -1011,9 +1021,9 @@ class AdaptiveStrategy(DefaultStrategy):
                 "region_features": region_features[region_idx].detach(),
                 "region_assignment": region_idx.detach(),
                 "gaussian_action": final_actions[i].detach(),
-                "region_action": region_actions[region_idx].detach(),
+                # "region_action": region_actions[region_idx].detach(),
                 "gaussian_log_prob": gauss_log_probs[i].detach(),
-                "region_log_prob": region_log_probs[region_idx].detach(),
+                # "region_log_prob": region_log_probs[region_idx].detach(),
                 "initial_error": initial_error.detach(),
                 "initial_quality": initial_quality.detach(),
                 "initial_uncertainty": initial_uncertainty.detach(),

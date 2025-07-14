@@ -27,7 +27,7 @@ class ActionValueNetwork(nn.Module):
         return self.net(features)
 
 @dataclass
-class SimplifiedAdaptiveStrategy(DefaultStrategy):
+class AdaptiveStrategy(DefaultStrategy):
     refine_every: int = 400
     learn_every: int = 200
 

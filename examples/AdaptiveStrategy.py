@@ -815,13 +815,16 @@ class AdaptiveStrategy(DefaultStrategy):
         # old_region_log_probs = sampled_td.get("region_log_prob")
 
         rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0, neginf=-1.0)
-        rewards = torch.clamp(rewards, -5.0, 5.0)
+        rewards = torch.clamp(rewards, -2.0, 2.0)
 
         (gauss_logits, gauss_values, new_continuous_params, _,
          region_logits, region_values) = self.ac_net(motion_features, region_features, region_assignments)
 
         gauss_advantage = rewards - gauss_values.detach()
-        gauss_advantage = (gauss_advantage - gauss_advantage.mean()) / (gauss_advantage.std() + 1e-8)
+        if gauss_advantage.std() > 1e-4:
+            gauss_advantage = (gauss_advantage - gauss_advantage.mean()) / (gauss_advantage.std() + 1e-8)
+        else:
+            gauss_advantage -= gauss_advantage.mean()
 
         new_gauss_dist = Categorical(logits=gauss_logits)
         new_gauss_log_probs = new_gauss_dist.log_prob(gauss_actions)
@@ -850,7 +853,7 @@ class AdaptiveStrategy(DefaultStrategy):
         total_loss_unreduced = (actor_loss_gauss + critic_loss_gauss + entropy_loss_gauss)
                                 # self.region_loss_weight * (actor_loss_region + critic_loss_region + entropy_loss_region))
 
-        sampled_continuous_params = sampled_td.get("continuous_params")
+        # sampled_continuous_params = sampled_td.get("continuous_params")
 
         is_continuous_action: Tensor = (gauss_actions == 1) | (gauss_actions == 2)
 
@@ -875,8 +878,12 @@ class AdaptiveStrategy(DefaultStrategy):
         self.ac_optimizer.zero_grad()
         self.gnn_optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 0.5)
+        torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 0.5)
+
+        # torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
+        # torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
         self.ac_optimizer.step()
         self.gnn_optimizer.step()
 
@@ -886,6 +893,9 @@ class AdaptiveStrategy(DefaultStrategy):
         sampled_td.set("priority", td_errors)
 
         state["replay_buffer"].update_priority(info.get("index"), td_errors)
+
+        if self.verbose:
+            print(f"Gradient norm: {grad_norm:.4f}")
 
         if self.verbose:
             print(f"Agent trained: Loss = {loss.item():.4f}, Actor Loss = {actor_loss_gauss.mean().item():.4f}, "
@@ -983,9 +993,9 @@ class AdaptiveStrategy(DefaultStrategy):
                 (opacities.squeeze(-1) > self.prune_opa)
         )
 
-        gaussian_logits = gaussian_logits.clone()
-        gaussian_logits[prune_merge_veto_mask, 3] = -1e9
-        gaussian_logits[prune_merge_veto_mask, 4] = -1e9
+        # gaussian_logits = gaussian_logits.clone()
+        # gaussian_logits[prune_merge_veto_mask, 3] = -1e9
+        # gaussian_logits[prune_merge_veto_mask, 4] = -1e9
 
         progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
         epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)
@@ -1043,20 +1053,20 @@ class AdaptiveStrategy(DefaultStrategy):
         # prune_mask = (region_decision_for_each_gaussian == 2)
         # final_actions[prune_mask & ((final_actions == 1) | (final_actions == 2))] = 0
 
-        age_in_steps = state["age"][original_subset_indices]
-        significance = state["significance"][original_subset_indices]
-        scales_mag = torch.exp(params["scales"][original_subset_indices]).norm(dim=-1)
-        opacities = torch.sigmoid(params["opacities"][original_subset_indices])
+        # age_in_steps = state["age"][original_subset_indices]
+        # significance = state["significance"][original_subset_indices]
+        # scales_mag = torch.exp(params["scales"][original_subset_indices]).norm(dim=-1)
+        # opacities = torch.sigmoid(params["opacities"][original_subset_indices])
 
-        prune_merge_veto_mask = (
-                (age_in_steps < self.prune_age_threshold) |
-                (significance > self.prune_significance_threshold) |
-                (opacities > self.prune_opa) |
-                (scales_mag > self.prune_scale3d * state["scene_scale"])
-        )
-
-        final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
-        final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
+        # prune_merge_veto_mask = (
+        #         (age_in_steps < self.prune_age_threshold) |
+        #         (significance > self.prune_significance_threshold) |
+        #         (opacities > self.prune_opa) |
+        #         (scales_mag > self.prune_scale3d * state["scene_scale"])
+        # )
+        #
+        # final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
+        # final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
 
         final_finetune_mask_subset = (final_actions == 5) # Finetune action
         final_prune_mask_subset = (final_actions == 4) # Prune action

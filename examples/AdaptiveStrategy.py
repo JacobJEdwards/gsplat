@@ -324,12 +324,12 @@ class AdaptiveStrategy(DefaultStrategy):
             features[:, 11] = neighbor_opacities.mean(dim=-1)
             features[:, 12] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
 
-            # neighbor_means = params["means"][neighbor_idxs]
-            # centered_neighbors = neighbor_means - means3d_subset.unsqueeze(1)
-            # cov_neighbors = torch.einsum('nki,nkj->nij', centered_neighbors, centered_neighbors) / (5 - 1)
+            neighbor_means = params["means"][neighbor_idxs]
+            centered_neighbors = neighbor_means - means3d_subset.unsqueeze(1)
+            cov_neighbors = torch.einsum('nki,nkj->nij', centered_neighbors, centered_neighbors) / (5 - 1)
 
-            # features[:, 13] = cov_neighbors.mean(dim=(1, 2)).norm(dim=-1) / state["scene_scale"]
-            # features[:, 13] = torch.det(cov_neighbors)
+            features[:, 13] = cov_neighbors.mean(dim=(1, 2)).norm(dim=-1) / state["scene_scale"]
+            features[:, 14] = torch.det(cov_neighbors)
 
         # current_grad = state["grad2d"][subset_mask] / state["count"][subset_mask].clamp_min(1)
         # features[:, 15] = current_grad

@@ -725,7 +725,7 @@ class AdaptiveStrategy(DefaultStrategy):
             #                self.w_quality * reward_quality +
             #                self.w_uncertainty * reward_uncertainty)
             # base_reward = exp["initial_error"] - current_error
-            base_reward = -reward_photo
+            base_reward = -reward_photo * 100
 
             shaped_reward = 0.0
 

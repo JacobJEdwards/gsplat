@@ -14,7 +14,6 @@ from torch.distributions import Categorical
 from torch_geometric.nn import knn_graph, TransformerConv
 
 from utils import knn_with_ids, scatter_mean
-from gsplat.utils import normalized_quat_to_rotmat
 from gsplat.strategy.ops import (
     remove,
     reset_opa,
@@ -22,7 +21,6 @@ from gsplat.strategy.ops import (
 from gsplat.strategy.default import DefaultStrategy
 from ops import split, duplicate, merge
 from torchrl.data import TensorDictReplayBuffer, RandomSampler
-from torchrl.data.replay_buffers.samplers import PrioritizedSampler
 from torchrl.data.replay_buffers.storages import LazyMemmapStorage
 from tensordict import TensorDict
 
@@ -263,11 +261,6 @@ class AdaptiveStrategy(DefaultStrategy):
         gnn_params = list(self.gnn_net.parameters())
         self.gnn_optimizer = torch.optim.AdamW(gnn_params, lr=1e-4, weight_decay=1e-5)
 
-        # if self.use_curiosity:
-        #     self.icm_module = ICMModule(
-        #         feature_dim=ac_input_dim, action_dim=self.icm_action_dim
-        #     ).to(device)
-        #     self.icm_optimizer = torch.optim.AdamW(self.icm_module.parameters(), lr=1e-4)
 
     @torch.no_grad()
     def _get_raw_features(
@@ -324,56 +317,7 @@ class AdaptiveStrategy(DefaultStrategy):
             features[:, 11] = neighbor_opacities.mean(dim=-1)
             features[:, 12] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
 
-            # neighbor_means = params["means"][neighbor_idxs]
-            # centered_neighbors = neighbor_means - means3d_subset.unsqueeze(1)
-            # cov_neighbors = torch.einsum('nki,nkj->nij', centered_neighbors, centered_neighbors) / (5 - 1)
-
-            # features[:, 13] = cov_neighbors.mean(dim=(1, 2)).norm(dim=-1) / state["scene_scale"]
-            # features[:, 14] = torch.det(cov_neighbors)
-
-        # current_grad = state["grad2d"][subset_mask] / state["count"][subset_mask].clamp_min(1)
-        # features[:, 15] = current_grad
-
-        if state.get("prev_grad2d") is not None and state.get("prev_opacity") is not None:
-            time_delta = self.refine_every
-            prev_grad_subset = state["prev_grad2d"][subset_mask]
-            prev_opacity_subset = state["prev_opacity"][subset_mask]
-
-            # features[:, 16] = (current_grad - prev_grad_subset) / time_delta
-            # features[:, 17] = (opacities_subset - prev_opacity_subset) / time_delta
-
-        # if state.get("significance") is not None and state["significance"].numel() == len(subset_mask):
-        #     features[:, 18] = state["significance"][subset_mask]
-
         features[:, 19] = step / self.refine_stop_iter
-
-        # if state.get("age") is not None:
-        #     features[:, 20] = state["age"][subset_mask].float() / self.refine_stop_iter
-
-        view_dirs = F.normalize(means3d_subset - campos, dim=-1)
-        quats_subset = F.normalize(params["quats"][subset_mask], dim=-1)
-        rotmats = normalized_quat_to_rotmat(quats_subset)
-
-        largest_scale_indices = torch.argmax(scales, dim=1)
-        largest_axis = rotmats[torch.arange(num_subset), :, largest_scale_indices]
-
-        view_alignment = torch.abs((largest_axis * view_dirs).sum(dim=-1))
-        features[:, 21] = view_alignment
-
-        # if state.get("prev_means") is not None and state["prev_means"].shape == params["means"].shape:
-        #     mean_velocity = torch.norm(params["means"][subset_mask] - state["prev_means"][subset_mask], dim=-1)
-        #     features[:, 22] = mean_velocity / state["scene_scale"]
-
-        # mean_optimizer = optimizers.get("means")
-        #
-        # if mean_optimizer is not None and 'exp_avg_sq' in mean_optimizer.state[params['means']]:
-        #     optimizer_state_mag = torch.norm(mean_optimizer.state[params['means']]['exp_avg_sq'][subset_mask], dim=-1)
-        #     features[:, 23] = torch.log1p(optimizer_state_mag)
-
-        # if valid_indices.numel() > 0:
-        #     l1_error = state["l1_loss_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
-        #     max_scale = scales[valid_indices].max(dim=-1).values
-        #     features[valid_indices, 24] = l1_error * max_scale
 
         return torch.nan_to_num(features, 0.0), (pixel_coords_x, pixel_coords_y, patch_coords_x, patch_coords_y), valid_mask
 
@@ -501,7 +445,6 @@ class AdaptiveStrategy(DefaultStrategy):
         if step % self.reset_every == 0 and step > 0:
             reset_opa(params=params, optimizers=optimizers, state=state, value=self.prune_opa * 2.0)
 
-    # _update_state, _update_quality_map, _project_to_patch_coords remain unchanged...
     def _update_state(
             self,
             params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
@@ -519,7 +462,6 @@ class AdaptiveStrategy(DefaultStrategy):
         ]:
             assert key in info, f"{key} is required but missing."
 
-        # normalize grads to [-1, 1] screen space
         if self.absgrad:
             grads = info[self.key_for_gradient].absgrad.clone()
         else:
@@ -711,7 +653,15 @@ class AdaptiveStrategy(DefaultStrategy):
             ptx, pty = exp["ptx"], exp["pty"]
 
             current_error = state["l1_loss_map"][max(0, py-2):py+3, max(0, px-2):px+3].mean()
-            reward_photo =(exp["initial_error"] - current_error) / (exp["initial_error"] + 1e-8)
+            # reward_photo =(exp["initial_error"] - current_error) / (exp["initial_error"] + 1e-8)
+
+            if not hasattr(state, 'error_baseline'):
+                state['error_baseline'] = current_error.detach()
+            else:
+                state['error_baseline'] = 0.99 * state['error_baseline'] + 0.01 * current_error.detach()
+
+            reward_photo = (exp["initial_error"] - current_error) / (state['error_baseline'] + 1e-6)
+            reward_photo = torch.clamp(reward_photo, -2.0, 2.0)
 
             current_quality = state["quality_heatmap"][pty, ptx]
             reward_quality = exp["initial_quality"] - current_quality
@@ -727,7 +677,7 @@ class AdaptiveStrategy(DefaultStrategy):
             #                self.w_quality * reward_quality +
             #                self.w_uncertainty * reward_uncertainty)
             # base_reward = exp["initial_error"] - current_error
-            base_reward = reward_photo
+
             if exp["gaussian_action"] == 0:  # No action
                 base_reward = reward_photo
             elif exp["gaussian_action"] in [1, 2]:
@@ -748,20 +698,9 @@ class AdaptiveStrategy(DefaultStrategy):
                 elif action == 0:
                     shaped_reward -= 0.02
 
-            # initial_significance = exp["initial_significance"]
-            # if action == 4 and initial_significance < self.prune_significance_threshold:
-            #     shaped_reward += 0.1
-
             action = exp["gaussian_action"]
             initial_error = exp["initial_error"]
             initial_quality = exp["initial_quality"]
-
-            action_cost = 0.0
-            # if action == 1 or action == 2:
-            #     action_cost = -self.action_cost_weight * torch.clamp(1.0 - initial_error / self.stable_error_threshold, 0.0, 1.0)
-            # if action == 3:
-            #     action_cost += 100
-
 
             final_reward = torch.tanh(base_reward * 10.0)
 
@@ -771,17 +710,14 @@ class AdaptiveStrategy(DefaultStrategy):
                     stability_bonus = self.stability_reward_bonus * (1.0 - initial_error / self.stable_error_threshold)
                     final_reward += stability_bonus
 
-
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
                 experience_tensordict = TensorDict({
                     "motion_features": exp["motion_features"],
                     "region_features": exp["region_features"],
                     "region_assignment": exp["region_assignment"],
                     "gaussian_action": exp["gaussian_action"],
-                    # "region_action": exp["region_action"],
                     "reward": final_reward.clone().detach(),
                     "gaussian_log_prob": exp["gaussian_log_prob"],
-                    # "region_log_prob": exp["region_log_prob"],
                     "continuous_params": exp["continuous_params"],
                 }, batch_size=[])
                 state["replay_buffer"].add(experience_tensordict)
@@ -809,10 +745,8 @@ class AdaptiveStrategy(DefaultStrategy):
         region_features = sampled_td.get("region_features")
         region_assignments = sampled_td.get("region_assignment")
         gauss_actions = sampled_td.get("gaussian_action")
-        # region_actions = sampled_td.get("region_action")
         rewards = sampled_td.get("reward")
         old_gauss_log_probs = sampled_td.get("gaussian_log_prob")
-        # old_region_log_probs = sampled_td.get("region_log_prob")
 
         rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0, neginf=-1.0)
         rewards = torch.clamp(rewards, -2.0, 2.0)
@@ -820,11 +754,16 @@ class AdaptiveStrategy(DefaultStrategy):
         (gauss_logits, gauss_values, new_continuous_params, _,
          region_logits, region_values) = self.ac_net(motion_features, region_features, region_assignments)
 
+        if hasattr(state, 'value_baseline'):
+            state['value_baseline'] = 0.99 * state['value_baseline'] + 0.01 * rewards.mean()
+        else:
+            state['value_baseline'] = rewards.mean()
+
         gauss_advantage = rewards - gauss_values.detach()
+        gauss_advantage = torch.clamp(gauss_advantage, -5.0, 5.0)
+
         if gauss_advantage.std() > 1e-4:
             gauss_advantage = (gauss_advantage - gauss_advantage.mean()) / (gauss_advantage.std() + 1e-8)
-        else:
-            gauss_advantage -= gauss_advantage.mean()
 
         new_gauss_dist = Categorical(logits=gauss_logits)
         new_gauss_log_probs = new_gauss_dist.log_prob(gauss_actions)
@@ -836,42 +775,11 @@ class AdaptiveStrategy(DefaultStrategy):
         critic_loss_gauss = F.mse_loss(gauss_values, rewards, reduction="none")
         entropy_loss_gauss = -self.entropy_loss_weight * new_gauss_dist.entropy()
 
-        # region_advantage = rewards - region_values.detach()
-        # region_advantage = (region_advantage - region_advantage.mean()) / (region_advantage.std() + 1e-8)
-
-        # new_region_dist = Categorical(logits=region_logits)
-        # new_region_log_probs = new_region_dist.log_prob(region_actions)
-        # ratio_region = torch.exp(new_region_log_probs - old_region_log_probs)
-        # ratio_region = torch.clamp(ratio_region, 0.0, 10.0)
-
-        # surr1_region = ratio_region * region_advantage
-        # surr2_region = torch.clamp(ratio_region, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * region_advantage
-        # actor_loss_region = -torch.min(surr1_region, surr2_region)
-        # critic_loss_region = F.mse_loss(region_values, rewards, reduction="none")
-        # entropy_loss_region = -self.region_entropy_weight * new_region_dist.entropy()
-
         total_loss_unreduced = (actor_loss_gauss + critic_loss_gauss + entropy_loss_gauss)
-                                # self.region_loss_weight * (actor_loss_region + critic_loss_region + entropy_loss_region))
-
-        # sampled_continuous_params = sampled_td.get("continuous_params")
-
-        is_continuous_action: Tensor = (gauss_actions == 1) | (gauss_actions == 2)
-
-        if is_continuous_action.any():
-            # continuous_loss = F.mse_loss(
-            #     new_continuous_params[is_continuous_action],
-            #     sampled_continuous_params[is_continuous_action],
-            #     reduction="none"
-            # ).mean(dim=-1)
-            #
-            # weighted_continuous_loss = - (continuous_loss * gauss_advantage.detach()[is_continuous_action])
-            #
-            # total_loss_unreduced += self.continuous_loss_weight * weighted_continuous_loss.mean()
-            pass
 
         loss = (total_loss_unreduced * is_weights).mean()
 
-        if torch.isnan(loss).any():
+        if torch.isnan(loss) or torch.isinf(loss):
             print("NaN loss detected, skipping training step to prevent model corruption.")
             return
 
@@ -879,11 +787,12 @@ class AdaptiveStrategy(DefaultStrategy):
         self.gnn_optimizer.zero_grad()
         loss.backward()
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 0.5)
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+            [p for p in self.ac_net.parameters() if p.requires_grad],
+            max_norm=1.0
+        )
         torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 0.5)
 
-        # torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
-        # torch.nn.utils.clip_grad_norm_(self.gnn_net.parameters(), 1.0)
         self.ac_optimizer.step()
         self.gnn_optimizer.step()
 
@@ -894,27 +803,28 @@ class AdaptiveStrategy(DefaultStrategy):
 
         state["replay_buffer"].update_priority(info.get("index"), td_errors)
 
+        ratio_mean = ratio_gauss.mean().item()
+        ration_std = ratio_gauss.std().item()
+        if ration_std > 2.0:
+            print(f"Warning: High ratio std: {ration_std:.4f} at step {state['step']}, mean ratio: {ratio_mean:.4f}")
+
         if self.verbose:
-            print(f"Gradient norm: {grad_norm:.4f}")
+            print(f"Gradient norm: {actor_grad_norm:.4f}")
 
         if self.verbose:
             print(f"Agent trained: Loss = {loss.item():.4f}, Actor Loss = {actor_loss_gauss.mean().item():.4f}, "
                   f"Critic Loss = {critic_loss_gauss.mean().item():.4f}, "
                   f"Entropy Loss = {entropy_loss_gauss.mean().item():.4f}, ")
-                  # f"Region Actor Loss = {actor_loss_region.mean().item():.4f}, "
-                  # f"Region Critic Loss = {critic_loss_region.mean().item():.4f}, "
-                  # f"Region Entropy Loss = {entropy_loss_region.mean().item():.4f}, "
-                    # f"Continuous Loss = {weighted_continuous_loss.mean().item() if is_continuous_action.any() else 0.0:.4f}")
+
+        action_counts = torch.bincount(gauss_actions, minlength=6)
+        action_probs = action_counts.float() / action_counts.sum().float()
+        for i, prob in enumerate(action_probs):
+            self.writer.add_scalar(f"action_distribution/action_{i}", prob, state["step"])
 
         self.writer.add_scalar("agent/loss", loss.item(), state["step"])
         self.writer.add_scalar("agent/actor_loss", actor_loss_gauss.mean().item(), state["step"])
         self.writer.add_scalar("agent/critic_loss", critic_loss_gauss.mean().item(), state["step"])
         self.writer.add_scalar("agent/entropy_loss", entropy_loss_gauss.mean().item(), state["step"])
-        # self.writer.add_scalar("agent/region_actor_loss", actor_loss_region.mean().item(), state["step"])
-        # self.writer.add_scalar("agent/region_critic_loss", critic_loss_region.mean().item(), state["step"])
-        # self.writer.add_scalar("agent/region_entropy_loss", entropy_loss_region.mean().item(), state["step"])
-        # self.writer.add_scalar("agent/continuous_loss", weighted_continuous_loss.mean().item() if is_continuous_action.any() else 0.0, state["step"])
-
 
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> Tuple[int, int, int, int, int]:
@@ -933,7 +843,6 @@ class AdaptiveStrategy(DefaultStrategy):
                 (initial_num_gaussians, self.num_temporal_steps, hidden_dim), device=device
             )
 
-        # grad_thresh = state["dynamic_grow_grad2d"]
         grad_thresh = self.grow_grad2d
         candidates_by_grad = state["grad2d"] / state["count"].clamp_min(1) > grad_thresh
 
@@ -987,21 +896,10 @@ class AdaptiveStrategy(DefaultStrategy):
         significance = state["significance"][original_subset_indices]
         opacities = torch.sigmoid(params["opacities"][original_subset_indices])
 
-        prune_merge_veto_mask = (
-                (age_in_steps < self.prune_age_threshold) |
-                (significance > self.prune_significance_threshold) |
-                (opacities.squeeze(-1) > self.prune_opa)
-        )
-
-        # gaussian_logits = gaussian_logits.clone()
-        # gaussian_logits[prune_merge_veto_mask, 3] = -1e9
-        # gaussian_logits[prune_merge_veto_mask, 4] = -1e9
-
         progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
         epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)
 
         gauss_dist = Categorical(logits=gaussian_logits)
-        # region_dist = Categorical(logits=region_logits)
 
         if torch.rand(1).item() < epsilon:
             final_actions = gauss_dist.sample()
@@ -1009,10 +907,8 @@ class AdaptiveStrategy(DefaultStrategy):
             final_actions[random_mask] = torch.randint(0, 6, (random_mask.sum(),), device=device)
         else:
             final_actions = gauss_dist.sample()
-            # region_actions = region_dist.sample()
 
         gauss_log_probs = gauss_dist.log_prob(final_actions)
-        # region_log_probs = region_dist.log_prob(region_actions)
 
         for i in range(len(original_subset_indices)):
             if not valid_mask_subset[i]:
@@ -1031,9 +927,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 "region_features": region_features[region_idx].detach(),
                 "region_assignment": region_idx.detach(),
                 "gaussian_action": final_actions[i].detach(),
-                # "region_action": region_actions[region_idx].detach(),
                 "gaussian_log_prob": gauss_log_probs[i].detach(),
-                # "region_log_prob": region_log_probs[region_idx].detach(),
                 "initial_error": initial_error.detach(),
                 "initial_quality": initial_quality.detach(),
                 "initial_uncertainty": initial_uncertainty.detach(),
@@ -1043,39 +937,11 @@ class AdaptiveStrategy(DefaultStrategy):
             }
             state["hindsight_buffer"].append(exp)
 
-        # region_decision_for_each_gaussian = region_actions[region_assignments]
-        # stable_mask = (region_decision_for_each_gaussian == 0)
-        # final_actions[stable_mask & (final_actions != 5)] = 0
-        #
-        # refine_mask = (region_decision_for_each_gaussian == 1)
-        # final_actions[refine_mask & ((final_actions == 3) | (final_actions == 4))] = 0
-        #
-        # prune_mask = (region_decision_for_each_gaussian == 2)
-        # final_actions[prune_mask & ((final_actions == 1) | (final_actions == 2))] = 0
-
-        # age_in_steps = state["age"][original_subset_indices]
-        # significance = state["significance"][original_subset_indices]
-        # scales_mag = torch.exp(params["scales"][original_subset_indices]).norm(dim=-1)
-        # opacities = torch.sigmoid(params["opacities"][original_subset_indices])
-
-        # prune_merge_veto_mask = (
-        #         (age_in_steps < self.prune_age_threshold) |
-        #         (significance > self.prune_significance_threshold) |
-        #         (opacities > self.prune_opa) |
-        #         (scales_mag > self.prune_scale3d * state["scene_scale"])
-        # )
-        #
-        # final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
-        # final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
-
         final_finetune_mask_subset = (final_actions == 5) # Finetune action
         final_prune_mask_subset = (final_actions == 4) # Prune action
         final_merge_mask_subset = (final_actions == 3) # Merge action
         final_dupe_mask_subset = (final_actions == 2) # Duplicate action
         final_split_mask_subset = (final_actions == 1) # Split action
-
-        # no merge:
-        # final_merge_mask_subset = torch.zeros_like(final_merge_mask_subset, dtype=torch.bool)
 
         finetune_indices = original_subset_indices[final_finetune_mask_subset]
         n_finetune = finetune_indices.numel()
@@ -1124,15 +990,10 @@ class AdaptiveStrategy(DefaultStrategy):
             valid_mask = remapped_indices != -1
             if valid_mask.any():
                 global_split_mask[remapped_indices[valid_mask]] = True
-                split_continuous_params = split_continuous_params[valid_mask]
 
         n_split = global_split_mask.sum().item()
         if n_split > 0:
             split(params, optimizers, state_to_modify, global_split_mask)
-                  # split_ratios=split_continuous_params[:, 0],
-                  # directions=split_continuous_params[:, 2:5],
-                  # lr_multipliers=lr_multipliers[final_split_mask_subset],
-                  # warmup_steps=self.meta_lr_warmup_steps)
         num_gaussians_post_split = len(params["means"])
 
         # D. DUPLICATE
@@ -1171,10 +1032,7 @@ class AdaptiveStrategy(DefaultStrategy):
                     offset_mags = final_dupe_params[:, 1]
                     dupe_dirs = final_dupe_params[:, 5:8]
                     offset_magnitudes = dupe_scales.max(dim=-1).values * offset_mags
-                    duplication_offsets = dupe_dirs * offset_magnitudes.unsqueeze(-1)
-                    duplicate(params, optimizers, state_to_modify, global_dupe_mask) # offsets=duplication_offsets,
-                              # lr_multipliers=lr_multipliers[final_dupe_mask_subset],
-                              # warmup_steps=self.meta_lr_warmup_steps)
+                    duplicate(params, optimizers, state_to_modify, global_dupe_mask)
 
         state.update(state_to_modify)
         if n_dupli > 0: state["age"][-n_dupli:] = 0

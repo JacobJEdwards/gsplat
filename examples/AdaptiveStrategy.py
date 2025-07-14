@@ -298,6 +298,8 @@ class AdaptiveStrategy(DefaultStrategy):
             # Reset age for new Gaussians
             state_to_modify["age"][-n_split:] = 0
 
+        state.update(state_to_modify)
+
 
     def _process_rewards(self, state: dict, current_step: int):
         """Processes the reward queue for experiences that have matured."""

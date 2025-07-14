@@ -153,6 +153,8 @@ class AdaptiveStrategy(DefaultStrategy):
         if step >= self.refine_stop_iter:
             return
 
+        state["step"] = step
+
         # Basic setup on the first run
         if self.ac_net is None:
             self._initialize_learning_components(params["means"].device)
@@ -369,6 +371,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
         if self.verbose:
             print(f"Agent trained at step {state.get('step', -1)}: Total Loss = {loss.item():.4f}")
+
+        self.writer.add_scalar("agent/loss", loss.item(), state.get("step", -1))
 
     @torch.no_grad()
     def _update_quality_map(

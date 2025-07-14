@@ -258,10 +258,10 @@ class AdaptiveStrategy(DefaultStrategy):
         ).to(device)
 
         ac_params = list(self.ac_net.parameters())
-        self.ac_optimizer = torch.optim.AdamW(ac_params, lr=1e-4, weight_decay=1e-5)
+        self.ac_optimizer = torch.optim.AdamW(ac_params, lr=3e-5, weight_decay=1e-5)
 
         gnn_params = list(self.gnn_net.parameters())
-        self.gnn_optimizer = torch.optim.AdamW(gnn_params, lr=1e-4, weight_decay=1e-5)
+        self.gnn_optimizer = torch.optim.AdamW(gnn_params, lr=3e-5, weight_decay=1e-5)
 
 
     @torch.no_grad()

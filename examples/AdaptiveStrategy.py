@@ -327,3 +327,103 @@ class AdaptiveStrategy(DefaultStrategy):
 
         if self.verbose:
             print(f"Agent trained at step {state.get('step', -1)}: Total Loss = {loss.item():.4f}")
+
+        @torch.no_grad()
+    def _update_quality_map(
+            self,
+            params: dict[str, torch.nn.Parameter],
+            state: dict[str, Any],
+            info: dict[str, Any],
+    ):
+        step = info["step"]
+        width, height = info['width'], info['height']
+        sh_degree_to_use = min(step // 1000, 3)
+
+        num_nrqm_poses = min(4, self.novel_poses.shape[0])
+        sampled_pose_indices = torch.randperm(self.novel_poses.shape[0])[:num_nrqm_poses]
+        novel_camtoworlds = self.novel_poses[sampled_pose_indices]
+
+        Ks = info["Ks"]
+
+        novel_Ks = Ks.repeat(num_nrqm_poses, 1, 1)
+        novel_width = width
+        novel_height = height
+
+        novel_render_pkg, nrqm_alphas, _ = self.rasterizer_fn(
+            means=params["means"],
+            quats=params["quats"],
+            scales=params["scales"],
+            opacities=params["opacities"],
+            colors=torch.cat([params["sh0"], params["shN"]], 1),
+            camtoworlds=novel_camtoworlds,
+            Ks=novel_Ks,
+            width=novel_width,
+            height=novel_height,
+            sh_degree=sh_degree_to_use,
+            render_mode="RGB+ED"
+        )
+
+        novel_render_for_nrqm = torch.clamp(novel_render_pkg[0, ..., :3].unsqueeze(0).permute(0, 3, 1, 2), 0.0, 1.0)
+        all_depth_renders = novel_render_pkg[..., 3]
+
+        p = self.nrqm_patch_size
+        patches = novel_render_for_nrqm.unfold(2, p, p).unfold(3, p, p)
+        patches = patches.contiguous().view(1, 3, -1, p, p).permute(0, 2, 1, 3, 4).squeeze(0)
+
+        patch_scores = torch.empty(patches.shape[0], device=patches.device)
+        std_threshold = 0.01
+        is_flat = patches.mean(dim=1).std(dim=[1, 2]) < std_threshold
+
+        if is_flat.any():
+            patch_scores[is_flat] = 100.0
+
+        valid_patch_indices = torch.where(~is_flat)[0]
+        if valid_patch_indices.numel() > 0:
+            valid_patches = patches[valid_patch_indices].float()
+            try:
+                scores = self.nrqm_model(valid_patches)
+                patch_scores[valid_patch_indices] = scores
+            except AssertionError:
+                patch_scores[valid_patch_indices] = 100.0
+
+        num_patches_h = height // p
+        num_patches_w = width // p
+
+
+        quality_heatmap = patch_scores.view(num_patches_h, num_patches_w)
+        if state["quality_heatmap"] is None:
+            state["quality_heatmap"] = quality_heatmap
+        else:
+            state["quality_heatmap"] = torch.lerp(
+                quality_heatmap, state["quality_heatmap"], self.nrqm_ema_decay
+            )
+
+        if self.use_geom_uncertainty:
+            depth_stack = all_depth_renders
+            min_d = torch.min(depth_stack[depth_stack > 0])
+            max_d = torch.max(depth_stack)
+            normalized_depth = (depth_stack - min_d) / (max_d - min_d + 1e-8)
+            normalized_depth[depth_stack == 0] = 0
+            geom_uncertainty_map = torch.var(normalized_depth, dim=0)
+
+            if state["geom_uncertainty_map"] is None:
+                state["geom_uncertainty_map"] = geom_uncertainty_map
+            else:
+                state["geom_uncertainty_map"] = torch.lerp(
+                    geom_uncertainty_map, state["geom_uncertainty_map"], self.nrqm_ema_decay)
+
+        main_camtoworld = info["camtoworlds"][0]
+        main_K = info["Ks"][0]
+
+        view_proj_matrix, view_matrix, proj_matrix = create_view_proj_matrix(
+            main_camtoworld, main_K, width, height
+        )
+
+        state["view_matrix"] = view_matrix
+        state["view_proj_matrix"] = view_proj_matrix
+        state["proj_matrix"] = proj_matrix
+
+        avg_quality = patch_scores.mean()
+        normalized_quality = torch.clamp(avg_quality / 50.0, 0.0, 2.0)
+        quality_factor = torch.clamp(1.0 + (normalized_quality - 1.0) * 0.5, 0.5, 1.5).item()
+        state["dynamic_grow_grad2d"] = self.grow_grad2d * quality_factor

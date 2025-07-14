@@ -727,6 +727,21 @@ class AdaptiveStrategy(DefaultStrategy):
             # base_reward = exp["initial_error"] - current_error
             base_reward = -reward_photo
 
+            shaped_reward = 0.0
+
+            action = exp["gaussian_action"]
+            initial_uncertainty = exp["initial_uncertainty"]
+
+            if initial_uncertainty > self.geom_uncertainty_thresh:
+                if action == 1 or action == 2:
+                    shaped_reward += 0.05
+                elif action == 0:
+                    shaped_reward -= 0.02
+
+            # initial_significance = exp["initial_significance"]
+            # if action == 4 and initial_significance < self.prune_significance_threshold:
+            #     shaped_reward += 0.1
+
             action = exp["gaussian_action"]
             initial_error = exp["initial_error"]
             initial_quality = exp["initial_quality"]
@@ -738,7 +753,7 @@ class AdaptiveStrategy(DefaultStrategy):
             #     action_cost += 100
 
 
-            final_reward = base_reward + action_cost
+            final_reward = base_reward + action_cost + shaped_reward
 
             if action == 0:
                 if initial_error < self.stable_error_threshold and \
@@ -949,6 +964,20 @@ class AdaptiveStrategy(DefaultStrategy):
         (gaussian_logits, _, continuous_params, lr_multipliers,
          region_logits, _) = self.ac_net(motion_features, region_features, region_assignments)
 
+
+        age_in_steps = state["age"][original_subset_indices]
+        significance = state["significance"][original_subset_indices]
+        opacities = torch.sigmoid(params["opacities"][original_subset_indices])
+
+        prune_merge_veto_mask = (
+                (age_in_steps < self.prune_age_threshold) |
+                (significance > self.prune_significance_threshold) |
+                (opacities.squeeze(-1) > self.prune_opa)
+        )
+
+        gaussian_logits[prune_merge_veto_mask, 3] = -torch.inf
+        gaussian_logits[prune_merge_veto_mask, 4] = -torch.inf
+
         progress = max(0.0, (step - self.bootstrap_steps) / self.exploration_decay_steps)
         epsilon = self.end_exploration_epsilon + (self.start_exploration_epsilon - self.end_exploration_epsilon) * (1 - progress)
 
@@ -1004,20 +1033,20 @@ class AdaptiveStrategy(DefaultStrategy):
         # prune_mask = (region_decision_for_each_gaussian == 2)
         # final_actions[prune_mask & ((final_actions == 1) | (final_actions == 2))] = 0
 
-        age_in_steps = state["age"][original_subset_indices]
-        significance = state["significance"][original_subset_indices]
-        scales_mag = torch.exp(params["scales"][original_subset_indices]).norm(dim=-1)
-        opacities = torch.sigmoid(params["opacities"][original_subset_indices])
+        # age_in_steps = state["age"][original_subset_indices]
+        # significance = state["significance"][original_subset_indices]
+        # scales_mag = torch.exp(params["scales"][original_subset_indices]).norm(dim=-1)
+        # opacities = torch.sigmoid(params["opacities"][original_subset_indices])
+        #
+        # prune_merge_veto_mask = (
+        #         (age_in_steps < self.prune_age_threshold) |
+        #         (significance > self.prune_significance_threshold) |
+        #         (opacities > self.prune_opa) |
+        #         (scales_mag > self.prune_scale3d * state["scene_scale"])
+        # )
 
-        prune_merge_veto_mask = (
-                (age_in_steps < self.prune_age_threshold) |
-                (significance > self.prune_significance_threshold) |
-                (opacities > self.prune_opa) |
-                (scales_mag > self.prune_scale3d * state["scene_scale"])
-        )
-
-        final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
-        final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
+        # final_actions[(final_actions == 3) & prune_merge_veto_mask] = 0
+        # final_actions[(final_actions == 4) & prune_merge_veto_mask] = 0
 
         final_finetune_mask_subset = (final_actions == 5) # Finetune action
         final_prune_mask_subset = (final_actions == 4) # Prune action

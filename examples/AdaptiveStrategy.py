@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.distributions import Categorical
 
+from examples.utils import knn_with_ids
 from gsplat.strategy.default import DefaultStrategy
 from gsplat.strategy.ops import remove, split, reset_opa
 from tensordict import TensorDict
@@ -205,9 +206,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         # Feature 4: Normalized distance to nearest neighbor
         if n_subset > 5:
-            means_subset = params["means"][subset_mask]
-            # Using a simplified KNN approach here for speed
-            dists, _ = torch.cdist(means_subset, means_subset).kthvalue(2, dim=1) # k=2 to get the first neighbor (k=1 is self)
+            dists, _ = knn_with_ids(subset_mask, K=5 + 1)
             features[:, 4] = dists / state["scene_scale"]
 
         return torch.nan_to_num(features, 0.0)

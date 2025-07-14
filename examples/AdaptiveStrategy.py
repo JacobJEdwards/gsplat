@@ -305,8 +305,8 @@ class AdaptiveStrategy(DefaultStrategy):
                 features[valid_indices, 6] = state["geom_uncertainty_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
             if state.get("quality_heatmap") is not None:
                 features[valid_indices, 7] = state["quality_heatmap"][patch_coords_y[valid_indices], patch_coords_x[valid_indices]]
-            if state.get("detail_error_map") is not None:
-                features[valid_indices, 8] = state["detail_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+            # if state.get("detail_error_map") is not None:
+            #     features[valid_indices, 8] = state["detail_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
 
         if self.knn_fn is not None and len(params["means"]) > 5:
             dists, idxs = self.knn_fn(means3d_subset, K=5 + 1)

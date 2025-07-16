@@ -209,11 +209,11 @@ class AdaptiveStrategy(DefaultStrategy):
         normalized_grads = state["grad2d"] / state["count"].clamp_min(1.0)
         candidate_mask = normalized_grads > self.grow_grad2d
 
-        if candidate_mask.sum() > self.max_densification_subset:
-            candidate_indices = torch.where(candidate_mask)[0]
-            rand_indices = torch.randperm(len(candidate_indices), device=device)[:self.max_densification_subset]
-            candidate_mask.fill_(False)
-            candidate_mask[candidate_indices[rand_indices]] = True
+        # if candidate_mask.sum() > self.max_densification_subset:
+        #     candidate_indices = torch.where(candidate_mask)[0]
+        #     rand_indices = torch.randperm(len(candidate_indices), device=device)[:self.max_densification_subset]
+        #     candidate_mask.fill_(False)
+        #     candidate_mask[candidate_indices[rand_indices]] = True
 
         if candidate_mask.sum() == 0:
             return 0, 0

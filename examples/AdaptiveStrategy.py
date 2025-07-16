@@ -92,7 +92,7 @@ class AdaptiveStrategy(DefaultStrategy):
     uncertainty_bonus_factor: float = 0.05
 
     reward_delay: int = 400
-    reward_patch_radius: int = 64
+    reward_patch_radius: int = 128
     gauss_count_penalty_factor: float = 0.01
 
     max_densification_subset: int = 50_000

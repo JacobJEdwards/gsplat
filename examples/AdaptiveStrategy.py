@@ -413,6 +413,9 @@ class AdaptiveStrategy(DefaultStrategy):
                 valid_indices]]
             features[valid_indices, 6] = state["detail_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
 
+        # age
+        features[:, 7] = state["age"][subset_mask].float() / self.refine_stop_iter
+
         if self.knn_fn is not None and len(params["means"]) > 40:
             dists, idxs = knn_with_ids(means3d_subset, K=41)
             neighbor_idxs = idxs[:, 1:]

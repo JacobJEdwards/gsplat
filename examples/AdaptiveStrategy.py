@@ -15,6 +15,28 @@ from tensordict import TensorDict
 from torchrl.data import RandomSampler, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyMemmapStorage
 
+class WorldModel(nn.Module):
+    def __init__(self, feature_dim: int, hidden_dim: int, action_embedding_dim: int = 16):
+        super().__init__()
+        self.action_embedding = nn.Embedding(3, action_embedding_dim) # 3 actions: 0=nothing, 1=split, 2=duplicate
+
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim + action_embedding_dim, hidden_dim),
+            nn.SELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, features: Tensor, actions: Tensor) -> Tensor:
+        action_embeds = self.action_embedding(actions)
+        if action_embeds.dim() == 1:
+            action_embeds = action_embeds.unsqueeze(0)
+        if features.dim() == 1:
+            features = features.unsqueeze(0)
+
+        x = torch.cat([features, action_embeds], dim=-1)
+        return self.net(x).squeeze(-1)
 
 class SimpleActorCritic(nn.Module):
     def __init__(self, feature_dim: int, hidden_dim: int, action_dim: int):

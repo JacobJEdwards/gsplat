@@ -747,8 +747,10 @@ class Runner:
 
                 ssim_error_map = (1.0 - ssim_map) / 2.0
 
-                # pad_size = (11 - 1) // 2
-                # ssim_error_map = F.pad(ssim_error_map, (pad_size, pad_size, pad_size, pad_size), 'replicate')
+                ssim_error_map = ssim_error_map.mean(dim=1, keepdim=True)
+
+                pad_size = (11 - 1) // 2
+                ssim_error_map = F.pad(ssim_error_map, (pad_size, pad_size, pad_size, pad_size), 'replicate')
 
                 ssim_error_map = ssim_error_map.squeeze(1)
 

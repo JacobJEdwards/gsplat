@@ -100,6 +100,13 @@ class AdaptiveStrategy(DefaultStrategy):
             return
 
         state["step"] = step
+
+        if step == self.imitation_steps:
+            if self.verbose:
+                print(f"--- End of Imitation Phase at step {step}. Clearing replay buffers. ---")
+            state["prune_replay_buffer"].empty()
+            state["grow_replay_buffer"].empty()
+
         is_imitation_phase = step < self.imitation_steps
 
         if self.prune_ac_net is None:

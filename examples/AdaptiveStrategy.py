@@ -26,13 +26,13 @@ class RSSMState:
 class GraphEncoder(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
-        self.conv1 = gnn.GATv2Conv(input_dim, hidden_dim, heads=4)
-        self.conv2 = gnn.GATv2Conv(hidden_dim * 4, hidden_dim, heads=4)
+        self.conv1 = gnn.GATv2Conv(input_dim, hidden_dim, heads=4, concat=True, edge_dim=1)
+        self.conv2 = gnn.GATv2Conv(hidden_dim * 4, hidden_dim, heads=4, concat=True, edge_dim=1)
         self.output_head = nn.Linear(hidden_dim * 4, output_dim)
 
-    def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
-        x = F.elu(self.conv1(x, edge_index))
-        x = F.elu(self.conv2(x, edge_index))
+    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
+        x = F.elu(self.conv1(x, edge_index, edge_attr=edge_attr))
+        x = F.elu(self.conv2(x, edge_index, edge_attr=edge_attr))
         return self.output_head(x)
 
 class RSSM(nn.Module):

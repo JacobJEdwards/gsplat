@@ -76,10 +76,23 @@ class AdaptiveStrategy(DefaultStrategy):
     prune_significance_thresh: float = 0.01
     prune_min_age: int = 800
 
+    es_population_size: int = 50
+    es_sigma: float = 0.1
+    es_learning_rate: float = 0.01
+
     grow_ac_net: Any = field(default=None, repr=False)
-    grow_ac_optimizer: Any = field(default=None, repr=False)
 
     writer: Any = field(default=None, repr=False)
+
+    def _get_flat_params(self, model: nn.Module) -> torch.Tensor:
+        return torch.cat([p.detach().view(-1) for p in model.parameters()])
+
+    def _set_flat_params(self, model: nn.Module, flat_params: torch.Tensor):
+        pointer = 0
+        for p in model.parameters():
+            num_params = p.numel()
+            p.data.copy_(flat_params[pointer:pointer + num_params].view_as(p))
+            pointer += num_params
 
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
@@ -89,18 +102,30 @@ class AdaptiveStrategy(DefaultStrategy):
             "l1_loss_map": None,
             "detail_error_map": None,
             "view_proj_matrix": None,
-            "grow_replay_buffer": TensorDictReplayBuffer(
-                storage=LazyMemmapStorage(max_size=30_000), sampler=RandomSampler(), batch_size=512,
-            ),
+            "es_master_weights": None,
+            "es_population_noise": None,
+            "es_population_rewards": None,
+            "es_current_member_idx": 0,
             "grow_reward_queue": deque(maxlen=10_000),
         })
         return state
 
-    def _initialize_learning_components(self, device: torch.device) -> None:
+    def _initialize_learning_components(self, state: dict, device: torch.device) -> None:
         self.grow_ac_net = SimpleActorCritic(self.feature_dim, self.hidden_dim, 3).to(device)
-        self.grow_ac_optimizer = torch.optim.AdamW(self.grow_ac_net.parameters(), lr=self.learning_rate)
+        master_weights = self._get_flat_params(self.grow_ac_net)
 
-        print("Initialized separate Pruning and Growing Actor-Critic networks.")
+        state["es_master_weights"] = master_weights
+
+        state["es_population_noise"] = torch.randn(
+            self.es_population_size,
+            len(master_weights),
+            device=device
+        )
+
+        state["es_population_rewards"] = torch.zeros(self.es_population_size, device=device)
+
+        print("Initialized Actor-Critic network for ES-based growth.")
+
 
     def step_post_backward(
             self,
@@ -117,7 +142,7 @@ class AdaptiveStrategy(DefaultStrategy):
         state["step"] = step
 
         if self.grow_ac_net is None:
-            self._initialize_learning_components(params["means"].device)
+            self._initialize_learning_components(state, params["means"].device)
         if state.get("age") is None:
             state["age"] = torch.zeros(params["means"].shape[0], dtype=torch.int32, device=params["means"].device)
 
@@ -147,15 +172,19 @@ class AdaptiveStrategy(DefaultStrategy):
         self._process_rewards(state, step)
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
-
+            current_idx = state["es_current_member_idx"]
+            next_idx = (current_idx + 1) % self.es_population_size
+            state["es_current_member_idx"] = next_idx
 
             n_prune = self.prune_gs(params, optimizers, state)
             n_split, n_duplicate = self.grow_gs(params, optimizers, state)
-            if self.verbose:
-                print(f"Step {step}: Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}.")
 
-        if step > self.refine_start_iter and step % self.learn_every == 0:
-            self._train_rl_agent(state)
+            if self.verbose:
+                print(f"Step {step}: Evaluated Pop Member {current_idx}. Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}.")
+
+
+        if step > self.refine_start_iter and state["es_current_member_idx"] == 0 and step % self.refine_every == 0:
+            self._train_es_agent(state)
 
         if step % self.reset_every == 0 and step > 0:
             reset_opa(params, optimizers, state, self.prune_opa * 2.0)
@@ -216,12 +245,20 @@ class AdaptiveStrategy(DefaultStrategy):
         original_indices = torch.where(candidate_mask)[0]
         features = self._get_simplified_features(params, state, candidate_mask)
 
+        current_idx = state["es_current_member_idx"]
+        master_weights = state["es_master_weights"]
+        noise = state["es_population_noise"][current_idx]
+
+        perturbed_weights = master_weights + self.es_sigma * noise
+        self._set_flat_params(self.grow_ac_net, perturbed_weights)
+
         self.grow_ac_net.train()
         action_logits, _ = self.grow_ac_net(features)
 
         action_dist = Categorical(logits=action_logits)
         actions = action_dist.sample()
-        self._queue_rl_experience(state, features, actions, action_dist.log_prob(actions), original_indices)
+
+        self._queue_es_experience(state, features, actions, original_indices, current_idx)
 
         state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "gaussian_contribution"]}
         split_mask = (actions == 1)
@@ -248,50 +285,8 @@ class AdaptiveStrategy(DefaultStrategy):
         state.update(state_to_modify)
         return n_split, n_duplicate
 
-    def _train_rl_agent(self, state: dict):
-        replay_buffer = state["grow_replay_buffer"]
-        if len(replay_buffer) < replay_buffer.batch_size:
-            return
-
-        agent_net = self.grow_ac_net
-        optimizer = self.grow_ac_optimizer
-        device = next(agent_net.parameters()).device
-
-        batch = replay_buffer.sample().to(device)
-        features = batch.get("features")
-        actions = batch.get("action").squeeze(-1)
-        rewards = batch.get("reward").squeeze(-1)
-        old_log_probs = batch.get("log_prob").squeeze(-1)
-
-        new_logits, values = agent_net(features)
-        values = values.squeeze(-1)
-
-        advantage = rewards - values.detach()
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-
-        new_dist = Categorical(logits=new_logits)
-        new_log_probs = new_dist.log_prob(actions)
-        ratio = torch.exp(new_log_probs - old_log_probs)
-
-        surr1 = ratio * advantage
-        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantage
-        actor_loss = -torch.min(surr1, surr2).mean()
-
-        critic_loss = F.mse_loss(values, rewards)
-        entropy_loss = -new_dist.entropy().mean()
-        loss = actor_loss + self.critic_loss_weight * critic_loss + self.entropy_loss_weight * entropy_loss
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        self.writer.add_scalar(f"agent/grow_loss", loss.item(), state.get("step",-1))
-        self.writer.add_scalar(f"agent/grow_actor_loss", actor_loss.item(), state.get("step",-1))
-        self.writer.add_scalar(f"agent/grow_critic_loss", critic_loss.item(), state.get("step",-1))
-        self.writer.add_scalar(f"agent/grow_mean_reward", rewards.mean().item(), state.get("step",-1))
-
     @torch.no_grad()
-    def _queue_rl_experience(self, state: dict, features: Tensor, actions: Tensor, log_probs: Tensor, indices: Tensor):
+    def _queue_es_experience(self, state: dict, features: Tensor, actions: Tensor, indices: Tensor, population_idx: int):
         if state.get("detail_error_map") is None: return
 
         detail_error_map = state["detail_error_map"].squeeze()
@@ -315,9 +310,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
             experience = {
                 "step": state["step"],
-                "features": features[i].detach(),
-                "action": actions[i].detach(),
-                "log_prob": log_probs[i].detach(),
+                "population_idx": population_idx,
                 "pixel_x": x, "pixel_y": y,
                 "initial_patch_error": initial_patch_error,
             }
@@ -325,7 +318,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
     def _process_rewards(self, state: dict, current_step: int):
         reward_queue = state["grow_reward_queue"]
-        replay_buffer = state["grow_replay_buffer"]
 
         while reward_queue and (current_step - reward_queue[0]["step"]) >= self.reward_delay:
             exp = reward_queue.popleft()
@@ -340,14 +332,40 @@ class AdaptiveStrategy(DefaultStrategy):
 
             new_error_patch = detail_error_map[y_min:y_max, x_min:x_max]
             new_patch_error = new_error_patch.mean() if new_error_patch.numel() > 0 else torch.tensor(0.0)
+
             reward = (exp["initial_patch_error"] - new_patch_error * 10).clamp(-1.0, 1.0)
 
-            if len(replay_buffer) < replay_buffer._storage.max_size:
-                td = TensorDict({
-                    "features": exp["features"], "action": exp["action"],
-                    "log_prob": exp["log_prob"], "reward": reward,
-                }, batch_size=[])
-                replay_buffer.add(td)
+            pop_idx = exp["population_idx"]
+            state["es_population_rewards"][pop_idx] += reward
+
+    def _train_es_agent(self, state: dict):
+        step = state.get("step", -1)
+        device = state["es_master_weights"].device
+
+        rewards = state["es_population_rewards"]
+        if rewards.std() > 1e-6:
+            normalized_rewards = (rewards - rewards.mean()) / rewards.std()
+        else:
+            normalized_rewards = torch.zeros_like(rewards)
+
+        noise_vectors = state["es_population_noise"]
+        gradient_estimate = torch.matmul(normalized_rewards, noise_vectors)
+
+        update_step = (self.es_learning_rate / (self.es_population_size * self.es_sigma)) * gradient_estimate
+        state["es_master_weights"] += update_step
+
+        if self.writer is not None:
+            self.writer.add_scalar(f"agent/es_mean_reward", rewards.mean().item(), step)
+            self.writer.add_scalar(f"agent/es_max_reward", rewards.max().item(), step)
+            self.writer.add_scalar(f"agent/es_update_norm", torch.linalg.norm(update_step).item(), step)
+
+        state["es_population_noise"] = torch.randn_like(state["es_population_noise"])
+        state["es_population_rewards"].zero_()
+        state["es_current_member_idx"] = 0
+
+        if self.verbose:
+            print(f"Step {step}: ES update complete. Mean reward: {rewards.mean().item():.4f}")
+
 
     @torch.no_grad()
     def _get_simplified_features(self, params: dict, state: dict, subset_mask: Tensor) -> Tensor:

@@ -43,9 +43,9 @@ class AdaptiveStrategy(DefaultStrategy):
     reward_patch_radius: int = 4
     hidden_dim: int = 64
     action_dim: int = 4  # 0: No-op, 1: Prune, 2: Split, 3: Duplicate
-    learning_rate: float = 3e-4
-    ppo_clip_epsilon: float = 0.2
-    entropy_loss_weight: float = 0.01
+    learning_rate: float = 1e-4
+    ppo_clip_epsilon: float = 0.15
+    entropy_loss_weight: float = 0.015
     reward_delay: int = 200
     max_densification_subset: int = 100_000
 
@@ -59,11 +59,11 @@ class AdaptiveStrategy(DefaultStrategy):
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
         replay_buffer = TensorDictReplayBuffer(
-            storage=LazyMemmapStorage(max_size=50_000),
+            storage=LazyMemmapStorage(max_size=60_000),
             sampler=RandomSampler(),
-            batch_size=256
+            batch_size=512
         )
-        reward_queue = deque(maxlen=10_000)
+        reward_queue = deque(maxlen=20_000)
 
         state.update({
             "age": None,

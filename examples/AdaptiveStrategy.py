@@ -350,7 +350,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         for i in range(features.shape[0]):
             y, x = pixel_y[i], pixel_x[i]
-            # Extract patches
             y_start, y_end = max(0, y - r), min(info["height"], y + r)
             x_start, x_end = max(0, x - r), min(info["width"], x + r)
 

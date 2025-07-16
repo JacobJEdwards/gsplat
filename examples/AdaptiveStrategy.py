@@ -429,6 +429,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         return torch.nan_to_num(features, 0.0)
 
+
     # Required helper from parent, not directly used by new logic but needed for state
     def _update_quality_map(self, params: dict, state: dict, info: dict):
         if info.get("camtoworlds") is None: return

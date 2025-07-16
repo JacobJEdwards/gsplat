@@ -227,7 +227,8 @@ class AdaptiveStrategy(DefaultStrategy):
         actions = action_dist.sample()
         self._queue_rl_experience(state, features, actions, action_dist.log_prob(actions), original_indices, "grow")
 
-        state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "gaussian_contribution"]}
+        state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age",
+                                                                   "gaussian_contribution", "significance","prev_grad2d", "prev_opacity"]}
         split_mask = (actions == 1)
         duplicate_mask = (actions == 2)
 

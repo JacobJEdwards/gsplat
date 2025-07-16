@@ -71,7 +71,7 @@ class WorldModel(nn.Module):
 class AdaptiveStrategy(DefaultStrategy):
     refine_every: int = 400
     learn_every: int = 100
-    refine_start_iter: int = 1000
+    refine_start_iter: int = 400
 
     prune_min_age: int = 1000
     prune_significance_thresh: float = 0.01

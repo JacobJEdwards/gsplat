@@ -54,6 +54,8 @@ class AdaptiveStrategy(DefaultStrategy):
     prune_ac_net: Any = field(default=None, repr=False)
     prune_ac_optimizer: Any = field(default=None, repr=False)
 
+    prune_significance_thresh: float = 0.01
+
     grow_ac_net: Any = field(default=None, repr=False)
     grow_ac_optimizer: Any = field(default=None, repr=False)
 
@@ -123,6 +125,21 @@ class AdaptiveStrategy(DefaultStrategy):
         state["pixels"] = info.get("pixels")
         state["gaussian_contribution"] = info.get("gaussian_contribution")
 
+        if state.get("significance") is None:
+            state["significance"] = torch.zeros(params["means"].shape[0], device=params["means"].device)
+
+        if "gaussian_contribution" in info:
+            current_significance = info["gaussian_contribution"]
+
+            if state["significance"] is None or state["significance"].shape[0] != current_significance.shape[0]:
+                state["significance"] = torch.zeros_like(current_significance)
+
+            if state["significance"].device != current_significance.device:
+                state["significance"] = state["significance"].to(current_significance.device)
+
+            state["significance"] = 0.9 * state["significance"] + 0.1 * current_significance
+
+
         self._update_quality_map(params, state, info)
         self._update_state(params, state, info, packed=packed)
 
@@ -147,48 +164,62 @@ class AdaptiveStrategy(DefaultStrategy):
             reset_opa(params, optimizers, state, self.prune_opa * 2.0)
 
     @torch.no_grad()
-    def prune_gs(self, params: dict, optimizers: dict, state: dict, is_imitation_phase: bool) -> int:
-        device = params["means"].device
-        opacities = torch.sigmoid(params["opacities"].flatten())
-        is_too_transparent = opacities < self.prune_opa
-        is_too_large = torch.exp(params["scales"]).max(dim=-1).values > self.prune_scale3d * state["scene_scale"]
+    def prune_gs(self, params: dict, optimizers: dict, state: dict) -> int:
+        step = state.get("step", 0)
 
-        candidate_mask = is_too_transparent | is_too_large
+        is_prune_original = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
+        if step > self.reset_every:
+            is_too_big = (
+                    torch.exp(params["scales"]).max(dim=-1).values
+                    > self.prune_scale3d * state["scene_scale"]
+            )
+            if step < self.refine_scale2d_stop_iter:
+                is_too_big |= state["radii"] > self.prune_scale2d
+            is_prune_original |= is_too_big
 
-        if candidate_mask.sum() == 0:
-            return 0
+        is_prune_significant = torch.zeros_like(is_prune_original)
+        if "significance" in state and state["significance"] is not None and state["significance"].numel() > 0:
+            if state["significance"].numel() == is_prune_original.numel():
+                is_prune_significant = state["significance"] < self.prune_significance_thresh
 
-        original_indices = torch.where(candidate_mask)[0]
-        features = self._get_simplified_features(params, state, candidate_mask)
+        # is_prune_redundant = torch.zeros_like(is_prune_original)
+        # num_gaussians = len(params["means"])
+        # device = params["means"].device
+        # subset_mask = torch.rand(num_gaussians, device=device) <
+        # subset_indices_map = torch.where(subset_mask)[0]
+        #
+        # if subset_indices_map.numel() > self.redundancy_knn:
+        #     subset_means = params["means"][subset_mask]
+        #     dists_subset, idxs_subset = self.knn_fn(subset_means, K=self.redundancy_knn)
+        #     original_neighbor_idxs = subset_indices_map[idxs_subset[:, 1:]]
+        #     neighbor_scales = torch.exp(params["scales"][original_neighbor_idxs]).max(dim=-1).values
+        #
+        #     neighbor_opacities = torch.sigmoid(params["opacities"][original_neighbor_idxs].squeeze(-1))
+        #     neighbor_sh0 = params["sh0"][original_neighbor_idxs].squeeze(-2)
+        #     scales_subset = torch.exp(params["scales"][subset_mask]).max(dim=-1).values
+        #     opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
+        #     sh0_subset = params["sh0"][subset_mask].squeeze(1)
+        #
+        #     overlap_mask = dists_subset[:, 1:] < (scales_subset.unsqueeze(1) + neighbor_scales) * self.redundancy_overlap_thresh
+        #     color_dist = torch.norm(sh0_subset.unsqueeze(1) - neighbor_sh0, dim=-1)
+        #     color_sim_mask = color_dist < self.redundancy_color_thresh
+        #     is_less_opaque = opacities_subset.unsqueeze(1) < neighbor_opacities
+        #     is_redundant_neighbor = overlap_mask & color_sim_mask & is_less_opaque
+        #     is_prune_redundant[subset_indices_map] = is_redundant_neighbor.any(dim=1)
 
-        self.prune_ac_net.train(is_imitation_phase)
-        action_logits, _ = self.prune_ac_net(features)
+        is_prune = is_prune_original | is_prune_significant
 
-        if is_imitation_phase:
-            labels = torch.ones(len(original_indices), dtype=torch.long, device=device)
-            for i in range(len(original_indices)):
-                experience = TensorDict({
-                    "features": features[i],
-                    "action": labels[i]
-                }, batch_size=[])
-                state["prune_replay_buffer"].add(experience)
-            actions = labels
-        else:
-            action_dist = Categorical(logits=action_logits)
-            actions = action_dist.sample()
-            self._queue_rl_experience(state, features, actions, action_dist.log_prob(actions), original_indices, "prune")
-
-        prune_mask_agent = (actions == 1)
-        global_prune_mask = torch.zeros_like(candidate_mask)
-        global_prune_mask[original_indices[prune_mask_agent]] = True
-
-        n_prune = global_prune_mask.sum().item()
+        n_prune = is_prune.sum().item()
         if n_prune > 0:
-            state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "gaussian_contribution"]}
-            remove(params, optimizers, state_to_modify, global_prune_mask)
-            state.update(state_to_modify)
+            per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance"]
+            state_to_prune = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
+
+            remove(params=params, optimizers=optimizers, state=state_to_prune, mask=is_prune)
+
+            state.update(state_to_prune)
 
         return n_prune
+
 
     @torch.no_grad()
     def grow_gs(self, params: dict, optimizers: dict, state: dict, is_imitation_phase: bool) -> Tuple[int, int]:
@@ -432,6 +463,8 @@ class AdaptiveStrategy(DefaultStrategy):
             features[:, 6] = contribution[subset_mask]
 
         return torch.nan_to_num(features, 0.0)
+
+
     def _update_quality_map(self, params: dict, state: dict, info: dict):
         if info.get("camtoworlds") is None: return
         width, height = info['width'], info['height']

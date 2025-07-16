@@ -353,6 +353,9 @@ class AdaptiveStrategy(DefaultStrategy):
             y_start, y_end = max(0, y - r), min(info["height"], y + r)
             x_start, x_end = max(0, x - r), min(info["width"], x + r)
 
+            if (y_end - y_start) < min_patch_size or (x_end - x_start) < min_patch_size:
+                continue
+
             initial_patch = rendered_img_p[..., y_start:y_end, x_start:x_end]
             gt_patch = gt_img_p[..., y_start:y_end, x_start:x_end]
 
@@ -402,14 +405,20 @@ class AdaptiveStrategy(DefaultStrategy):
         current_scene_encoding = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device)).mean(dim=0).detach()
 
         r = self.reward_patch_radius
+        min_patch_size = 16
 
         while queue and (current_step - queue[0]["step"]) >= self.reward_delay:
             exp = queue.popleft()
 
             y, x = exp["pixel_y"], exp["pixel_x"]
-            current_patch = rendered_img_p[..., y-r:y+r, x-r:x+r]
-            gt_patch = gt_img_p[..., y-r:y+r, x-r:x+r]
-            if current_patch.shape[-1] < 1 or current_patch.shape[-2] < 1: continue
+            y_start, y_end = max(0, y - r), min(info["height"], y + r)
+            x_start, x_end = max(0, x - r), min(info["width"], x + r)
+
+            if (y_end - y_start) < min_patch_size or (x_end - x_start) < min_patch_size:
+                continue
+
+            current_patch = rendered_img_p[..., y_start:y_end, x_start:x_end]
+            gt_patch = gt_img_p[..., y_start:y_end, x_start:x_end]
 
             current_patch_lpips = self.lpips_metric(current_patch, gt_patch)
 

@@ -92,7 +92,6 @@ class AdaptiveStrategy(DefaultStrategy):
     uncertainty_bonus_factor: float = 0.05
 
     reward_delay: int = 400
-    reward_patch_radius: int = 128
     gauss_count_penalty_factor: float = 0.01
 
     max_densification_subset: int = 50_000
@@ -275,39 +274,41 @@ class AdaptiveStrategy(DefaultStrategy):
 
         return n_split, n_duplicate
 
-
     def _train_models(self, state: dict):
         if len(state["replay_buffer"]) < state["replay_buffer"].batch_size: return
         device = self.actor_critic.parameters().__next__().device
         batch = state["replay_buffer"].sample().to(device)
 
         features = batch.get("features")
-        next_features = batch.get("next_features")
+        scene_encodings = batch.get("scene_encoding")
+        next_scene_encodings = batch.get("next_scene_encoding")
         actions = batch.get("action").squeeze(-1)
-        rewards = batch.get("reward").squeeze(-1)
+        rewards_raw = batch.get("reward").squeeze(-1)
         old_log_probs = batch.get("log_prob").squeeze(-1)
         old_values = batch.get("value").squeeze(-1)
 
         with torch.autocast(enabled=False, device_type="cuda"):
-            next_features_pred = self.world_model(features)
-            wm_loss = F.mse_loss(next_features_pred, next_features)
+            next_scene_pred = self.world_model(scene_encodings)
+            wm_loss = F.mse_loss(next_scene_pred, next_scene_encodings)
 
         self.wm_optimizer.zero_grad()
         wm_loss.backward()
         self.wm_optimizer.step()
 
         with autocast(enabled=False, device_type="cuda"), torch.no_grad():
-            next_values = self.actor_critic(next_features)[1]
+            rewards = (rewards_raw - rewards_raw.mean()) / (rewards_raw.std() + 1e-8)
+
+            next_values = self.actor_critic(self.graph_encoder.output_head(next_scene_encodings))[1]
+
             delta = rewards + 0.99 * next_values - old_values
             advantages = (delta - delta.mean()) / (delta.std() + 1e-8)
             returns = advantages + old_values
-
-
 
         with autocast(enabled=False, device_type="cuda"):
             new_dist, new_values = self.actor_critic(features)
             new_log_probs = new_dist.log_prob(actions)
             ratio = torch.exp(new_log_probs - old_log_probs)
+
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantages
             actor_loss = -torch.min(surr1, surr2).mean()
@@ -326,122 +327,81 @@ class AdaptiveStrategy(DefaultStrategy):
         self.writer.add_scalar("agent/wm_loss", wm_loss.item(), state["step"])
         self.writer.add_scalar("agent/mean_reward", rewards.mean().item(), state["step"])
 
-        if self.verbose:
-            print(f"Step {state['step']}: AC Loss: {ac_loss.item():.4f}, Actor Loss: {actor_loss.item():.4f}, "
-                  f"Critic Loss: {critic_loss.item():.4f}, Entropy Loss: {entropy_loss.item():.4f}, "
-                  f"WM Loss: {wm_loss.item():.4f}, Mean Reward: {rewards.mean().item():.4f}")
-
 
     @torch.no_grad()
     def _queue_per_node_experience(self, state: dict, info: dict, features: Tensor, actions: Tensor, log_probs: Tensor,
-                                   values: Tensor, uncertainty: Tensor, original_indices: Tensor) -> None:
+                                   values: Tensor, uncertainty: Tensor) -> None:
 
-        means3d = state["params_for_features"]["means"][original_indices]
-        h, w = info["height"], info["width"]
+        rendered_img = torch.clamp(info["colors"], 0.0, 1.0).permute(0, 3, 1, 2)
+        gt_img = torch.clamp(info["pixels"], 0.0, 1.0).permute(0, 3, 1, 2)
+        initial_lpips = self.lpips_metric(rendered_img, gt_img)
 
-        means_h = F.pad(means3d, (0, 1), value=1.0)
-        p_hom = means_h @ state["view_proj_matrix"]
-        p_w = 1.0 / (p_hom[:, 3].clamp_min(1e-6))
-        p_proj = p_hom[:, :2] * p_w[:, None]
-        pixel_x = torch.clamp(((p_proj[:, 0] * 0.5 + 0.5) * w), 0, w - 1).long()
-        pixel_y = torch.clamp(((p_proj[:, 1] * 0.5 + 0.5) * h), 0, h - 1).long()
-
-        rendered_img_p = torch.clamp(info["colors"], 0., 1.).permute(0, 3, 1, 2)
-        gt_img_p = torch.clamp(info["pixels"], 0., 1.).permute(0, 3, 1, 2)
         scene_encoding = features.mean(dim=0).detach()
-        r = self.reward_patch_radius
-
-        min_patch_size = 32
 
         for i in range(features.shape[0]):
-            y, x = pixel_y[i], pixel_x[i]
-            y_start, y_end = max(0, y - r), min(info["height"], y + r)
-            x_start, x_end = max(0, x - r), min(info["width"], x + r)
-
-            if (y_end - y_start) < min_patch_size or (x_end - x_start) < min_patch_size:
-                continue
-
-            initial_patch = rendered_img_p[..., y_start:y_end, x_start:x_end]
-            gt_patch = gt_img_p[..., y_start:y_end, x_start:x_end]
-
-            if initial_patch.shape[-1] < min_patch_size or initial_patch.shape[-2] < min_patch_size:
-                continue
-
-            initial_patch_lpips = self.lpips_metric(initial_patch, gt_patch)
-
             experience = {
-                "step": state["step"], "features": features[i].detach(),
-                "action": actions[i].detach(), "log_prob": log_probs[i].detach(),
-                "value": values[i].detach(), "uncertainty": uncertainty[i].detach(),
-                "pixel_y": y, "pixel_x": x,
-                "initial_patch_lpips": initial_patch_lpips.detach(),
+                "step": state["step"],
+                "features": features[i].detach(),
+                "action": actions[i].detach(),
+                "log_prob": log_probs[i].detach(),
+                "value": values[i].detach(),
+                "uncertainty": uncertainty[i].detach(),
                 "scene_encoding": scene_encoding,
+                "initial_lpips": initial_lpips.detach(),
+                "initial_gauss_count": state["age"].shape[0]
             }
             state["reward_queue"].append(experience)
-
-        # rendered_img = torch.clamp(info["colors"], 0.0, 1.0).permute(0, 3, 1, 2)
-        # gt_img = torch.clamp(info["pixels"], 0.0, 1.0).permute(0, 3, 1, 2)
-        # initial_lpips = self.lpips_metric(rendered_img, gt_img)
-        #
-        # scene_encoding = features.mean(dim=0).detach()
-        #
-        # for i in range(features.shape[0]):
-        #     experience = {
-        #         "step": state["step"],
-        #         "features": features[i].detach(),
-        #         "action": actions[i].detach(),
-        #         "log_prob": log_probs[i].detach(),
-        #         "value": values[i].detach(),
-        #         "uncertainty": uncertainty[i].detach(),
-        #         "scene_encoding": scene_encoding,
-        #         "initial_lpips": initial_lpips.detach(),
-        #         "initial_gauss_count": state["age"].shape[0]
-        #     }
-        #     state["reward_queue"].append(experience)
 
 
     def _process_rewards(self, params: dict, state: dict, current_step: int, info: dict) -> None:
         queue = state["reward_queue"]
         if not queue or (current_step - queue[0]["step"]) < self.reward_delay: return
 
-        rendered_img_p = torch.clamp(info["colors"], 0., 1.).permute(0, 3, 1, 2)
-        gt_img_p = torch.clamp(info["pixels"], 0., 1.).permute(0, 3, 1, 2)
+        with torch.no_grad(), autocast(enabled=False, device_type="cuda"):
+            current_scene_encoding = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device)).mean(dim=0).detach()
 
-        current_scene_encoding = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device)).mean(dim=0).detach()
 
-        r = self.reward_patch_radius
-        min_patch_size = 32
+        rendered_img = torch.clamp(info["colors"], 0.0, 1.0).permute(0, 3, 1, 2)
+        gt_img = torch.clamp(info["pixels"], 0.0, 1.0).permute(0, 3, 1, 2)
+        current_lpips = self.lpips_metric(rendered_img, gt_img)
 
+        current_scene_encoding = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0],
+                                                                                         dtype=torch.bool, device=params["means"].device
         while queue and (current_step - queue[0]["step"]) >= self.reward_delay:
             exp = queue.popleft()
 
-            y, x = exp["pixel_y"], exp["pixel_x"]
-            y_start, y_end = max(0, y - r), min(info["height"], y + r)
-            x_start, x_end = max(0, x - r), min(info["width"], x + r)
+            extrinsic_reward = (exp["initial_lpips"] - current_lpips) * 10.0
 
-            if (y_end - y_start) < min_patch_size or (x_end - x_start) < min_patch_size:
-                continue
-
-            current_patch = rendered_img_p[..., y_start:y_end, x_start:x_end]
-            gt_patch = gt_img_p[..., y_start:y_end, x_start:x_end]
-
-            current_patch_lpips = self.lpips_metric(current_patch, gt_patch)
-
-            extrinsic_reward = (exp["initial_patch_lpips"] - current_patch_lpips) * 10.0
             predicted_next_encoding = self.world_model(exp["scene_encoding"])
-            intrinsic_reward = F.mse_loss(predicted_next_encoding, current_scene_encoding)
-            reward = (extrinsic_reward + self.intrinsic_reward_factor * intrinsic_reward + self.uncertainty_bonus_factor * exp["uncertainty"])
+            intrinsic_reward = F.mse_loss(predicted_next_encoding, current_scene_encoding.detach())
 
-            td = TensorDict({
-                "features": exp["features"], "next_features": exp["features"], # Approximation
-                "action": exp["action"], "log_prob": exp["log_prob"],
-                "value": exp["value"], "reward": reward.clamp(-2.0, 2.0).detach(),
-            }, batch_size=[])
-            state["replay_buffer"].add(td)
+            gauss_count_now = params["means"].shape[0]
+            penalty = self.gauss_count_penalty_factor * max(0, gauss_count_now - exp["initial_gauss_count"])
+
+            uncertainty_bonus = exp["uncertainty"]
+
+            reward = (extrinsic_reward
+                      + self.intrinsic_reward_factor * intrinsic_reward
+                      + self.uncertainty_bonus_factor * uncertainty_bonus
+                      - penalty)
+
+            reward = reward.clamp(-2.0, 2.0)
+
+            if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
+                td = TensorDict({
+                    "features": exp["features"],
+                    "scene_encoding": exp["scene_encoding"],
+                    "next_scene_encoding": current_scene_encoding,
+                    "action": exp["action"], "log_prob": exp["log_prob"],
+                    "value": exp["value"], "reward": reward.clamp(-10.0, 10.0).detach(),
+                }, batch_size=[])
+                state["replay_buffer"].add(td)
+
+
+
 
     @torch.no_grad()
     def _get_features_from_graph(self, params: dict, state: dict, subset_mask: Tensor) -> Tensor:
-        state["params_for_features"] = params
         device = params["means"].device
         all_indices = torch.where(subset_mask)[0]
         if all_indices.numel() == 0:

@@ -264,7 +264,7 @@ class AdaptiveStrategy(DefaultStrategy):
         self.writer.add_scalar(f"agent/grow_mean_reward", rewards.mean().item(), state.get("step",-1))
 
     @torch.no_grad()
-    def _queue_rl_experience(self, state: dict, features: Tensor, actions: Tensor, log_probs: Tensor, indices: Tensor, agent_type: str):
+    def _queue_rl_experience(self, state: dict, features: Tensor, actions: Tensor, log_probs: Tensor, indices: Tensor):
         if state.get("l1_loss_map") is None: return
 
         l1_loss_map = state["l1_loss_map"].squeeze()
@@ -294,7 +294,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 "pixel_x": x, "pixel_y": y,
                 "initial_patch_error": initial_patch_error,
             }
-            state[f"{agent_type}_reward_queue"].append(experience)
+            state[f"grow_reward_queue"].append(experience)
 
     def _process_rewards(self, state: dict, current_step: int):
         reward_queue = state["grow_reward_queue"]

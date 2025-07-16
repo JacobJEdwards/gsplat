@@ -39,7 +39,8 @@ class AdaptiveStrategy(DefaultStrategy):
     refine_every: int = 400
     learn_every: int = 200
 
-    feature_dim: int = 5
+    feature_dim: int = 7
+    reward_patch_radius: int = 4
     hidden_dim: int = 64
     action_dim: int = 4  # 0: No-op, 1: Prune, 2: Split, 3: Duplicate
     learning_rate: float = 3e-4
@@ -76,7 +77,7 @@ class AdaptiveStrategy(DefaultStrategy):
     def _initialize_learning_components(self, device: torch.device) -> None:
         self.ac_net = SimpleActorCritic(self.feature_dim, self.hidden_dim, self.action_dim).to(device)
         self.ac_optimizer = torch.optim.AdamW(self.ac_net.parameters(), lr=self.learning_rate)
-        print("Initialized Simple Actor-Critic network.")
+        print("Initialised Simple Actor-Critic network.")
 
     def step_post_backward(
             self,
@@ -99,16 +100,19 @@ class AdaptiveStrategy(DefaultStrategy):
 
         state["age"] += 1
         state["l1_loss_map"] = info.get("l1_loss_map")
-        self._update_quality_map(params, state, info)
+        state["pixels"] = info.get("pixels")
+        state["gaussian_contribution"] = info.get("gaussian_contribution")
 
+        self._update_quality_map(params, state, info)
         self._update_state(params, state, info, packed=packed)
         self._process_rewards(state, step)
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
-            n_prune, n_split, n_duplicate = self._update_geometry(params, optimizers, state, step)
-            if self.verbose:
-                print(f"Step {step}: Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}. Now "
-                      f"{len(params['means'])} Gs.")
+            if state.get("pixels") is not None and state.get("gaussian_contribution") is not None:
+                n_prune, n_split, n_duplicate = self._update_geometry(params, optimizers, state, step)
+                if self.verbose:
+                    print(f"Step {step}: Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}. Now "
+                          f"{len(params['means'])} Gs.")
 
         if step > self.refine_start_iter and step % self.learn_every == 0:
             self._train_agent(state)
@@ -120,36 +124,54 @@ class AdaptiveStrategy(DefaultStrategy):
     @torch.no_grad()
     def _get_simplified_features(self, params: dict, state: dict, subset_mask: Tensor) -> Tensor:
         n_subset = subset_mask.sum().item()
+        if n_subset == 0:
+            return torch.zeros(0, self.feature_dim, device=params["means"].device)
+
         device = params["means"].device
         features = torch.zeros(n_subset, self.feature_dim, device=device)
 
         grads2d = state["grad2d"][subset_mask]
         counts = state["count"][subset_mask].clamp_min(1)
         features[:, 0] = (grads2d / counts) / self.grow_grad2d
-
         scales = params["scales"][subset_mask]
         features[:, 1] = torch.log(scales.max(dim=-1).values / state["scene_scale"])
-
         features[:, 2] = params["opacities"][subset_mask].flatten()
-
         features[:, 3] = state["age"][subset_mask] / 1000.0
 
         if n_subset > 5:
             means3d_subset = params["means"][subset_mask]
-            dists, idxs = knn_with_ids(means3d_subset, K=5 + 1)
-            # neighbor_idxs = idxs[:, 1:]
-
+            dists, _ = knn_with_ids(means3d_subset, K=5 + 1)
             features[:, 4] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
 
-            # neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
-            # neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
-            # neighbor_sh0 = params["sh0"][neighbor_idxs].squeeze(-2)
-            #
-            # sh0_subset = params["sh0"][subset_mask]
+        gt_pixels_full = state["pixels"]
+        gt_pixels = gt_pixels_full.squeeze(0) if gt_pixels_full is not None and gt_pixels_full.dim() == 4 else gt_pixels_full
 
-            # features[:, 5] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
-            # features[:, 6] = neighbor_opacities.mean(dim=-1)
-            # features[:, 7] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
+        if gt_pixels is not None:
+            h, w, _ = gt_pixels.shape
+            means_subset = params["means"][subset_mask]
+            means_h = F.pad(means_subset, (0, 1), value=1.0)
+            p_hom = means_h @ state["view_proj_matrix"]
+            p_w = 1.0 / (p_hom[:, 3].clamp_min(1e-6))
+            p_proj = p_hom[:, :2] * p_w[:, None]
+
+            pixel_x = torch.clamp(((p_proj[:, 0] * 0.5 + 0.5) * w), 0, w - 1).long()
+            pixel_y = torch.clamp(((p_proj[:, 1] * 0.5 + 0.5) * h), 0, h - 1).long()
+
+            r = self.reward_patch_radius
+            patch_complexities = torch.zeros(n_subset, device=device)
+            for i in range(n_subset):
+                y, x = pixel_y[i], pixel_x[i]
+                y_min, y_max = max(0, y - r), min(h, y + r + 1)
+                x_min, x_max = max(0, x - r), min(w, x + r + 1)
+                patch = gt_pixels[y_min:y_max, x_min:x_max]
+                if patch.numel() > 0:
+                    patch_complexities[i] = patch.mean(dim=-1).std()
+
+            features[:, 5] = patch_complexities
+
+        contribution = state.get("gaussian_contribution")
+        if contribution is not None:
+            features[:, 6] = contribution[subset_mask]
 
         return torch.nan_to_num(features, 0.0)
 
@@ -179,7 +201,8 @@ class AdaptiveStrategy(DefaultStrategy):
         actions = action_dist.sample()
         log_probs = action_dist.log_prob(actions)
 
-        h, w = state["l1_loss_map"].shape
+        l1_loss_map = state["l1_loss_map"].squeeze() if state["l1_loss_map"].dim() > 2 else state["l1_loss_map"]
+        h, w = l1_loss_map.shape
         means_h = F.pad(params["means"][original_indices], (0, 1), value=1.0)
         p_hom = means_h @ state["view_proj_matrix"]
         p_w = 1.0 / (p_hom[:, 3].clamp_min(1e-6))
@@ -188,16 +211,23 @@ class AdaptiveStrategy(DefaultStrategy):
         pixel_x = torch.clamp(((p_proj[:, 0] * 0.5 + 0.5) * w), 0, w - 1).long()
         pixel_y = torch.clamp(((p_proj[:, 1] * 0.5 + 0.5) * h), 0, h - 1).long()
 
+        r = self.reward_patch_radius
         for i in range(len(original_indices)):
-            initial_error = state["l1_loss_map"][pixel_y[i], pixel_x[i]]
+            y, x = pixel_y[i], pixel_x[i]
+            y_min, y_max = max(0, y - r), min(h, y + r + 1)
+            x_min, x_max = max(0, x - r), min(w, x + r + 1)
+
+            initial_error_patch = l1_loss_map[y_min:y_max, x_min:x_max]
+            initial_patch_error = initial_error_patch.mean() if initial_error_patch.numel() > 0 else torch.tensor(0.0, device=device)
+
             experience = {
                 "step": step,
                 "features": features[i].detach(),
                 "action": actions[i].detach(),
                 "log_prob": log_probs[i].detach(),
-                "pixel_x": pixel_x[i],
-                "pixel_y": pixel_y[i],
-                "initial_error": initial_error,
+                "pixel_x": x,
+                "pixel_y": y,
+                "initial_error": initial_patch_error,
             }
             state["reward_queue"].append(experience)
 
@@ -235,6 +265,7 @@ class AdaptiveStrategy(DefaultStrategy):
         if n_split > 0:
             n_split = global_split_mask.sum().item()
             split(params, optimizers, state_to_modify, global_split_mask)
+            state_to_modify["age"][-2*n_split:-n_split] = 0
             state_to_modify["age"][-n_split:] = 0
 
         n_duplicate = global_duplicate_mask.sum().item()
@@ -249,14 +280,24 @@ class AdaptiveStrategy(DefaultStrategy):
 
 
     def _process_rewards(self, state: dict, current_step: int):
+        r = self.reward_patch_radius
         while state["reward_queue"] and (current_step - state["reward_queue"][0]["step"]) >= self.reward_delay:
             exp = state["reward_queue"].popleft()
 
             if state.get("l1_loss_map") is None:
                 continue
 
-            new_error = state["l1_loss_map"][exp["pixel_y"], exp["pixel_x"]]
-            reward = exp["initial_error"] - new_error
+            l1_loss_map = l1_loss_map.squeeze() if l1_loss_map.dim() > 2 else l1_loss_map
+            h, w = l1_loss_map.shape
+            y, x = exp["pixel_y"], exp["pixel_x"]
+            y_min, y_max = max(0, y - r), min(h, y + r + 1)
+            x_min, x_max = max(0, x - r), min(w, x + r + 1)
+
+            new_error_patch = l1_loss_map[y_min:y_max, x_min:x_max]
+            new_patch_error = new_error_patch.mean() if new_error_patch.numel() > 0 else torch.tensor(0.0, device=l1_loss_map.device)
+
+            initial_patch_error = exp["initial_patch_error"]
+            reward = initial_patch_error - new_patch_error
 
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
                 experience_td = TensorDict({
@@ -268,7 +309,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 state["replay_buffer"].add(experience_td)
 
     def _train_agent(self, state: dict):
-        if len(state["replay_buffer"]) < 256:
+        if len(state["replay_buffer"]) < state["replay_buffer"]._storage.batch_size:
             return
 
         self.ac_net.train()
@@ -276,11 +317,12 @@ class AdaptiveStrategy(DefaultStrategy):
 
         batch = state["replay_buffer"].sample().to(device)
         features = batch.get("features")
-        actions = batch.get("action")
-        rewards = batch.get("reward")
-        old_log_probs = batch.get("log_prob")
+        actions = batch.get("action").squeeze(-1)
+        rewards = batch.get("reward").squeeze(-1)
+        old_log_probs = batch.get("log_prob").squeeze(-1)
 
         new_logits, values = self.ac_net(features)
+        values = values.squeeze(-1)
 
         advantage = rewards - values.detach()
         advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
@@ -311,6 +353,7 @@ class AdaptiveStrategy(DefaultStrategy):
         self.writer.add_scalar("agent/actor_loss", actor_loss.item(), state.get("step", -1))
         self.writer.add_scalar("agent/critic_loss", critic_loss.item(), state.get("step", -1))
         self.writer.add_scalar("agent/entropy_loss", entropy_loss.item(), state.get("step", -1))
+        self.writer.add_scalar("agent/mean_reward", rewards.mean().item(), step)
 
     @torch.no_grad()
     def _update_quality_map(

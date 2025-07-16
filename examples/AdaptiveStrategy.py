@@ -341,8 +341,8 @@ class AdaptiveStrategy(DefaultStrategy):
         pixel_x = torch.clamp(((p_proj[:, 0] * 0.5 + 0.5) * w), 0, w - 1).long()
         pixel_y = torch.clamp(((p_proj[:, 1] * 0.5 + 0.5) * h), 0, h - 1).long()
 
-        rendered_img_p = info["colors"].permute(0, 3, 1, 2)
-        gt_img_p = info["pixels"].permute(0, 3, 1, 2)
+        rendered_img_p = torch.clamp(info["colors"], 0., 1.).permute(0, 3, 1, 2)
+        gt_img_p = torch.clamp(info["pixels"], 0., 1.).permute(0, 3, 1, 2)
         scene_encoding = features.mean(dim=0).detach()
         r = self.reward_patch_radius
 
@@ -399,8 +399,8 @@ class AdaptiveStrategy(DefaultStrategy):
         queue = state["reward_queue"]
         if not queue or (current_step - queue[0]["step"]) < self.reward_delay: return
 
-        rendered_img_p = info["colors"].permute(0, 3, 1, 2)
-        gt_img_p = info["pixels"].permute(0, 3, 1, 2)
+        rendered_img_p = torch.clamp(info["colors"], 0., 1.).permute(0, 3, 1, 2)
+        gt_img_p = torch.clamp(info["pixels"], 0., 1.).permute(0, 3, 1, 2)
 
         current_scene_encoding = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device)).mean(dim=0).detach()
 

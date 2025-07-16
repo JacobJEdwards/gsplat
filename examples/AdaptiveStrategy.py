@@ -287,6 +287,8 @@ class AdaptiveStrategy(DefaultStrategy):
             if state.get("l1_loss_map") is None:
                 continue
 
+            l1_loss_map = state["l1_loss_map"]
+
             l1_loss_map = l1_loss_map.squeeze() if l1_loss_map.dim() > 2 else l1_loss_map
             h, w = l1_loss_map.shape
             y, x = exp["pixel_y"], exp["pixel_x"]
@@ -353,7 +355,7 @@ class AdaptiveStrategy(DefaultStrategy):
         self.writer.add_scalar("agent/actor_loss", actor_loss.item(), state.get("step", -1))
         self.writer.add_scalar("agent/critic_loss", critic_loss.item(), state.get("step", -1))
         self.writer.add_scalar("agent/entropy_loss", entropy_loss.item(), state.get("step", -1))
-        self.writer.add_scalar("agent/mean_reward", rewards.mean().item(), step)
+        self.writer.add_scalar("agent/mean_reward", rewards.mean().item(), state.get("step", -1))
 
     @torch.no_grad()
     def _update_quality_map(

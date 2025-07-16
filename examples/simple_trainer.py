@@ -744,7 +744,7 @@ class Runner:
                 colors_p = colors.permute(0, 3, 1, 2)
                 pixels_p = pixels.permute(0, 3, 1, 2)
 
-                ssim_map = self.ssim_for_map(colors_p, pixels_p)
+                _, ssim_map = self.ssim_for_map(colors_p, pixels_p)
 
                 ssim_error_map = (1.0 - ssim_map) / 2.0
 

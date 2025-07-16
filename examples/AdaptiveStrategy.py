@@ -45,7 +45,8 @@ class AdaptiveStrategy(DefaultStrategy):
     action_dim: int = 4  # 0: No-op, 1: Prune, 2: Split, 3: Duplicate
     learning_rate: float = 1e-4
     ppo_clip_epsilon: float = 0.
-    entropy_loss_weight: float = 0.01
+    entropy_loss_weight: float = 0.1
+    critic_loss_weight: float = 0.5
     reward_delay: int = 200
     max_densification_subset: int = 100_000
 
@@ -343,7 +344,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         entropy_loss = -new_dist.entropy().mean()
 
-        loss = actor_loss + 0.5 * critic_loss + self.entropy_loss_weight * entropy_loss
+        loss = actor_loss + self.critic_loss_weight * critic_loss + self.entropy_loss_weight * entropy_loss
 
         self.ac_optimizer.zero_grad()
         loss.backward()

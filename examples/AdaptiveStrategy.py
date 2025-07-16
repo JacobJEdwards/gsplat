@@ -339,8 +339,9 @@ class AdaptiveStrategy(DefaultStrategy):
         gt_img = torch.clamp(info["pixels"], 0.0, 1.0).permute(0, 3, 1, 2)
         current_lpips = self.lpips_metric(rendered_img, gt_img)
 
-        current_scene_encoding = self._get_features_from_graph(params, state, torch.ones_like(params["means"].shape[0],
-                                                                                              dtype=torch.bool)).mean(dim=0)
+        current_scene_encoding = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0],
+                                                                                              dtype=torch.bool, device=params["means"].device
+                                                                                         )).mean(dim=0)
 
         while queue and (current_step - queue[0]["step"]) >= self.reward_delay:
             exp = queue.popleft()

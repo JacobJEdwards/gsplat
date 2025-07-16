@@ -523,8 +523,8 @@ class Runner:
         else:
             raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
 
-        # if isinstance(cfg.strategy, AdaptiveStrategy):
-        #     cfg.strategy.lpips_metric = self.lpips
+        if isinstance(cfg.strategy, AdaptiveStrategy):
+            cfg.strategy.lpips_metric = self.lpips
 
     def rasterize_splats(
             self,

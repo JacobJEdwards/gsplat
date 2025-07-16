@@ -130,6 +130,8 @@ class AdaptiveStrategy(DefaultStrategy):
     kl_loss_weight: float = 0.1
     reconstruction_loss_weight: float = 1.0
 
+    max_densification_subset: int = 100_000
+
     reward_patch_radius: int = 8
     reward_delay: int = 400
     gauss_count_penalty: float = 0.001
@@ -256,6 +258,15 @@ class AdaptiveStrategy(DefaultStrategy):
         normalized_grads = state["grad2d"] / state["count"].clamp_min(1.0)
         candidate_mask = normalized_grads > self.grow_grad2d
 
+        num_candidates = candidate_mask.sum().item()
+        if num_candidates > self.max_densification_subset:
+            candidate_indices = torch.where(candidate_mask)[0]
+            rand_indices = torch.randperm(num_candidates, device=device)[:self.max_densification_subset]
+
+            new_mask = torch.zeros_like(candidate_mask)
+            new_mask[candidate_indices[rand_indices]] = True
+            candidate_mask = new_mask
+
         if candidate_mask.sum() == 0:
             return 0, 0
 
@@ -358,11 +369,10 @@ class AdaptiveStrategy(DefaultStrategy):
         torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), 100.0)
         self.ac_optimizer.step()
 
-        if self.writer:
-            self.writer.add_scalar("agent/wm_loss", world_model_loss.item(), state["step"])
-            self.writer.add_scalar("agent/ac_loss", ac_loss.item(), state["step"])
-            self.writer.add_scalar("agent/reward_loss", reward_loss.item(), state["step"])
-            self.writer.add_scalar("agent/kl_loss", kl_loss.item(), state["step"])
+        self.writer.add_scalar("agent/wm_loss", world_model_loss.item(), state["step"])
+        self.writer.add_scalar("agent/ac_loss", ac_loss.item(), state["step"])
+        self.writer.add_scalar("agent/reward_loss", reward_loss.item(), state["step"])
+        self.writer.add_scalar("agent/kl_loss", kl_loss.item(), state["step"])
 
     @staticmethod
     def _compute_lambda_returns(rewards: Tensor, values: Tensor, gamma=0.99, lambda_=0.95) -> Tensor:

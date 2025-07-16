@@ -40,7 +40,7 @@ class AdaptiveStrategy(DefaultStrategy):
     refine_every: int = 400
     learn_every: int = 200
 
-    feature_dim: int = 17
+    feature_dim: int = 11
     hidden_dim: int = 64
     learning_rate: float = 1e-4
     ppo_clip_epsilon: float = 0.2
@@ -422,7 +422,7 @@ class AdaptiveStrategy(DefaultStrategy):
         dists, idxs = knn_with_ids(means3d_subset, K=41)
         neighbor_idxs = idxs[:, 1:]
 
-        features[:, 8] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
+        features[:, 7] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
 
         neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
         neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
@@ -430,15 +430,15 @@ class AdaptiveStrategy(DefaultStrategy):
 
         sh0_subset = params["sh0"][subset_mask]
 
-        features[:, 9] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
-        features[:, 10] = neighbor_opacities.mean(dim=-1)
-        features[:, 11] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
+        features[:, 8] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
+        features[:, 9] = neighbor_opacities.mean(dim=-1)
+        features[:, 10] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
 
-        features[:, 12] = neighbor_scales.std(dim=-1) / state["scene_scale"]
-        features[:, 13] = neighbor_opacities.std(dim=-1)
-        features[:, 14] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).std(dim=-1)
+        # features[:, 12] = neighbor_scales.std(dim=-1) / state["scene_scale"]
+        # features[:, 13] = neighbor_opacities.std(dim=-1)
+        # features[:, 14] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).std(dim=-1)
         # features[:, 15] = state["radii"][subset_mask] / state["scene_scale"]
-        features[:, 16] = state["significance"][subset_mask] if "significance" in state else 0.0
+        # features[:, 16] = state["significance"][subset_mask] if "significance" in state else 0.0
 
         return features
 

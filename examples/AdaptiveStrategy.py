@@ -311,8 +311,8 @@ class AdaptiveStrategy(DefaultStrategy):
     def _queue_per_node_experience(self, state: dict, info: dict, features: Tensor, actions: Tensor, log_probs: Tensor,
                                    values: Tensor, indices: Tensor):
 
-        rendered_img = info["colors"].permute(0, 3, 1, 2)
-        gt_img = info["pixels"].permute(0, 3, 1, 2)
+        rendered_img = torch.clamp(info["colors"], 0.0, 1.0).permute(0, 3, 1, 2)
+        gt_img = torch.clamp(info["pixels"], 0.0, 1.0).permute(0, 3, 1, 2)
         initial_lpips = self.lpips_metric(rendered_img, gt_img)
 
         scene_encoding = features.mean(dim=0).detach()
@@ -335,7 +335,10 @@ class AdaptiveStrategy(DefaultStrategy):
         queue = state["reward_queue"]
         if not queue or (current_step - queue[0]["step"]) < self.reward_delay: return
 
-        current_lpips = self.lpips_metric(info["colors"].permute(0, 3, 1, 2), info["pixels"].permute(0, 3, 1, 2))
+        rendered_img = torch.clamp(info["colors"], 0.0, 1.0).permute(0, 3, 1, 2)
+        gt_img = torch.clamp(info["pixels"], 0.0, 1.0).permute(0, 3, 1, 2)
+        current_lpips = self.lpips_metric(rendered_img, gt_img)
+
         current_scene_encoding = self._get_features_from_graph(params, state, torch.ones_like(params["means"], dtype=torch.bool)).mean(dim=0)
 
         while queue and (current_step - queue[0]["step"]) >= self.reward_delay:

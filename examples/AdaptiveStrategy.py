@@ -123,7 +123,8 @@ class AdaptiveStrategy(DefaultStrategy):
             self.reward_validation_set.append({
                 "camtoworld": data["camtoworld"].to(device),
                 "K": data["K"].to(device),
-                "gt_image": (data["image"] / 255.0).to(device),
+                "pixels": (data["image"] / 255.0).to(device),
+                "image_id": data["image_id"].to(device),
                 "height": data["image"].shape[0],
                 "width": data["image"].shape[1],
             })
@@ -131,19 +132,31 @@ class AdaptiveStrategy(DefaultStrategy):
             print(f"Created a fixed reward validation set with {len(self.reward_validation_set)} views.")
 
     @torch.no_grad()
-    def _calculate_avg_lpips(self, params: dict) -> Tensor:
+    def _calculate_avg_lpips(self, params: dict, step: int) -> Tensor:
         total_lpips = 0.0
-        for view_data in self.reward_validation_set:
+        sh_degree_to_use = min(step // 1000, 3)
+
+        for data in self.reward_validation_set:
+            camtoworlds = data["camtoworld"],  # [1, 4, 4]
+            Ks = data["K"],  # [1, 3, 3]
+            pixels = data["pixels"],
+            image_ids = data["image_id"],
+
+            height, width = pixels.shape[1:3]
+
             render_colors, _, _ = self.rasterize_fn(
-                camtoworlds=view_data["camtoworld"].unsqueeze(0),
-                Ks=view_data["K"].unsqueeze(0),
-                width=view_data["width"],
-                height=view_data["height"],
-                means=params["means"], scales=params["scales"], quats=params["quats"],
-                opacities=params["opacities"], sh0=params["sh0"], shN=params["shN"]
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=sh_degree_to_use,
+                near_plane=0.01,
+                far_plane=1e10,
+                image_ids=image_ids,
+                render_mode="RGB",
             )
             rendered_img_p = render_colors.permute(0, 3, 1, 2)
-            gt_img_p = view_data["gt_image"].permute(2, 0, 1).unsqueeze(0)
+            gt_img_p = pixels.permute(0, 3, 1, 2)
             total_lpips += self.lpips_metric(rendered_img_p, gt_img_p)
 
         return total_lpips / len(self.reward_validation_set)
@@ -289,7 +302,7 @@ class AdaptiveStrategy(DefaultStrategy):
             _, values = self.actor_critic(per_gaussian_features)
 
 
-        initial_avg_lpips = self._calculate_avg_lpips(params)
+        initial_avg_lpips = self._calculate_avg_lpips(params, step=state["step"])
         self._queue_per_node_experience(state, info, per_gaussian_features, actions, action_dist.log_prob(actions),
                                         values, uncertainty, initial_avg_lpips)
 
@@ -401,7 +414,7 @@ class AdaptiveStrategy(DefaultStrategy):
         with torch.no_grad(), autocast(enabled=False, device_type="cuda"):
             current_scene_encoding = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device)).mean(dim=0).detach()
 
-        current_avg_lpips = self._calculate_avg_lpips(params)
+        current_avg_lpips = self._calculate_avg_lpips(params, step=current_step)
 
         while queue and (current_step - queue[0]["step"]) >= self.reward_delay:
             exp = queue.popleft()

@@ -109,14 +109,13 @@ class AdaptiveStrategy(DefaultStrategy):
     lpips_metric: Any = field(default=None, repr=False)
     writer: Any = field(default=None, repr=False)
 
-    def setup_validation_set(self, validation_dataset: torch.utils.data.Dataset):
+    def setup_validation_set(self, validation_dataset: torch.utils.data.Dataset, device: torch.device) -> None:
         """
         IMPORTANT: This method must be called by the trainer once at initialization.
         It selects a fixed subset of the validation data to use for stable reward calculation.
         """
         if not validation_dataset: return
 
-        device = next(self.graph_encoder.parameters()).device
         indices = torch.randperm(len(validation_dataset))[:self.num_reward_views].tolist()
 
         for i in indices:

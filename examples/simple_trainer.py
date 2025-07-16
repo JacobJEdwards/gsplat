@@ -525,7 +525,7 @@ class Runner:
 
         if isinstance(cfg.strategy, AdaptiveStrategy):
             cfg.strategy.lpips_metric = self.lpips
-            cfg.strategy.setup_validation_set(self.trainset)
+            cfg.strategy.setup_validation_set(self.trainset, device=self.device)
             cfg.strategy.rasterizer_fn = self.rasterize_splats
 
 

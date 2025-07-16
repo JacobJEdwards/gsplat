@@ -43,8 +43,8 @@ class AdaptiveStrategy(DefaultStrategy):
     hidden_dim: int = 64
     learning_rate: float = 3e-4
     ppo_clip_epsilon: float = 0.2
-    entropy_loss_weight: float = 0.01
-    critic_loss_weight: float = 0.01
+    entropy_loss_weight: float = 0.05
+    critic_loss_weight: float = 0.1
 
     reward_patch_radius: int = 4
     reward_delay: int = 200
@@ -314,7 +314,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
             new_error_patch = l1_loss_map[y_min:y_max, x_min:x_max]
             new_patch_error = new_error_patch.mean() if new_error_patch.numel() > 0 else torch.tensor(0.0)
-            reward = ((exp["initial_patch_error"] - new_patch_error) * 10).clamp(-1.0, 1.0)
+            reward = (exp["initial_patch_error"] - new_patch_error * 10).clamp(-1.0, 1.0)
 
             if len(replay_buffer) < replay_buffer._storage.max_size:
                 td = TensorDict({

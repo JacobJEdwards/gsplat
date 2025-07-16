@@ -86,8 +86,6 @@ class AdaptiveStrategy(DefaultStrategy):
         self.grow_ac_net = SimpleActorCritic(self.feature_dim, self.hidden_dim, 3).to(device)
         self.grow_ac_optimizer = torch.optim.AdamW(self.grow_ac_net.parameters(), lr=self.learning_rate)
 
-        print("Initialized separate Pruning and Growing Actor-Critic networks.")
-
     def step_post_backward(
             self,
             params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
@@ -102,7 +100,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         state["step"] = step
 
-        if self.prune_ac_net is None:
+        if self.grow_ac_net is None:
             self._initialize_learning_components(params["means"].device)
         if state.get("age") is None:
             state["age"] = torch.zeros(params["means"].shape[0], dtype=torch.int32, device=params["means"].device)

@@ -121,8 +121,8 @@ class AdaptiveStrategy(DefaultStrategy):
             self._process_rewards(state, step)
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
-            n_prune = self.prune_gs(params, optimizers, state, is_imitation_phase)
             n_split, n_duplicate = self.grow_gs(params, optimizers, state, is_imitation_phase)
+            n_prune = self.prune_gs(params, optimizers, state, is_imitation_phase)
             if self.verbose:
                 print(f"Step {step} ({'Imitation' if is_imitation_phase else 'RL'}): Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}.")
 

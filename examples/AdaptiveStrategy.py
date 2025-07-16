@@ -389,6 +389,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
         means3d_subset = params["means"][subset_mask]
 
+        state["params_for_features"] = params
+
         if state.get("l1_loss_map") is None:
             return None
 

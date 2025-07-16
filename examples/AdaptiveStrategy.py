@@ -141,6 +141,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
             height, width = pixels.shape[1:3]
 
+            colors = torch.cat([params["sh0"], params["shN"]], 1)  # [N, K, 3]
+
             render_colors, _, _ = self.rasterize_fn(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -151,6 +153,8 @@ class AdaptiveStrategy(DefaultStrategy):
                 far_plane=1e10,
                 # image_ids=image_ids,
                 render_mode="RGB",
+                means=params["means"], scales=params["scales"], quats=params["quats"],
+                opacities=params["opacities"], colors=colors,
             )
             rendered_img_p = render_colors.permute(0, 3, 1, 2)
             gt_img_p = pixels.permute(0, 3, 1, 2)

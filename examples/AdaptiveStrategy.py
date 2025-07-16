@@ -309,7 +309,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 state["replay_buffer"].add(experience_td)
 
     def _train_agent(self, state: dict):
-        if len(state["replay_buffer"]) < state["replay_buffer"]._storage.batch_size:
+        if len(state["replay_buffer"]) < state["replay_buffer"].batch_size:
             return
 
         self.ac_net.train()

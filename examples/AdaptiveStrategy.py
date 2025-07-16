@@ -92,7 +92,7 @@ class AdaptiveStrategy(DefaultStrategy):
     uncertainty_bonus_factor: float = 0.05
 
     reward_delay: int = 400
-    reward_patch_radius: int = 32
+    reward_patch_radius: int = 64
     gauss_count_penalty_factor: float = 0.01
 
     max_densification_subset: int = 50_000
@@ -346,7 +346,7 @@ class AdaptiveStrategy(DefaultStrategy):
         scene_encoding = features.mean(dim=0).detach()
         r = self.reward_patch_radius
 
-        min_patch_size = 16
+        min_patch_size = 32
 
         for i in range(features.shape[0]):
             y, x = pixel_y[i], pixel_x[i]
@@ -405,7 +405,7 @@ class AdaptiveStrategy(DefaultStrategy):
         current_scene_encoding = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device)).mean(dim=0).detach()
 
         r = self.reward_patch_radius
-        min_patch_size = 16
+        min_patch_size = 32
 
         while queue and (current_step - queue[0]["step"]) >= self.reward_delay:
             exp = queue.popleft()

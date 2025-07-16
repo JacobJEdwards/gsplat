@@ -137,10 +137,10 @@ class AdaptiveStrategy(DefaultStrategy):
         sh_degree_to_use = min(step // 1000, 3)
 
         for data in self.reward_validation_set:
-            camtoworlds = data["camtoworld"],  # [1, 4, 4]
-            Ks = data["K"],  # [1, 3, 3]
-            pixels = data["pixels"],
-            image_ids = data["image_id"],
+            camtoworlds = data["camtoworld"]  # [1, 4, 4]
+            Ks = data["K"]  # [1, 3, 3]
+            pixels = data["pixels"]
+            image_ids = data["image_id"]
 
             height, width = pixels.shape[1:3]
 

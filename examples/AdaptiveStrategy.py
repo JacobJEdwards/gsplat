@@ -246,7 +246,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
 
         self._queue_per_node_experience(state, info, per_gaussian_features, actions, action_dist.log_prob(actions),
-                                        values, uncertainty, original_indices)
+                                        values, uncertainty)
 
         split_action_mask = (actions == 1)
         duplicate_action_mask = (actions == 2)

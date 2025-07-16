@@ -154,8 +154,12 @@ class AdaptiveStrategy(DefaultStrategy):
 
         if is_imitation_phase:
             labels = torch.ones(len(original_indices), dtype=torch.long, device=device)
-            experience = TensorDict({"features": features, "action_label": labels}, batch_size=[len(labels)])
-            state["prune_replay_buffer"].add(experience)
+            for i in range(len(original_indices)):
+                experience = TensorDict({
+                    "features": features[i],
+                    "action_label": labels[i]
+                }, batch_size=[])
+                state["prune_replay_buffer"].add(experience)
             actions = labels
         else:
             action_dist = Categorical(logits=action_logits)
@@ -200,8 +204,12 @@ class AdaptiveStrategy(DefaultStrategy):
             is_large_mask = scales.max(dim=-1).values > state["scene_scale"]
             labels = torch.ones(len(original_indices), dtype=torch.long, device=device)
             labels[~is_large_mask] = 2
-            experience = TensorDict({"features": features, "action_label": labels}, batch_size=[len(labels)])
-            state["grow_replay_buffer"].add(experience)
+            for i in range(len(original_indices)):
+                experience = TensorDict({
+                    "features": features[i],
+                    "action_label": labels[i]
+                }, batch_size=[])
+                state["grow_replay_buffer"].add(experience)
             actions = labels
         else:
             action_dist = Categorical(logits=action_logits)

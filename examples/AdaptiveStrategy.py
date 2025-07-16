@@ -192,6 +192,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
         no_prune = state["age"] < 800
 
+        is_prune &= ~no_prune
+
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:
@@ -435,7 +437,7 @@ class AdaptiveStrategy(DefaultStrategy):
         features[:, 12] = neighbor_scales.std(dim=-1) / state["scene_scale"]
         features[:, 13] = neighbor_opacities.std(dim=-1)
         features[:, 14] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).std(dim=-1)
-        features[:, 15] = state["radii"][subset_mask] / state["scene_scale"]
+        # features[:, 15] = state["radii"][subset_mask] / state["scene_scale"]
         features[:, 16] = state["significance"][subset_mask] if "significance" in state else 0.0
 
         return features

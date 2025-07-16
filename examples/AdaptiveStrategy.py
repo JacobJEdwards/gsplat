@@ -303,19 +303,31 @@ class AdaptiveStrategy(DefaultStrategy):
         wm_loss.backward()
         self.wm_optimizer.step()
 
-        new_dist, new_values = self.actor_critic(features)
+        with torch.no_grad():
+            next_values = rewards
 
-        advantage = rewards - old_values
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+            advantages = torch.zeros_like(rewards)
+            last_gae_lam = 0
+            gamma = 0.99
+            lambda_ = 0.95
+
+            delta = rewards + gamma * next_values - old_values
+            advantages = delta
+
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            returns = advantages + old_values
+
+        new_dist, new_values = self.actor_critic(features)
 
         new_log_probs = new_dist.log_prob(actions)
         ratio = torch.exp(new_log_probs - old_log_probs)
 
-        surr1 = ratio * advantage
-        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantage
-
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantages
         actor_loss = -torch.min(surr1, surr2).mean()
-        critic_loss = F.mse_loss(new_values, rewards)
+
+        critic_loss = F.mse_loss(new_values, returns)
         entropy_loss = -new_dist.entropy().mean()
 
         ac_loss = actor_loss + self.critic_loss_weight * critic_loss + self.entropy_loss_weight * entropy_loss

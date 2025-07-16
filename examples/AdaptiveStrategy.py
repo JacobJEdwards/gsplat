@@ -87,7 +87,6 @@ class AdaptiveStrategy(DefaultStrategy):
         state.update({
             "age": None,
             "l1_loss_map": None,
-            "ssim_error_map": None,
             "detail_error_map": None,
             "view_proj_matrix": None,
             "grow_replay_buffer": TensorDictReplayBuffer(
@@ -125,7 +124,6 @@ class AdaptiveStrategy(DefaultStrategy):
         state["age"] += 1
         state["l1_loss_map"] = info.get("l1_loss_map")
         state["detail_error_map"] = info.get("detail_error_map")
-        state["ssim_error_map"] = info.get("ssim_error_map")
         state["pixels"] = info.get("pixels")
         state["gaussian_contribution"] = info.get("gaussian_contribution")
 
@@ -149,6 +147,8 @@ class AdaptiveStrategy(DefaultStrategy):
         self._process_rewards(state, step)
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
+
+
             n_prune = self.prune_gs(params, optimizers, state)
             n_split, n_duplicate = self.grow_gs(params, optimizers, state)
             if self.verbose:
@@ -292,10 +292,10 @@ class AdaptiveStrategy(DefaultStrategy):
 
     @torch.no_grad()
     def _queue_rl_experience(self, state: dict, features: Tensor, actions: Tensor, log_probs: Tensor, indices: Tensor):
-        if state.get("ssim_error_map") is None: return
+        if state.get("detail_error_map") is None: return
 
-        ssim_error_map = state["ssim_error_map"].squeeze()
-        h, w = ssim_error_map.shape
+        detail_error_map = state["detail_error_map"].squeeze()
+        h, w = detail_error_map.shape
         means_h = F.pad(state["params_for_features"]["means"][indices], (0, 1), value=1.0)
         p_hom = means_h @ state["view_proj_matrix"]
         p_w = 1.0 / (p_hom[:, 3].clamp_min(1e-6))
@@ -310,7 +310,7 @@ class AdaptiveStrategy(DefaultStrategy):
             y_min, y_max = max(0, y - r), min(h, y + r + 1)
             x_min, x_max = max(0, x - r), min(w, x + r + 1)
 
-            initial_error_patch = ssim_error_map[y_min:y_max, x_min:x_max]
+            initial_error_patch = detail_error_map[y_min:y_max, x_min:x_max]
             initial_patch_error = initial_error_patch.mean() if initial_error_patch.numel() > 0 else torch.tensor(0.0)
 
             experience = {
@@ -329,16 +329,16 @@ class AdaptiveStrategy(DefaultStrategy):
 
         while reward_queue and (current_step - reward_queue[0]["step"]) >= self.reward_delay:
             exp = reward_queue.popleft()
-            if state.get("ssim_error_map") is None: continue
+            if state.get("detail_error_map") is None: continue
 
-            ssim_error_map = state["ssim_error_map"].squeeze()
-            h, w = ssim_error_map.shape
+            detail_error_map = state["detail_error_map"].squeeze()
+            h, w = detail_error_map.shape
             y, x = exp["pixel_y"], exp["pixel_x"]
             r = self.reward_patch_radius
             y_min, y_max = max(0, y - r), min(h, y + r + 1)
             x_min, x_max = max(0, x - r), min(w, x + r + 1)
 
-            new_error_patch = ssim_error_map[y_min:y_max, x_min:x_max]
+            new_error_patch = detail_error_map[y_min:y_max, x_min:x_max]
             new_patch_error = new_error_patch.mean() if new_error_patch.numel() > 0 else torch.tensor(0.0)
             reward = (exp["initial_patch_error"] - new_patch_error * 10).clamp(-1.0, 1.0)
 

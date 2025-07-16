@@ -5,7 +5,7 @@ from typing import Any, Tuple
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Independent, kl_divergence, Normal
 
 from ops import duplicate, split
 from utils import knn_with_ids, create_view_proj_matrix
@@ -14,93 +14,159 @@ from gsplat.strategy.ops import remove, reset_opa
 from tensordict import TensorDict
 from torchrl.data import RandomSampler, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyMemmapStorage
+import torch_geometric.nn as gnn
 
-class WorldModel(nn.Module):
-    def __init__(self, feature_dim: int, hidden_dim: int, action_embedding_dim: int = 16):
+@dataclass
+class RSSMState:
+    mean: Tensor
+    std: Tensor
+    stoch: Tensor
+    deter: Tensor
+
+class GraphEncoder(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
-        self.action_embedding = nn.Embedding(3, action_embedding_dim) # 3 actions: 0=nothing, 1=split, 2=duplicate
+        self.conv1 = gnn.GATv2Conv(input_dim, hidden_dim, heads=4)
+        self.conv2 = gnn.GATv2Conv(hidden_dim * 4, hidden_dim, heads=4)
+        self.output_head = nn.Linear(hidden_dim * 4, output_dim)
 
-        self.net = nn.Sequential(
-            nn.Linear(feature_dim + action_embedding_dim, hidden_dim),
-            nn.SELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SELU(),
-            nn.Linear(hidden_dim, 1),
+    def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
+        x = F.elu(self.conv1(x, edge_index))
+        x = F.elu(self.conv2(x, edge_index))
+        return self.output_head(x)
+
+class RSSM(nn.Module):
+    def __init__(self, scene_embed_dim, action_dim, stoch_dim=32, deter_dim=256, hidden_dim=256):
+        super().__init__()
+        self.stoch_dim = stoch_dim
+        self.deter_dim = deter_dim
+        self.action_dim = action_dim
+
+        self.representation_model = nn.Sequential(
+            nn.Linear(scene_embed_dim + deter_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, stoch_dim * 2)
         )
 
-    def forward(self, features: Tensor, actions: Tensor) -> Tensor:
-        action_embeds = self.action_embedding(actions)
-        if action_embeds.dim() == 1:
-            action_embeds = action_embeds.unsqueeze(0)
-        if features.dim() == 1:
-            features = features.unsqueeze(0)
+        self.rnn = nn.GRUCell(stoch_dim + action_dim, deter_dim)
 
-        x = torch.cat([features, action_embeds], dim=-1)
-        return self.net(x).squeeze(-1)
+        self.transition_model = nn.Sequential(
+            nn.Linear(deter_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, stoch_dim * 2)
+        )
 
-class SimpleActorCritic(nn.Module):
-    def __init__(self, feature_dim: int, hidden_dim: int, action_dim: int):
+        self.reward_predictor = nn.Sequential(
+            nn.Linear(stoch_dim + deter_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, 1)
+        )
+        self.continue_predictor = nn.Sequential(
+            nn.Linear(stoch_dim + deter_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, 1)
+        )
+
+    def get_initial_state(self, batch_size: int, device: torch.device) -> RSSMState:
+        return RSSMState(
+            mean=torch.zeros(batch_size, self.stoch_dim, device=device),
+            std=torch.ones(batch_size, self.stoch_dim, device=device),
+            stoch=torch.zeros(batch_size, self.stoch_dim, device=device),
+            deter=torch.zeros(batch_size, self.deter_dim, device=device),
+        )
+
+    def observe(self, scene_embed: Tensor, action: Tensor, prev_state: RSSMState) -> Tuple[RSSMState, RSSMState]:
+        prior_state = self._imagine_step(prev_state, action)
+
+        x = torch.cat([prev_state.deter, scene_embed], -1)
+        mean, std = self.representation_model(x).chunk(2, dim=-1)
+        std = F.softplus(std) + 0.1
+        stoch = mean + std * torch.randn_like(mean)
+        deter = self.rnn(torch.cat([stoch, action], -1), prev_state.deter)
+        posterior_state = RSSMState(mean, std, stoch, deter)
+
+        return posterior_state, prior_state
+
+    def imagine_step(self, prev_state: RSSMState, action: Tensor) -> RSSMState:
+        x = self.transition_model(prev_state.deter)
+        mean, std = x.chunk(2, dim=-1)
+        std = F.softplus(std) + 0.1
+        stoch = mean + std * torch.randn_like(mean)
+        deter = self.rnn(torch.cat([stoch, action], -1), prev_state.deter)
+        return RSSMState(mean, std, stoch, deter)
+
+class LatentActorCritic(nn.Module):
+    def __init__(self, latent_dim: int, hidden_dim: int, action_dim: int):
         super().__init__()
         self.shared_net = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.SELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SELU(),
+            nn.Linear(latent_dim, hidden_dim), nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ELU()
         )
         self.actor_head = nn.Linear(hidden_dim, action_dim)
         self.critic_head = nn.Linear(hidden_dim, 1)
 
-    def forward(self, features: Tensor) -> tuple[Tensor, Tensor]:
-        x = self.shared_net(features)
+    def forward(self, latent_state: Tensor) -> tuple[Categorical, Tensor]:
+        x = self.shared_net(latent_state)
         action_logits = self.actor_head(x)
+        action_dist = Categorical(logits=action_logits)
         value = self.critic_head(x).squeeze(-1)
-        return action_logits, value
+        return action_dist, value
 
 @dataclass
 class AdaptiveStrategy(DefaultStrategy):
     refine_every: int = 400
-    learn_every: int = 200
-    initial_exploration_steps: int = 2000
+    learn_every: int = 100
+    refine_start_iter: int = 1000
 
-    feature_dim: int = 7
-    hidden_dim: int = 64
-    learning_rate: float = 3e-4
-    ppo_clip_epsilon: float = 0.2
-    entropy_loss_weight: float = 0.05
-    critic_loss_weight: float = 0.05
-
-    reward_patch_radius: int = 4
-    reward_delay: int = 200
-    max_densification_subset: int = 100_000
-
+    prune_min_age: int = 1000
     prune_significance_thresh: float = 0.01
-    prune_min_age: int = 800
 
-    grow_ac_net: Any = field(default=None, repr=False)
-    grow_ac_optimizer: Any = field(default=None, repr=False)
+    gnn_input_dim: int = 11
+    gnn_hidden_dim: int = 64
+    gnn_output_dim: int = 128
+    stoch_dim: int = 32
+    deter_dim: int = 256
+    wm_hidden_dim: int = 256
+    imagine_horizon: int = 15
+
+    wm_learning_rate: float = 1e-4
+    ac_learning_rate: float = 3e-5
+    kl_loss_weight: float = 0.1
+    reconstruction_loss_weight: float = 1.0
+
+    reward_patch_radius: int = 8
+    reward_delay: int = 400
+    gauss_count_penalty: float = 0.001
+    graph_encoder: Any = field(default=None, repr=False)
+    rssm: Any = field(default=None, repr=False)
+    actor_critic: Any = field(default=None, repr=False)
+    wm_optimizer: Any = field(default=None, repr=False)
+    ac_optimizer: Any = field(default=None, repr=False)
+    lpips_metric: Any = field(default=None, repr=False)
 
     writer: Any = field(default=None, repr=False)
 
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
-
         state.update({
             "age": None,
-            "l1_loss_map": None,
-            "detail_error_map": None,
-            "view_proj_matrix": None,
-            "grow_replay_buffer": TensorDictReplayBuffer(
-                storage=LazyMemmapStorage(max_size=30_000), sampler=RandomSampler(), batch_size=512,
+            "rssm_state": None,
+            "replay_buffer": TensorDictReplayBuffer(
+                storage=LazyMemmapStorage(max_size=50_000), sampler=RandomSampler(), batch_size=64,
             ),
-            "grow_reward_queue": deque(maxlen=10_000),
+            "reward_queue": deque(maxlen=20_000),
         })
+
         return state
 
     def _initialize_learning_components(self, device: torch.device) -> None:
-        self.grow_ac_net = SimpleActorCritic(self.feature_dim, self.hidden_dim, 3).to(device)
-        self.grow_ac_optimizer = torch.optim.AdamW(self.grow_ac_net.parameters(), lr=self.learning_rate)
+        self.graph_encoder = GraphEncoder(self.gnn_input_dim, self.gnn_hidden_dim, self.gnn_output_dim).to(device)
+        self.rssm = RSSM(self.gnn_output_dim, 2, self.stoch_dim, self.deter_dim, self.wm_hidden_dim).to(device)
+        self.actor_critic = LatentActorCritic(self.stoch_dim + self.deter_dim, self.wm_hidden_dim, 3).to(device)
 
-        print("Initialized separate Pruning and Growing Actor-Critic networks.")
+        wm_params = list(self.graph_encoder.parameters()) + list(self.rssm.parameters())
+        self.wm_optimizer = torch.optim.AdamW(wm_params, lr=self.wm_learning_rate)
+        self.ac_optimizer = torch.optim.AdamW(self.actor_critic.parameters(), lr=self.ac_learning_rate)
+
+        if self.verbose:
+            print("Initialized densification agent (GNN + World Model).")
+
 
     def step_post_backward(
             self,
@@ -113,52 +179,34 @@ class AdaptiveStrategy(DefaultStrategy):
     ) -> None:
         if step >= self.refine_stop_iter:
             return
-
         state["step"] = step
 
-        if self.grow_ac_net is None:
+        if self.rssm is None:
             self._initialize_learning_components(params["means"].device)
+
         if state.get("age") is None:
             state["age"] = torch.zeros(params["means"].shape[0], dtype=torch.int32, device=params["means"].device)
+        if state.get("rssm_state") is None:
+            state["rssm_state"] = self.rssm.get_initial_state(1, params["means"].device)
 
         state["age"] += 1
-        state["l1_loss_map"] = info.get("l1_loss_map")
-        state["detail_error_map"] = info.get("detail_error_map")
-        state["pixels"] = info.get("pixels")
-        state["gaussian_contribution"] = info.get("gaussian_contribution")
-
-        if state.get("significance") is None:
-            state["significance"] = torch.zeros(params["means"].shape[0], device=params["means"].device)
-
-        if "gaussian_contribution" in info:
-            current_significance = info["gaussian_contribution"]
-
-            if state["significance"] is None or state["significance"].shape[0] != current_significance.shape[0]:
-                state["significance"] = torch.zeros_like(current_significance)
-
-            if state["significance"].device != current_significance.device:
-                state["significance"] = state["significance"].to(current_significance.device)
-
-            state["significance"] = 0.9 * state["significance"] + 0.1 * current_significance
-
 
         self._update_quality_map(params, state, info)
+        self._process_rewards(params, state, step)
         self._update_state(params, state, info, packed=packed)
-        self._process_rewards(state, step)
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
-
-
             n_prune = self.prune_gs(params, optimizers, state)
             n_split, n_duplicate = self.grow_gs(params, optimizers, state)
             if self.verbose:
                 print(f"Step {step}: Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}.")
 
         if step > self.refine_start_iter and step % self.learn_every == 0:
-            self._train_rl_agent(state)
+            self._train_world_model_and_agent(state)
 
-        if step % self.reset_every == 0 and step > 0:
+        if step > 0 and step % self.reset_every == 0:
             reset_opa(params, optimizers, state, self.prune_opa * 2.0)
+
 
     @torch.no_grad()
     def prune_gs(self, params: dict, optimizers: dict, state: dict) -> int:
@@ -199,211 +247,195 @@ class AdaptiveStrategy(DefaultStrategy):
 
 
     @torch.no_grad()
-    def grow_gs(self, params: dict, optimizers: dict, state: dict) -> Tuple[int, int]:
+    def grow_gs(self, params: dict, optimizers: dict, state: dict) -> tuple[int, int]:
         device = params["means"].device
         normalized_grads = state["grad2d"] / state["count"].clamp_min(1.0)
         candidate_mask = normalized_grads > self.grow_grad2d
 
-        if candidate_mask.sum() > self.max_densification_subset:
-            candidate_indices = torch.where(candidate_mask)[0]
-            rand_indices = torch.randperm(len(candidate_indices), device=device)[:self.max_densification_subset]
-            candidate_mask.fill_(False)
-            candidate_mask[candidate_indices[rand_indices]] = True
-
         if candidate_mask.sum() == 0:
             return 0, 0
 
-        original_indices = torch.where(candidate_mask)[0]
-        features = self._get_simplified_features(params, state, candidate_mask)
+        scene_features, scene_encoding = self._get_features_from_graph(params, state, candidate_mask)
 
-        self.grow_ac_net.train()
-        action_logits, _ = self.grow_ac_net(features)
+        latent_state_flat = torch.cat([state["rssm_state"].stoch, state["rssm_state"].deter], -1)
+        action_dist, _ = self.actor_critic(latent_state_flat.detach())
+        action_choice = action_dist.sample().item()
 
-        action_dist = Categorical(logits=action_logits)
-        actions = action_dist.sample()
-        self._queue_rl_experience(state, features, actions, action_dist.log_prob(actions), original_indices)
+        self._queue_rl_experience(state, scene_encoding, action_choice, action_dist.log_prob(torch.tensor(action_choice)))
 
-        state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "gaussian_contribution"]}
-        split_mask = (actions == 1)
-        duplicate_mask = (actions == 2)
-
-        n_split = 0
-        if split_mask.any():
-            global_split_mask = torch.zeros(params["means"].shape[0], dtype=torch.bool, device=device)
-            global_split_mask[original_indices[split_mask]] = True
-            n_split = global_split_mask.sum().item()
-            split(params, optimizers, state_to_modify, global_split_mask)
-
-        n_duplicate = 0
-        if duplicate_mask.any():
-            global_duplicate_mask = torch.zeros(params["means"].shape[0], dtype=torch.bool, device=device)
-            global_duplicate_mask[original_indices[duplicate_mask]] = True
-            n_duplicate = global_duplicate_mask.sum().item()
-            duplicate(params, optimizers, state_to_modify, global_duplicate_mask)
+        state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age"]}
+        n_split, n_duplicate = 0, 0
+        if action_choice == 1: # split
+            n_split = candidate_mask.sum().item()
+            split(params, optimizers, state_to_modify, candidate_mask)
+        elif action_choice == 2: # duplicate
+            n_duplicate = candidate_mask.sum().item()
+            duplicate(params, optimizers, state_to_modify, candidate_mask)
 
         if n_split > 0 or n_duplicate > 0:
-            total_new = (n_split * 2) + n_duplicate
-            state_to_modify["age"][-total_new:] = 0
-
+            num_new = (n_split * 2) + n_duplicate - (n_split + n_duplicate)
+            state_to_modify["age"][-num_new:] = 0
         state.update(state_to_modify)
+
+        action_one_hot = F.one_hot(torch.tensor([action_choice]), num_classes=3).float().to(device)
+        action_one_hot = action_one_hot.squeeze(0)
+
+        post_state, _ = self.rssm.observe(scene_encoding.detach(), action_one_hot, state["rssm_state"])
+        state["rssm_state"] = post_state
         return n_split, n_duplicate
 
-    def _train_rl_agent(self, state: dict):
-        replay_buffer = state["grow_replay_buffer"]
+
+
+
+    def _train_world_model_and_agent(self, state: dict):
+        replay_buffer = state["replay_buffer"]
         if len(replay_buffer) < replay_buffer.batch_size:
             return
 
-        agent_net = self.grow_ac_net
-        optimizer = self.grow_ac_optimizer
-        device = next(agent_net.parameters()).device
+        device = next(self.actor_critic.parameters()).device
+        batch = state["replay_buffer"].sample().to(device)
+        scene_embeds = batch["scene_embed"]
+        actions = batch["action"]
+        rewards = batch["reward"]
 
-        batch = replay_buffer.sample().to(device)
-        features = batch.get("features")
-        actions = batch.get("action").squeeze(-1)
-        rewards = batch.get("reward").squeeze(-1)
-        old_log_probs = batch.get("log_prob").squeeze(-1)
+        prev_state = self.rssm.get_initial_state(scene_embeds.shape[0], device)
+        post_states, prior_states = self.rssm.observe(scene_embeds[:, 0], actions[:, 0], prev_state)
 
-        new_logits, values = agent_net(features)
-        values = values.squeeze(-1)
+        reward_pred = self.rssm.reward_predictor(torch.cat([post_states.stoch, post_states.deter], -1))
+        reward_loss = F.mse_loss(reward_pred.squeeze(), rewards[:, 0])
 
-        advantage = rewards - values.detach()
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+        kl_loss = kl_divergence(
+            Independent(Normal(post_states.mean, post_states.std), 1),
+            Independent(Normal(prior_states.mean, prior_states.std), 1)
+        ).mean()
 
-        new_dist = Categorical(logits=new_logits)
-        new_log_probs = new_dist.log_prob(actions)
-        ratio = torch.exp(new_log_probs - old_log_probs)
+        world_model_loss = self.kl_loss_weight * kl_loss + reward_loss
 
-        surr1 = ratio * advantage
-        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantage
-        actor_loss = -torch.min(surr1, surr2).mean()
+        self.wm_optimizer.zero_grad()
+        world_model_loss.backward()
+        torch.nn.utils.clip_grad_norm_(list(self.graph_encoder.parameters()) + list(self.rssm.parameters()), 100.0)
+        self.wm_optimizer.step()
 
-        critic_loss = F.mse_loss(values, rewards)
-        entropy_loss = -new_dist.entropy().mean()
-        loss = actor_loss + self.critic_loss_weight * critic_loss + self.entropy_loss_weight * entropy_loss
+        initial_imagine_state = RSSMState(post_states.mean.detach(), post_states.std.detach(), post_states.stoch.detach(), post_states.deter.detach())
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        imagined_rewards = []
+        imagined_latents = []
+        imagined_log_probs = []
 
-        self.writer.add_scalar(f"agent/grow_loss", loss.item(), state.get("step",-1))
-        self.writer.add_scalar(f"agent/grow_actor_loss", actor_loss.item(), state.get("step",-1))
-        self.writer.add_scalar(f"agent/grow_critic_loss", critic_loss.item(), state.get("step",-1))
-        self.writer.add_scalar(f"agent/grow_mean_reward", rewards.mean().item(), state.get("step",-1))
+        current_state = initial_imagine_state
+        for _ in range(self.imagine_horizon):
+            latent_flat = torch.cat([current_state.stoch, current_state.deter], -1)
+            action_dist, _ = self.actor_critic(latent_flat)
+            action = action_dist.sample()
+            imagined_log_probs.append(action_dist.log_prob(action))
+
+            # Predict next state and reward in imagination
+            current_state = self.rssm.imagine_step(current_state, F.one_hot(action, num_classes=3).float())
+            imagined_latents.append(torch.cat([current_state.stoch, current_state.deter], -1))
+            imagined_rewards.append(self.rssm.reward_predictor(torch.cat([current_state.stoch, current_state.deter], -1)))
+
+        # Calculate imagined returns (value estimates) using the critic
+        imagined_rewards = torch.stack(imagined_rewards).squeeze(-1)
+        imagined_latents = torch.stack(imagined_latents)
+        imagined_log_probs = torch.stack(imagined_log_probs)
+
+        _, values = self.actor_critic(imagined_latents)
+        lambda_returns = self._compute_lambda_returns(imagined_rewards, values)
+
+        # Actor loss (policy gradient)
+        actor_loss = -(imagined_log_probs * lambda_returns.detach()).mean()
+
+        # Critic loss
+        critic_loss = F.mse_loss(values, lambda_returns)
+
+        ac_loss = actor_loss + critic_loss
+        self.ac_optimizer.zero_grad()
+        ac_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), 100.0)
+        self.ac_optimizer.step()
+
+        if self.writer:
+            self.writer.add_scalar("agent/wm_loss", world_model_loss.item(), state["step"])
+            self.writer.add_scalar("agent/ac_loss", ac_loss.item(), state["step"])
+            self.writer.add_scalar("agent/reward_loss", reward_loss.item(), state["step"])
+            self.writer.add_scalar("agent/kl_loss", kl_loss.item(), state["step"])
+
+    @staticmethod
+    def _compute_lambda_returns(rewards: Tensor, values: Tensor, gamma=0.99, lambda_=0.95) -> Tensor:
+        returns = torch.zeros_like(rewards)
+        last_val = values[-1]
+        for t in reversed(range(rewards.shape[0])):
+            last_val = rewards[t] + gamma * (1 - lambda_) * values[t] + gamma * lambda_ * last_val
+            returns[t] = last_val
+        return returns
+
 
     @torch.no_grad()
-    def _queue_rl_experience(self, state: dict, features: Tensor, actions: Tensor, log_probs: Tensor, indices: Tensor):
-        if state.get("detail_error_map") is None: return
+    def _queue_rl_experience(self, state: dict, scene_embed: Tensor, action: int, log_prob: Tensor):
+        initial_error = state["l1_loss_map"].mean()
 
-        detail_error_map = state["detail_error_map"].squeeze()
-        h, w = detail_error_map.shape
-        means_h = F.pad(state["params_for_features"]["means"][indices], (0, 1), value=1.0)
-        p_hom = means_h @ state["view_proj_matrix"]
-        p_w = 1.0 / (p_hom[:, 3].clamp_min(1e-6))
-        p_proj = p_hom[:, :2] * p_w[:, None]
+        experience = {
+            "step": state["step"],
+            "scene_embed": scene_embed.detach(),
+            "action": torch.tensor(action, device=scene_embed.device),
+            "log_prob": log_prob.detach(),
+            "initial_error": initial_error,
+            "initial_gauss_count": state["age"].shape[0]
+        }
+        state["reward_queue"].append(experience)
 
-        pixel_x = torch.clamp(((p_proj[:, 0] * 0.5 + 0.5) * w), 0, w - 1).long()
-        pixel_y = torch.clamp(((p_proj[:, 1] * 0.5 + 0.5) * h), 0, h - 1).long()
 
-        r = self.reward_patch_radius
-        for i in range(len(indices)):
-            y, x = pixel_y[i], pixel_x[i]
-            y_min, y_max = max(0, y - r), min(h, y + r + 1)
-            x_min, x_max = max(0, x - r), min(w, x + r + 1)
+    def _process_rewards(self, params: dict, state: dict, current_step: int):
+        while state["reward_queue"] and (current_step - state["reward_queue"][0]["step"]) >= self.reward_delay:
+            exp = state["reward_queue"].popleft()
 
-            initial_error_patch = detail_error_map[y_min:y_max, x_min:x_max]
-            initial_patch_error = initial_error_patch.mean() if initial_error_patch.numel() > 0 else torch.tensor(0.0)
+            current_error = state["l1_loss_map"].mean()
+            extrinsic_reward = (exp["initial_error"] - current_error) * 10.0
 
-            experience = {
-                "step": state["step"],
-                "features": features[i].detach(),
-                "action": actions[i].detach(),
-                "log_prob": log_probs[i].detach(),
-                "pixel_x": x, "pixel_y": y,
-                "initial_patch_error": initial_patch_error,
-            }
-            state[f"grow_reward_queue"].append(experience)
+            gauss_count_now = params["means"].shape[0]
+            penalty = self.gauss_count_penalty * max(0, gauss_count_now - exp["initial_gauss_count"])
 
-    def _process_rewards(self, state: dict, current_step: int):
-        reward_queue = state["grow_reward_queue"]
-        replay_buffer = state["grow_replay_buffer"]
+            reward = (extrinsic_reward - penalty).clamp(-1.0, 1.0)
 
-        while reward_queue and (current_step - reward_queue[0]["step"]) >= self.reward_delay:
-            exp = reward_queue.popleft()
-            if state.get("detail_error_map") is None: continue
-
-            detail_error_map = state["detail_error_map"].squeeze()
-            h, w = detail_error_map.shape
-            y, x = exp["pixel_y"], exp["pixel_x"]
-            r = self.reward_patch_radius
-            y_min, y_max = max(0, y - r), min(h, y + r + 1)
-            x_min, x_max = max(0, x - r), min(w, x + r + 1)
-
-            new_error_patch = detail_error_map[y_min:y_max, x_min:x_max]
-            new_patch_error = new_error_patch.mean() if new_error_patch.numel() > 0 else torch.tensor(0.0)
-            reward = (exp["initial_patch_error"] - new_patch_error * 10).clamp(-1.0, 1.0)
-
-            if len(replay_buffer) < replay_buffer._storage.max_size:
+            if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
                 td = TensorDict({
-                    "features": exp["features"], "action": exp["action"],
-                    "log_prob": exp["log_prob"], "reward": reward,
+                    "scene_embed": exp["scene_embed"],
+                    "action": exp["action"],
+                    "reward": reward,
                 }, batch_size=[])
-                replay_buffer.add(td)
+                state["replay_buffer"].add(td)
 
     @torch.no_grad()
-    def _get_simplified_features(self, params: dict, state: dict, subset_mask: Tensor) -> Tensor:
-        n_subset = subset_mask.sum().item()
-        if n_subset == 0:
-            return torch.zeros(0, self.feature_dim, device=params["means"].device)
-
+    def _get_features_from_graph(self, params: dict, state: dict, subset_mask: Tensor) -> tuple[Tensor, Tensor]:
         device = params["means"].device
-        features = torch.zeros(n_subset, self.feature_dim, device=device)
+        all_indices = torch.where(subset_mask)[0]
+        if all_indices.numel() == 0:
+            return torch.zeros(0, self.gnn_output_dim, device=device), torch.zeros(self.gnn_output_dim, device=device)
 
-        state["params_for_features"] = params
+        means = params["means"][subset_mask]
+        scales = torch.log(torch.exp(params["scales"][subset_mask]).mean(dim=-1, keepdim=True))
+        opacities = params["opacities"][subset_mask]
+        quats = params["quats"][subset_mask]
+        ages = state["age"][subset_mask].unsqueeze(-1).float() / 1000.0
+        grads2d = (state["grad2d"][subset_mask] / state["count"][subset_mask].clamp_min(1.0)).unsqueeze(-1)
+        node_features = torch.cat([means, scales, opacities, quats, ages, grads2d], dim=-1)
 
-        grads2d = state["grad2d"][subset_mask]
-        counts = state["count"][subset_mask].clamp_min(1)
-        features[:, 0] = (grads2d / counts) / self.grow_grad2d
-        scales = params["scales"][subset_mask]
-        features[:, 1] = torch.log(scales.max(dim=-1).values / state["scene_scale"])
-        features[:, 2] = params["opacities"][subset_mask].flatten()
-        features[:, 3] = state["age"][subset_mask] / 1000.0
+        node_features = F.layer_norm(node_features, [node_features.shape[-1]])
 
-        if n_subset > 10:
-            means3d_subset = params["means"][subset_mask]
-            dists, _ = knn_with_ids(means3d_subset, K=10 + 1)
-            features[:, 4] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
+        dists, nn_indices = knn_with_ids(means, K=16)
+        source_nodes = torch.arange(means.shape[0], device=device).view(-1, 1).repeat(1, 16).flatten()
+        target_nodes = nn_indices.flatten()
+        edge_index = torch.stack([source_nodes, target_nodes], dim=0)
+        edge_attr = dists.flatten().unsqueeze(-1) / state["scene_scale"]
 
-        gt_pixels_full = state["pixels"]
-        gt_pixels = gt_pixels_full.squeeze(0) if gt_pixels_full is not None and gt_pixels_full.dim() == 4 else gt_pixels_full
+        encoded_features = self.graph_encoder(node_features, edge_index, edge_attr=edge_attr)
 
-        if gt_pixels is not None:
-            h, w, _ = gt_pixels.shape
-            means_subset = params["means"][subset_mask]
-            means_h = F.pad(means_subset, (0, 1), value=1.0)
-            p_hom = means_h @ state["view_proj_matrix"]
-            p_w = 1.0 / (p_hom[:, 3].clamp_min(1e-6))
-            p_proj = p_hom[:, :2] * p_w[:, None]
+        scene_encoding = encoded_features.mean(dim=0)
 
-            pixel_x = torch.clamp(((p_proj[:, 0] * 0.5 + 0.5) * w), 0, w - 1).long()
-            pixel_y = torch.clamp(((p_proj[:, 1] * 0.5 + 0.5) * h), 0, h - 1).long()
+        return encoded_features, scene_encoding
 
-            r = self.reward_patch_radius
-            patch_complexities = torch.zeros(n_subset, device=device)
-            for i in range(n_subset):
-                y, x = pixel_y[i], pixel_x[i]
-                y_min, y_max = max(0, y - r), min(h, y + r + 1)
-                x_min, x_max = max(0, x - r), min(w, x + r + 1)
-                patch = gt_pixels[y_min:y_max, x_min:x_max]
-                if patch.numel() > 0:
-                    patch_complexities[i] = patch.mean(dim=-1).std()
 
-            features[:, 5] = patch_complexities
 
-        contribution = state.get("gaussian_contribution")
-        if contribution is not None:
-            features[:, 6] = contribution[subset_mask]
-
-        return torch.nan_to_num(features, 0.0)
 
     def _update_quality_map(self, params: dict, state: dict, info: dict):
         if info.get("camtoworlds") is None: return

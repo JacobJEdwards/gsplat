@@ -35,61 +35,6 @@ class GraphEncoder(nn.Module):
         x = F.elu(self.conv2(x, edge_index, edge_attr=edge_attr))
         return self.output_head(x)
 
-class RSSM(nn.Module):
-    def __init__(self, scene_embed_dim, action_dim, stoch_dim=32, deter_dim=256, hidden_dim=256):
-        super().__init__()
-        self.stoch_dim = stoch_dim
-        self.deter_dim = deter_dim
-        self.action_dim = action_dim
-
-        self.representation_model = nn.Sequential(
-            nn.Linear(scene_embed_dim + deter_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, stoch_dim * 2)
-        )
-
-        self.rnn = nn.GRUCell(stoch_dim + action_dim, deter_dim)
-
-        self.transition_model = nn.Sequential(
-            nn.Linear(deter_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, stoch_dim * 2)
-        )
-
-        self.reward_predictor = nn.Sequential(
-            nn.Linear(stoch_dim + deter_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, 1)
-        )
-        self.continue_predictor = nn.Sequential(
-            nn.Linear(stoch_dim + deter_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, 1)
-        )
-
-    def get_initial_state(self, batch_size: int, device: torch.device) -> RSSMState:
-        return RSSMState(
-            mean=torch.zeros(batch_size, self.stoch_dim, device=device),
-            std=torch.ones(batch_size, self.stoch_dim, device=device),
-            stoch=torch.zeros(batch_size, self.stoch_dim, device=device),
-            deter=torch.zeros(batch_size, self.deter_dim, device=device),
-        )
-
-    def observe(self, scene_embed: Tensor, action: Tensor, prev_state: RSSMState) -> Tuple[RSSMState, RSSMState]:
-        prior_state = self.imagine_step(prev_state, action)
-
-        x = torch.cat([prev_state.deter, scene_embed], -1)
-        mean, std = self.representation_model(x).chunk(2, dim=-1)
-        std = F.softplus(std) + 0.1
-        stoch = mean + std * torch.randn_like(mean)
-        deter = self.rnn(torch.cat([stoch, action], -1), prev_state.deter)
-        posterior_state = RSSMState(mean, std, stoch, deter)
-
-        return posterior_state, prior_state
-
-    def imagine_step(self, prev_state: RSSMState, action: Tensor) -> RSSMState:
-        x = self.transition_model(prev_state.deter)
-        mean, std = x.chunk(2, dim=-1)
-        std = F.softplus(std) + 0.1
-        stoch = mean + std * torch.randn_like(mean)
-        deter = self.rnn(torch.cat([stoch, action], -1), prev_state.deter)
-        return RSSMState(mean, std, stoch, deter)
 
 class PerNodeActorCritic(nn.Module):
     def __init__(self, feature_dim: int, hidden_dim: int, action_dim: int):
@@ -108,6 +53,17 @@ class PerNodeActorCritic(nn.Module):
         value = self.critic_head(x).squeeze(-1)
         return action_dist, value
 
+class WorldModel(nn.Module):
+    def __init__(self, scene_embed_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(scene_embed_dim, hidden_dim), nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ELU(),
+            nn.Linear(hidden_dim, scene_embed_dim)
+        )
+
+    def forward(self, scene_embed: Tensor) -> Tensor:
+        return self.net(scene_embed)
 
 @dataclass
 class AdaptiveStrategy(DefaultStrategy):
@@ -122,11 +78,14 @@ class AdaptiveStrategy(DefaultStrategy):
     gnn_hidden_dim: int = 64
     gnn_output_dim: int = 128
     ac_hidden_dim: int = 128
+    wm_hidden_dim: int = 256
 
-    learning_rate: float = 3e-4
+    ac_learning_rate: float = 3e-4
+    wm_learning_rate: float = 1e-4
     ppo_clip_epsilon: float = 0.2
     entropy_loss_weight: float = 0.01
     critic_loss_weight: float = 0.5
+    intrinsic_reward_factor: float = 0.1
 
     reward_delay: int = 400
     gauss_count_penalty_factor: float = 0.01
@@ -135,18 +94,20 @@ class AdaptiveStrategy(DefaultStrategy):
 
     graph_encoder: Any = field(default=None, repr=False)
     actor_critic: Any = field(default=None, repr=False)
-    optimizer: Any = field(default=None, repr=False)
+    world_model: Any = field(default=None, repr=False)
+    ac_optimizer: Any = field(default=None, repr=False)
+    wm_optimizer: Any = field(default=None, repr=False)
+    lpips_metric: Any = field(default=None, repr=False)
     writer: Any = field(default=None, repr=False)
 
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
         state.update({
             "age": None,
-            "rssm_state": None,
             "replay_buffer": TensorDictReplayBuffer(
-                storage=LazyMemmapStorage(max_size=50_000), sampler=RandomSampler(), batch_size=64,
+                storage=LazyMemmapStorage(max_size=150_000), sampler=RandomSampler(), batch_size=2048,
             ),
-            "reward_queue": deque(maxlen=20_000),
+            "reward_queue": deque(maxlen=self.max_densification_subset * 5),
             "l1_loss_map": None,
             "detail_error_map": None,
         })
@@ -156,13 +117,14 @@ class AdaptiveStrategy(DefaultStrategy):
     def _initialize_learning_components(self, device: torch.device) -> None:
         self.graph_encoder = GraphEncoder(self.gnn_input_dim, self.gnn_hidden_dim, self.gnn_output_dim).to(device)
         self.actor_critic = PerNodeActorCritic(self.gnn_output_dim, self.ac_hidden_dim, 3).to(device)
+        self.world_model = WorldModel(self.gnn_output_dim, self.wm_hidden_dim).to(device)
 
-        all_params = list(self.graph_encoder.parameters()) + list(self.actor_critic.parameters())
-        self.optimizer = torch.optim.AdamW(all_params, lr=self.learning_rate)
+        ac_params = list(self.graph_encoder.parameters()) + list(self.actor_critic.parameters())
+        self.ac_optimizer = torch.optim.AdamW(ac_params, lr=self.ac_learning_rate)
+        self.wm_optimizer = torch.optim.AdamW(self.world_model.parameters(), lr=self.wm_learning_rate)
 
         if self.verbose:
-            print("Initialized densification agent (GNN + World Model).")
-
+            print("Initialized FINAL densification agent (GNN + Per-Node AC + World Model).")
 
     def step_post_backward(
             self,
@@ -186,19 +148,20 @@ class AdaptiveStrategy(DefaultStrategy):
         state["age"] += 1
         state["l1_loss_map"] = info.get("l1_loss_map", None)
         state["detail_error_map"] = info.get("detail_error_map", None)
+        state["lpips_score"] = info.get("lpips_score", None)
 
         self._update_quality_map(params, state, info)
-        self._process_rewards(params, state, step)
+        self._process_rewards(params, state, step, info)
         self._update_state(params, state, info, packed=packed)
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
             n_prune = self.prune_gs(params, optimizers, state)
-            n_split, n_duplicate = self.grow_gs(params, optimizers, state)
+            n_split, n_duplicate = self.grow_gs(params, optimizers, state, info)
             if self.verbose:
                 print(f"Step {step}: Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}.")
 
         if step > self.refine_start_iter and step % self.learn_every == 0:
-            self._train_world_model_and_agent(state)
+            self._train_models(state)
 
         if step > 0 and step % self.reset_every == 0:
             reset_opa(params, optimizers, state, self.prune_opa * 2.0)
@@ -243,7 +206,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
 
     @torch.no_grad()
-    def grow_gs(self, params: dict, optimizers: dict, state: dict) -> tuple[int, int]:
+    def grow_gs(self, params: dict, optimizers: dict, state: dict, info: dict) -> tuple[int, int]:
         device = params["means"].device
         normalized_grads = state["grad2d"] / state["count"].clamp_min(1.0)
         candidate_mask = normalized_grads > self.grow_grad2d
@@ -266,7 +229,8 @@ class AdaptiveStrategy(DefaultStrategy):
         action_dist, values = self.actor_critic(per_gaussian_features.detach())
         actions = action_dist.sample()
 
-        self._queue_per_node_experience(state, per_gaussian_features, actions, action_dist.log_prob(actions), values, original_indices)
+        self._queue_per_node_experience(state, info, per_gaussian_features, actions, action_dist.log_prob(actions),
+                                        values, original_indices)
 
         split_action_mask = (actions == 1)
         duplicate_action_mask = (actions == 2)
@@ -295,18 +259,24 @@ class AdaptiveStrategy(DefaultStrategy):
         return n_split, n_duplicate
 
 
-
-
-    def _train_world_model_and_agent(self, state: dict):
+    def _train_models(self, state: dict):
         if len(state["replay_buffer"]) < state["replay_buffer"].batch_size: return
         device = self.actor_critic.parameters().__next__().device
-
         batch = state["replay_buffer"].sample().to(device)
+
         features = batch.get("features")
+        next_features = batch.get("next_features")
         actions = batch.get("action").squeeze(-1)
         rewards = batch.get("reward").squeeze(-1)
         old_log_probs = batch.get("log_prob").squeeze(-1)
         old_values = batch.get("value").squeeze(-1)
+
+        next_features_pred = self.world_model(features)
+        wm_loss = F.mse_loss(next_features_pred, next_features)
+
+        self.wm_optimizer.zero_grad()
+        wm_loss.backward()
+        self.wm_optimizer.step()
 
         new_dist, new_values = self.actor_critic(features)
 
@@ -318,67 +288,83 @@ class AdaptiveStrategy(DefaultStrategy):
 
         surr1 = ratio * advantage
         surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantage
-        actor_loss = -torch.min(surr1, surr2).mean()
 
+        actor_loss = -torch.min(surr1, surr2).mean()
         critic_loss = F.mse_loss(new_values, rewards)
         entropy_loss = -new_dist.entropy().mean()
-        loss = actor_loss + self.critic_loss_weight * critic_loss + self.entropy_loss_weight * entropy_loss
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        ac_loss = actor_loss + self.critic_loss_weight * critic_loss + self.entropy_loss_weight * entropy_loss
 
-        self.writer.add_scalar("agent/total_loss", loss.item(), state["step"])
+        self.ac_optimizer.zero_grad()
+        ac_loss.backward()
+        self.ac_optimizer.step()
+
+        self.writer.add_scalar("agent/ac_loss", ac_loss.item(), state["step"])
         self.writer.add_scalar("agent/actor_loss", actor_loss.item(), state["step"])
         self.writer.add_scalar("agent/critic_loss", critic_loss.item(), state["step"])
-
-    @staticmethod
-    def _compute_lambda_returns(rewards: Tensor, values: Tensor, gamma=0.99, lambda_=0.95) -> Tensor:
-        returns = torch.zeros_like(rewards)
-        last_val = values[-1]
-        for t in reversed(range(rewards.shape[0])):
-            last_val = rewards[t] + gamma * (1 - lambda_) * values[t] + gamma * lambda_ * last_val
-            returns[t] = last_val
-        return returns
+        self.writer.add_scalar("agent/entropy_loss", entropy_loss.item(), state["step"])
+        self.writer.add_scalar("agent/wm_loss", wm_loss.item(), state["step"])
+        self.writer.add_scalar("agent/mean_reward", rewards.mean().item(), state["step"])
 
 
     @torch.no_grad()
-    def _queue_per_node_experience(self, state: dict, features: Tensor, actions: Tensor, log_probs: Tensor, values: Tensor, indices: Tensor):
-        initial_error = state["l1_loss_map"].mean()
-        initial_gauss_count = state["age"].shape[0]
-        for i in range(len(indices)):
+    def _queue_per_node_experience(self, state: dict, info: dict, features: Tensor, actions: Tensor, log_probs: Tensor,
+                                   values: Tensor, indices: Tensor):
+
+        rendered_img = info["colors"].permute(0, 3, 1, 2)
+        gt_img = info["pixels"].permute(0, 3, 1, 2)
+        initial_lpips = self.lpips_metric(rendered_img, gt_img)
+
+        scene_encoding = features.mean(dim=0).detach()
+
+        for i in range(features.shape[0]):
             experience = {
                 "step": state["step"],
                 "features": features[i].detach(),
                 "action": actions[i].detach(),
                 "log_prob": log_probs[i].detach(),
                 "value": values[i].detach(),
-                "initial_error": initial_error,
-                "initial_gauss_count": initial_gauss_count,
+                "scene_encoding": scene_encoding,
+                "initial_lpips": initial_lpips.detach(),
+                "initial_gauss_count": state["age"].shape[0]
             }
             state["reward_queue"].append(experience)
 
-    def _process_rewards(self, params: dict, state: dict, current_step: int):
-        while state["reward_queue"] and (current_step - state["reward_queue"][0]["step"]) >= self.reward_delay:
-            exp = state["reward_queue"].popleft()
 
-            current_error = state["l1_loss_map"].mean()
-            extrinsic_reward = (exp["initial_error"] - current_error) * 10.0
+    def _process_rewards(self, params: dict, state: dict, current_step: int, info: dict) -> None:
+        queue = state["reward_queue"]
+        if not queue or (current_step - queue[0]["step"]) < self.reward_delay: return
+
+        current_lpips = self.lpips_metric(info["colors"].permute(0, 3, 1, 2), info["pixels"].permute(0, 3, 1, 2))
+        current_scene_encoding = self._get_features_from_graph(params, state, torch.ones_like(params["means"], dtype=torch.bool)).mean(dim=0)
+
+        while queue and (current_step - queue[0]["step"]) >= self.reward_delay:
+            exp = queue.popleft()
+
+            extrinsic_reward = (exp["initial_lpips"] - current_lpips) * 10.0
+
+            predicted_next_encoding = self.world_model(exp["scene_encoding"])
+            intrinsic_reward = F.mse_loss(predicted_next_encoding, current_scene_encoding.detach())
 
             gauss_count_now = params["means"].shape[0]
             penalty = self.gauss_count_penalty_factor * max(0, gauss_count_now - exp["initial_gauss_count"])
 
-            reward = (extrinsic_reward - penalty).clamp(-2.0, 2.0)
+            reward = extrinsic_reward + self.intrinsic_reward_factor * intrinsic_reward - penalty
+            reward = reward.clamp(-2.0, 2.0)
 
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
                 td = TensorDict({
                     "features": exp["features"],
+                    "next_features": exp["features"], # approximation: next state's features are the same gaussian's
+                    # new features
                     "action": exp["action"],
-                    "log_prob": exp["log_prob"],
-                    "value": exp["value"],
-                    "reward": reward,
+                    "log_prob": exp["log_prob"], "value": exp["value"],
+                    "reward": reward.detach(),
                 }, batch_size=[])
                 state["replay_buffer"].add(td)
+
+
+
 
     @torch.no_grad()
     def _get_features_from_graph(self, params: dict, state: dict, subset_mask: Tensor) -> Tensor:

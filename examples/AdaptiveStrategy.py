@@ -261,7 +261,7 @@ class AdaptiveStrategy(DefaultStrategy):
         action_dist, _ = self.actor_critic(latent_state_flat.detach())
         action_choice = action_dist.sample().item()
 
-        self._queue_rl_experience(state, scene_encoding, action_choice, action_dist.log_prob(torch.tensor(action_choice)))
+        self._queue_rl_experience(state, scene_encoding, action_choice, action_dist.log_prob(torch.tensor(action_choice).to(device)))
 
         state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age"]}
         n_split, n_duplicate = 0, 0

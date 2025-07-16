@@ -39,7 +39,6 @@ class SimpleActorCritic(nn.Module):
 class AdaptiveStrategy(DefaultStrategy):
     refine_every: int = 400
     learn_every: int = 200
-    imitation_steps: int = 1_000
 
     feature_dim: int = 7
     hidden_dim: int = 64
@@ -103,18 +102,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         state["step"] = step
 
-        if step == self.imitation_steps:
-            if self.verbose:
-                print(f"--- End of Imitation Phase at step {step}. Clearing replay buffers. ---")
-            state["prune_replay_buffer"] = TensorDictReplayBuffer(
-                storage=LazyMemmapStorage(max_size=30_000), sampler=RandomSampler(), batch_size=512,
-            )
-            state["grow_replay_buffer"] = TensorDictReplayBuffer(
-                storage=LazyMemmapStorage(max_size=30_000), sampler=RandomSampler(), batch_size=512,
-            )
-
-        is_imitation_phase = step < self.imitation_steps
-
         if self.prune_ac_net is None:
             self._initialize_learning_components(params["means"].device)
         if state.get("age") is None:
@@ -142,23 +129,17 @@ class AdaptiveStrategy(DefaultStrategy):
 
         self._update_quality_map(params, state, info)
         self._update_state(params, state, info, packed=packed)
-
-        if not is_imitation_phase:
-            self._process_rewards(state, step)
+        self._process_rewards(state, step)
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
-            n_prune = self.prune_gs(params, optimizers, state, is_imitation_phase)
-            n_split, n_duplicate = self.grow_gs(params, optimizers, state, is_imitation_phase)
+            n_prune = self.prune_gs(params, optimizers, state)
+            n_split, n_duplicate = self.grow_gs(params, optimizers, state)
             if self.verbose:
-                print(f"Step {step} ({'Imitation' if is_imitation_phase else 'RL'}): Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}.")
+                print(f"Step {step}: Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}.")
 
         if step > self.refine_start_iter and step % self.learn_every == 0:
-            if is_imitation_phase:
-                self._train_imitation_agent(state, agent_type="prune")
-                self._train_imitation_agent(state, agent_type="grow")
-            else:
-                self._train_rl_agent(state, agent_type="prune")
-                self._train_rl_agent(state, agent_type="grow")
+            self._train_rl_agent(state, agent_type="prune")
+            self._train_rl_agent(state, agent_type="grow")
 
         if step % self.reset_every == 0 and step > 0:
             reset_opa(params, optimizers, state, self.prune_opa * 2.0)
@@ -222,7 +203,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
 
     @torch.no_grad()
-    def grow_gs(self, params: dict, optimizers: dict, state: dict, is_imitation_phase: bool) -> Tuple[int, int]:
+    def grow_gs(self, params: dict, optimizers: dict, state: dict) -> Tuple[int, int]:
         device = params["means"].device
         normalized_grads = state["grad2d"] / state["count"].clamp_min(1.0)
         candidate_mask = normalized_grads > self.grow_grad2d
@@ -239,25 +220,12 @@ class AdaptiveStrategy(DefaultStrategy):
         original_indices = torch.where(candidate_mask)[0]
         features = self._get_simplified_features(params, state, candidate_mask)
 
-        self.grow_ac_net.train(is_imitation_phase)
+        self.grow_ac_net.train()
         action_logits, _ = self.grow_ac_net(features)
 
-        if is_imitation_phase:
-            scales = torch.exp(params["scales"][original_indices])
-            is_large_mask = scales.max(dim=-1).values > self.grow_scale3d * state["scene_scale"]
-            labels = torch.ones(len(original_indices), dtype=torch.long, device=device)
-            labels[~is_large_mask] = 2
-            for i in range(len(original_indices)):
-                experience = TensorDict({
-                    "features": features[i],
-                    "action": labels[i]
-                }, batch_size=[])
-                state["grow_replay_buffer"].add(experience)
-            actions = labels
-        else:
-            action_dist = Categorical(logits=action_logits)
-            actions = action_dist.sample()
-            self._queue_rl_experience(state, features, actions, action_dist.log_prob(actions), original_indices, "grow")
+        action_dist = Categorical(logits=action_logits)
+        actions = action_dist.sample()
+        self._queue_rl_experience(state, features, actions, action_dist.log_prob(actions), original_indices, "grow")
 
         state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "gaussian_contribution"]}
         split_mask = (actions == 1)
@@ -283,28 +251,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         state.update(state_to_modify)
         return n_split, n_duplicate
-
-    def _train_imitation_agent(self, state: dict, agent_type: str):
-        replay_buffer = state[f"{agent_type}_replay_buffer"]
-        if len(replay_buffer) < replay_buffer.batch_size:
-            return
-
-        agent_net = getattr(self, f"{agent_type}_ac_net")
-        optimizer = getattr(self, f"{agent_type}_ac_optimizer")
-        device = next(agent_net.parameters()).device
-
-        batch = replay_buffer.sample().to(device)
-        features = batch.get("features")
-        labels = batch.get("action").squeeze(-1)
-
-        action_logits, _ = agent_net(features)
-        loss = F.cross_entropy(action_logits, labels)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        self.writer.add_scalar(f"agent/{agent_type}_imitation_loss", loss.item(), state.get("step", -1))
 
     def _train_rl_agent(self, state: dict, agent_type: str):
         replay_buffer = state[f"{agent_type}_replay_buffer"]
@@ -463,7 +409,6 @@ class AdaptiveStrategy(DefaultStrategy):
             features[:, 6] = contribution[subset_mask]
 
         return torch.nan_to_num(features, 0.0)
-
 
     def _update_quality_map(self, params: dict, state: dict, info: dict):
         if info.get("camtoworlds") is None: return

@@ -123,10 +123,8 @@ class AdaptiveStrategy(DefaultStrategy):
             self.reward_validation_set.append({
                 "camtoworld": data["camtoworld"].to(device),
                 "K": data["K"].to(device),
-                "pixels": (data["image"] / 255.0).to(device),
-                "image_id": data["image_id"],
-                "height": data["image"].shape[0],
-                "width": data["image"].shape[1],
+                "pixels": data["image"].to(device) / 255.0,
+                # "image_id": data["image_id"].to(device),
             })
         if self.verbose:
             print(f"Created a fixed reward validation set with {len(self.reward_validation_set)} views.")
@@ -152,7 +150,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 sh_degree=sh_degree_to_use,
                 near_plane=0.01,
                 far_plane=1e10,
-                image_ids=image_ids,
+                # image_ids=image_ids,
                 render_mode="RGB",
             )
             rendered_img_p = render_colors.permute(0, 3, 1, 2)

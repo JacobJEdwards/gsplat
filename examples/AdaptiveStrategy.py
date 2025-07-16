@@ -335,7 +335,7 @@ class AdaptiveStrategy(DefaultStrategy):
         h, w = info["height"], info["width"]
 
         means_h = F.pad(means3d, (0, 1), value=1.0)
-        p_hom = means_h @ info["view_proj_matrix"]
+        p_hom = means_h @ state["view_proj_matrix"]
         p_w = 1.0 / (p_hom[:, 3].clamp_min(1e-6))
         p_proj = p_hom[:, :2] * p_w[:, None]
         pixel_x = torch.clamp(((p_proj[:, 0] * 0.5 + 0.5) * w), 0, w - 1).long()

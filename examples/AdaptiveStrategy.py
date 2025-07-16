@@ -192,7 +192,8 @@ class AdaptiveStrategy(DefaultStrategy):
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:
-            per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance"]
+            per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity",
+                                       "significance", "age", "gaussian_contribution"]
             state_to_prune = {k: v for k, v in state.items() if k in per_gaussian_state_keys and v is not None}
 
             remove(params=params, optimizers=optimizers, state=state_to_prune, mask=is_prune)

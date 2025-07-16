@@ -49,9 +49,6 @@ class AdaptiveStrategy(DefaultStrategy):
     reward_delay: int = 500
     max_densification_subset: int = 100_000
 
-    prune_ac_net: Any = field(default=None, repr=False)
-    prune_ac_optimizer: Any = field(default=None, repr=False)
-
     prune_significance_thresh: float = 0.01
     prune_min_age: int = 800
 
@@ -68,10 +65,6 @@ class AdaptiveStrategy(DefaultStrategy):
             "l1_loss_map": None,
             "detail_error_map": None,
             "view_proj_matrix": None,
-            "prune_replay_buffer": TensorDictReplayBuffer(
-                storage=LazyMemmapStorage(max_size=30_000), sampler=RandomSampler(), batch_size=512,
-            ),
-            "prune_reward_queue": deque(maxlen=10_000),
             "grow_replay_buffer": TensorDictReplayBuffer(
                 storage=LazyMemmapStorage(max_size=30_000), sampler=RandomSampler(), batch_size=512,
             ),
@@ -80,9 +73,6 @@ class AdaptiveStrategy(DefaultStrategy):
         return state
 
     def _initialize_learning_components(self, device: torch.device) -> None:
-        self.prune_ac_net = SimpleActorCritic(self.feature_dim, self.hidden_dim, 2).to(device)
-        self.prune_ac_optimizer = torch.optim.AdamW(self.prune_ac_net.parameters(), lr=self.learning_rate)
-
         self.grow_ac_net = SimpleActorCritic(self.feature_dim, self.hidden_dim, 3).to(device)
         self.grow_ac_optimizer = torch.optim.AdamW(self.grow_ac_net.parameters(), lr=self.learning_rate)
 
@@ -102,7 +92,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         state["step"] = step
 
-        if self.prune_ac_net is None:
+        if self.grow_ac_net is None:
             self._initialize_learning_components(params["means"].device)
         if state.get("age") is None:
             state["age"] = torch.zeros(params["means"].shape[0], dtype=torch.int32, device=params["means"].device)
@@ -138,8 +128,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 print(f"Step {step}: Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}.")
 
         if step > self.refine_start_iter and step % self.learn_every == 0:
-            self._train_rl_agent(state, agent_type="prune")
-            self._train_rl_agent(state, agent_type="grow")
+            self._train_rl_agent(state)
 
         if step % self.reset_every == 0 and step > 0:
             reset_opa(params, optimizers, state, self.prune_opa * 2.0)
@@ -162,31 +151,6 @@ class AdaptiveStrategy(DefaultStrategy):
         if "significance" in state and state["significance"] is not None and state["significance"].numel() > 0:
             if state["significance"].numel() == is_prune_original.numel():
                 is_prune_significant = state["significance"] < self.prune_significance_thresh
-
-        # is_prune_redundant = torch.zeros_like(is_prune_original)
-        # num_gaussians = len(params["means"])
-        # device = params["means"].device
-        # subset_mask = torch.rand(num_gaussians, device=device) <
-        # subset_indices_map = torch.where(subset_mask)[0]
-        #
-        # if subset_indices_map.numel() > self.redundancy_knn:
-        #     subset_means = params["means"][subset_mask]
-        #     dists_subset, idxs_subset = self.knn_fn(subset_means, K=self.redundancy_knn)
-        #     original_neighbor_idxs = subset_indices_map[idxs_subset[:, 1:]]
-        #     neighbor_scales = torch.exp(params["scales"][original_neighbor_idxs]).max(dim=-1).values
-        #
-        #     neighbor_opacities = torch.sigmoid(params["opacities"][original_neighbor_idxs].squeeze(-1))
-        #     neighbor_sh0 = params["sh0"][original_neighbor_idxs].squeeze(-2)
-        #     scales_subset = torch.exp(params["scales"][subset_mask]).max(dim=-1).values
-        #     opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
-        #     sh0_subset = params["sh0"][subset_mask].squeeze(1)
-        #
-        #     overlap_mask = dists_subset[:, 1:] < (scales_subset.unsqueeze(1) + neighbor_scales) * self.redundancy_overlap_thresh
-        #     color_dist = torch.norm(sh0_subset.unsqueeze(1) - neighbor_sh0, dim=-1)
-        #     color_sim_mask = color_dist < self.redundancy_color_thresh
-        #     is_less_opaque = opacities_subset.unsqueeze(1) < neighbor_opacities
-        #     is_redundant_neighbor = overlap_mask & color_sim_mask & is_less_opaque
-        #     is_prune_redundant[subset_indices_map] = is_redundant_neighbor.any(dim=1)
 
         is_prune = is_prune_original | is_prune_significant
 
@@ -230,7 +194,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         action_dist = Categorical(logits=action_logits)
         actions = action_dist.sample()
-        self._queue_rl_experience(state, features, actions, action_dist.log_prob(actions), original_indices, "grow")
+        self._queue_rl_experience(state, features, actions, action_dist.log_prob(actions), original_indices)
 
         state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "gaussian_contribution"]}
         split_mask = (actions == 1)
@@ -257,13 +221,13 @@ class AdaptiveStrategy(DefaultStrategy):
         state.update(state_to_modify)
         return n_split, n_duplicate
 
-    def _train_rl_agent(self, state: dict, agent_type: str):
-        replay_buffer = state[f"{agent_type}_replay_buffer"]
+    def _train_rl_agent(self, state: dict):
+        replay_buffer = state["grow_replay_buffer"]
         if len(replay_buffer) < replay_buffer.batch_size:
             return
 
-        agent_net = getattr(self, f"{agent_type}_ac_net")
-        optimizer = getattr(self, f"{agent_type}_ac_optimizer")
+        agent_net = self.grow_ac_net
+        optimizer = self.grow_ac_optimizer
         device = next(agent_net.parameters()).device
 
         batch = replay_buffer.sample().to(device)
@@ -294,10 +258,10 @@ class AdaptiveStrategy(DefaultStrategy):
         loss.backward()
         optimizer.step()
 
-        self.writer.add_scalar(f"agent/{agent_type}_rl_loss", loss.item(), state.get("step",-1))
-        self.writer.add_scalar(f"agent/{agent_type}_actor_loss", actor_loss.item(), state.get("step",-1))
-        self.writer.add_scalar(f"agent/{agent_type}_critic_loss", critic_loss.item(), state.get("step",-1))
-        self.writer.add_scalar(f"agent/{agent_type}_mean_reward", rewards.mean().item(), state.get("step",-1))
+        self.writer.add_scalar(f"agent/grow_loss", loss.item(), state.get("step",-1))
+        self.writer.add_scalar(f"agent/grow_actor_loss", actor_loss.item(), state.get("step",-1))
+        self.writer.add_scalar(f"agent/grow_critic_loss", critic_loss.item(), state.get("step",-1))
+        self.writer.add_scalar(f"agent/grow_mean_reward", rewards.mean().item(), state.get("step",-1))
 
     @torch.no_grad()
     def _queue_rl_experience(self, state: dict, features: Tensor, actions: Tensor, log_probs: Tensor, indices: Tensor, agent_type: str):
@@ -333,31 +297,30 @@ class AdaptiveStrategy(DefaultStrategy):
             state[f"{agent_type}_reward_queue"].append(experience)
 
     def _process_rewards(self, state: dict, current_step: int):
-        for agent_type in ["prune", "grow"]:
-            reward_queue = state[f"{agent_type}_reward_queue"]
-            replay_buffer = state[f"{agent_type}_replay_buffer"]
+        reward_queue = state["grow_reward_queue"]
+        replay_buffer = state["grow_replay_buffer"]
 
-            while reward_queue and (current_step - reward_queue[0]["step"]) >= self.reward_delay:
-                exp = reward_queue.popleft()
-                if state.get("l1_loss_map") is None: continue
+        while reward_queue and (current_step - reward_queue[0]["step"]) >= self.reward_delay:
+            exp = reward_queue.popleft()
+            if state.get("l1_loss_map") is None: continue
 
-                l1_loss_map = state["l1_loss_map"].squeeze()
-                h, w = l1_loss_map.shape
-                y, x = exp["pixel_y"], exp["pixel_x"]
-                r = self.reward_patch_radius
-                y_min, y_max = max(0, y - r), min(h, y + r + 1)
-                x_min, x_max = max(0, x - r), min(w, x + r + 1)
+            l1_loss_map = state["l1_loss_map"].squeeze()
+            h, w = l1_loss_map.shape
+            y, x = exp["pixel_y"], exp["pixel_x"]
+            r = self.reward_patch_radius
+            y_min, y_max = max(0, y - r), min(h, y + r + 1)
+            x_min, x_max = max(0, x - r), min(w, x + r + 1)
 
-                new_error_patch = l1_loss_map[y_min:y_max, x_min:x_max]
-                new_patch_error = new_error_patch.mean() if new_error_patch.numel() > 0 else torch.tensor(0.0)
-                reward = (exp["initial_patch_error"] - new_patch_error).clamp(-1.0, 1.0)
+            new_error_patch = l1_loss_map[y_min:y_max, x_min:x_max]
+            new_patch_error = new_error_patch.mean() if new_error_patch.numel() > 0 else torch.tensor(0.0)
+            reward = (exp["initial_patch_error"] - new_patch_error).clamp(-1.0, 1.0)
 
-                if len(replay_buffer) < replay_buffer._storage.max_size:
-                    td = TensorDict({
-                        "features": exp["features"], "action": exp["action"],
-                        "log_prob": exp["log_prob"], "reward": reward,
-                    }, batch_size=[])
-                    replay_buffer.add(td)
+            if len(replay_buffer) < replay_buffer._storage.max_size:
+                td = TensorDict({
+                    "features": exp["features"], "action": exp["action"],
+                    "log_prob": exp["log_prob"], "reward": reward,
+                }, batch_size=[])
+                replay_buffer.add(td)
 
     @torch.no_grad()
     def _get_simplified_features(self, params: dict, state: dict, subset_mask: Tensor) -> Tensor:

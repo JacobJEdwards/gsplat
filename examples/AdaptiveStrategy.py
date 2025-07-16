@@ -326,6 +326,11 @@ class AdaptiveStrategy(DefaultStrategy):
         self.writer.add_scalar("agent/wm_loss", wm_loss.item(), state["step"])
         self.writer.add_scalar("agent/mean_reward", rewards.mean().item(), state["step"])
 
+        if self.verbose:
+            print(f"Step {state['step']}: AC Loss: {ac_loss.item():.4f}, Actor Loss: {actor_loss.item():.4f}, "
+                  f"Critic Loss: {critic_loss.item():.4f}, Entropy Loss: {entropy_loss.item():.4f}, "
+                  f"WM Loss: {wm_loss.item():.4f}, Mean Reward: {rewards.mean().item():.4f}")
+
 
     @torch.no_grad()
     def _queue_per_node_experience(self, state: dict, info: dict, features: Tensor, actions: Tensor, log_probs: Tensor,

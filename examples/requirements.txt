@@ -25,6 +25,6 @@ splines
 git+https://github.com/graphcore-research/pytorch-approx-topk.git
 # faiss-gpu
 torch_geometric
-torch-cluster
+# torch-cluster
 torchrl
 

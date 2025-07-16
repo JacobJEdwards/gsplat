@@ -67,7 +67,7 @@ class AdaptiveStrategy(DefaultStrategy):
     learning_rate: float = 3e-4
     ppo_clip_epsilon: float = 0.2
     entropy_loss_weight: float = 0.05
-    critic_loss_weight: float = 0.1
+    critic_loss_weight: float = 0.05
 
     reward_patch_radius: int = 4
     reward_delay: int = 200

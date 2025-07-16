@@ -124,7 +124,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 "camtoworld": data["camtoworld"].to(device),
                 "K": data["K"].to(device),
                 "pixels": (data["image"] / 255.0).to(device),
-                "image_id": data["image_id"].to(device),
+                "image_id": data["image_id"],
                 "height": data["image"].shape[0],
                 "width": data["image"].shape[1],
             })

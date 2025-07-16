@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.distributions import Categorical
-from torch.optim import Optimizer
 
 from ops import duplicate, split
 from utils import knn_with_ids, create_view_proj_matrix
@@ -48,12 +47,13 @@ class AdaptiveStrategy(DefaultStrategy):
 
     reward_patch_radius: int = 4
     reward_delay: int = 200
-    max_densification_subset: int = 50_000
+    max_densification_subset: int = 100_000
 
     prune_ac_net: Any = field(default=None, repr=False)
     prune_ac_optimizer: Any = field(default=None, repr=False)
 
     prune_significance_thresh: float = 0.01
+    prune_min_age: int = 800
 
     grow_ac_net: Any = field(default=None, repr=False)
     grow_ac_optimizer: Any = field(default=None, repr=False)
@@ -189,6 +189,10 @@ class AdaptiveStrategy(DefaultStrategy):
         #     is_prune_redundant[subset_indices_map] = is_redundant_neighbor.any(dim=1)
 
         is_prune = is_prune_original | is_prune_significant
+
+        no_prune = state["age"] < self.prune_min_age
+
+        is_prune &= (~no_prune)
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:
@@ -374,9 +378,9 @@ class AdaptiveStrategy(DefaultStrategy):
         features[:, 2] = params["opacities"][subset_mask].flatten()
         features[:, 3] = state["age"][subset_mask] / 1000.0
 
-        if n_subset > 5:
+        if n_subset > 10:
             means3d_subset = params["means"][subset_mask]
-            dists, _ = knn_with_ids(means3d_subset, K=5 + 1)
+            dists, _ = knn_with_ids(means3d_subset, K=10 + 1)
             features[:, 4] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
 
         gt_pixels_full = state["pixels"]

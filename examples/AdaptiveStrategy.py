@@ -4,7 +4,7 @@ from typing import Any, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn
+from torch import Tensor, nn, autocast
 from torch.distributions import Categorical, Independent, kl_divergence, Normal
 
 from ops import duplicate, split
@@ -92,6 +92,7 @@ class AdaptiveStrategy(DefaultStrategy):
     uncertainty_bonus_factor: float = 0.05
 
     reward_delay: int = 400
+    reward_patch_radius: int = 8
     gauss_count_penalty_factor: float = 0.01
 
     max_densification_subset: int = 50_000
@@ -229,33 +230,24 @@ class AdaptiveStrategy(DefaultStrategy):
 
         original_indices = torch.where(candidate_mask)[0]
 
-        per_gaussian_features = self._get_features_from_graph(params, state, candidate_mask)
+        with autocast(enabled=False, device_type="cuda"):
+            per_gaussian_features = self._get_features_from_graph(params, state, candidate_mask)
 
-        self.actor_critic.train()
+            self.actor_critic.train()
+            num_passes = 5
+            all_logits = [self.actor_critic(per_gaussian_features)[0].logits for _ in range(num_passes)]
+            all_logits_tensor = torch.stack(all_logits)
+            uncertainty = all_logits_tensor.var(dim=0).mean(dim=-1)
+            self.actor_critic.eval()
 
-        num_passes = 5
-        all_logits = []
-        with torch.no_grad():
-            for _ in range(num_passes):
-                action_dist, _ = self.actor_critic(per_gaussian_features)
-                all_logits.append(action_dist.logits)
+            mean_logits = all_logits_tensor.mean(dim=0)
+            action_dist = Categorical(logits=mean_logits)
+            actions = action_dist.sample()
+            _, values = self.actor_critic(per_gaussian_features)
 
-        all_logits_tensor = torch.stack(all_logits)
-        uncertainty = all_logits_tensor.var(dim=0).mean(dim=-1)
-
-        self.actor_critic.eval()
-
-        mean_logits = all_logits_tensor.mean(dim=0)
-        action_dist = Categorical(logits=mean_logits)
-        actions = action_dist.sample()
-
-        _, values = self.actor_critic(per_gaussian_features)
-
-        # action_dist, values = self.actor_critic(per_gaussian_features.detach())
-        # actions = action_dist.sample()
 
         self._queue_per_node_experience(state, info, per_gaussian_features, actions, action_dist.log_prob(actions),
-                                        values, uncertainty)
+                                        values, uncertainty, original_indices)
 
         split_action_mask = (actions == 1)
         duplicate_action_mask = (actions == 2)
@@ -296,41 +288,32 @@ class AdaptiveStrategy(DefaultStrategy):
         old_log_probs = batch.get("log_prob").squeeze(-1)
         old_values = batch.get("value").squeeze(-1)
 
-        next_features_pred = self.world_model(features)
-        wm_loss = F.mse_loss(next_features_pred, next_features)
+        with torch.autocast(enabled=False, device_type="cuda"):
+            next_features_pred = self.world_model(features)
+            wm_loss = F.mse_loss(next_features_pred, next_features)
 
         self.wm_optimizer.zero_grad()
         wm_loss.backward()
         self.wm_optimizer.step()
 
-        with torch.no_grad():
-            next_values = rewards
-
-            advantages = torch.zeros_like(rewards)
-            last_gae_lam = 0
-            gamma = 0.99
-            lambda_ = 0.95
-
-            delta = rewards + gamma * next_values - old_values
-            advantages = delta
-
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
+        with autocast(enabled=False, device_type="cuda"), torch.no_grad():
+            next_values = self.actor_critic(next_features)[1]
+            delta = rewards + 0.99 * next_values - old_values
+            advantages = (delta - delta.mean()) / (delta.std() + 1e-8)
             returns = advantages + old_values
 
-        new_dist, new_values = self.actor_critic(features)
 
-        new_log_probs = new_dist.log_prob(actions)
-        ratio = torch.exp(new_log_probs - old_log_probs)
 
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantages
-        actor_loss = -torch.min(surr1, surr2).mean()
-
-        critic_loss = F.mse_loss(new_values, returns)
-        entropy_loss = -new_dist.entropy().mean()
-
-        ac_loss = actor_loss + self.critic_loss_weight * critic_loss + self.entropy_loss_weight * entropy_loss
+        with autocast(enabled=False, device_type="cuda"):
+            new_dist, new_values = self.actor_critic(features)
+            new_log_probs = new_dist.log_prob(actions)
+            ratio = torch.exp(new_log_probs - old_log_probs)
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip_epsilon, 1.0 + self.ppo_clip_epsilon) * advantages
+            actor_loss = -torch.min(surr1, surr2).mean()
+            critic_loss = F.mse_loss(new_values, returns)
+            entropy_loss = -new_dist.entropy().mean()
+            ac_loss = actor_loss + self.critic_loss_weight * critic_loss + self.entropy_loss_weight * entropy_loss
 
         self.ac_optimizer.zero_grad()
         ac_loss.backward()
@@ -346,77 +329,99 @@ class AdaptiveStrategy(DefaultStrategy):
 
     @torch.no_grad()
     def _queue_per_node_experience(self, state: dict, info: dict, features: Tensor, actions: Tensor, log_probs: Tensor,
-                                   values: Tensor, uncertainty: Tensor) -> None:
+                                   values: Tensor, uncertainty: Tensor, original_indices: Tensor) -> None:
 
-        rendered_img = torch.clamp(info["colors"], 0.0, 1.0).permute(0, 3, 1, 2)
-        gt_img = torch.clamp(info["pixels"], 0.0, 1.0).permute(0, 3, 1, 2)
-        initial_lpips = self.lpips_metric(rendered_img, gt_img)
+        means3d = state["params_for_features"]["means"][original_indices]
+        h, w = info["height"], info["width"]
 
+        means_h = F.pad(means3d, (0, 1), value=1.0)
+        p_hom = means_h @ info["view_proj_matrix"]
+        p_w = 1.0 / (p_hom[:, 3].clamp_min(1e-6))
+        p_proj = p_hom[:, :2] * p_w[:, None]
+        pixel_x = torch.clamp(((p_proj[:, 0] * 0.5 + 0.5) * w), 0, w - 1).long()
+        pixel_y = torch.clamp(((p_proj[:, 1] * 0.5 + 0.5) * h), 0, h - 1).long()
+
+        rendered_img_p = info["colors"].permute(0, 3, 1, 2)
+        gt_img_p = info["pixels"].permute(0, 3, 1, 2)
         scene_encoding = features.mean(dim=0).detach()
+        r = self.reward_patch_radius
 
         for i in range(features.shape[0]):
+            y, x = pixel_y[i], pixel_x[i]
+            initial_patch = rendered_img_p[..., y-r:y+r, x-r:x+r]
+            gt_patch = gt_img_p[..., y-r:y+r, x-r:x+r]
+
+            if initial_patch.shape[-1] < 1 or initial_patch.shape[-2] < 1: continue
+
+            initial_patch_lpips = self.lpips_metric(initial_patch, gt_patch)
+
             experience = {
-                "step": state["step"],
-                "features": features[i].detach(),
-                "action": actions[i].detach(),
-                "log_prob": log_probs[i].detach(),
-                "value": values[i].detach(),
-                "uncertainty": uncertainty[i].detach(),
+                "step": state["step"], "features": features[i].detach(),
+                "action": actions[i].detach(), "log_prob": log_probs[i].detach(),
+                "value": values[i].detach(), "uncertainty": uncertainty[i].detach(),
+                "pixel_y": y, "pixel_x": x,
+                "initial_patch_lpips": initial_patch_lpips.detach(),
                 "scene_encoding": scene_encoding,
-                "initial_lpips": initial_lpips.detach(),
-                "initial_gauss_count": state["age"].shape[0]
             }
             state["reward_queue"].append(experience)
+
+        # rendered_img = torch.clamp(info["colors"], 0.0, 1.0).permute(0, 3, 1, 2)
+        # gt_img = torch.clamp(info["pixels"], 0.0, 1.0).permute(0, 3, 1, 2)
+        # initial_lpips = self.lpips_metric(rendered_img, gt_img)
+        #
+        # scene_encoding = features.mean(dim=0).detach()
+        #
+        # for i in range(features.shape[0]):
+        #     experience = {
+        #         "step": state["step"],
+        #         "features": features[i].detach(),
+        #         "action": actions[i].detach(),
+        #         "log_prob": log_probs[i].detach(),
+        #         "value": values[i].detach(),
+        #         "uncertainty": uncertainty[i].detach(),
+        #         "scene_encoding": scene_encoding,
+        #         "initial_lpips": initial_lpips.detach(),
+        #         "initial_gauss_count": state["age"].shape[0]
+        #     }
+        #     state["reward_queue"].append(experience)
 
 
     def _process_rewards(self, params: dict, state: dict, current_step: int, info: dict) -> None:
         queue = state["reward_queue"]
         if not queue or (current_step - queue[0]["step"]) < self.reward_delay: return
 
-        rendered_img = torch.clamp(info["colors"], 0.0, 1.0).permute(0, 3, 1, 2)
-        gt_img = torch.clamp(info["pixels"], 0.0, 1.0).permute(0, 3, 1, 2)
-        current_lpips = self.lpips_metric(rendered_img, gt_img)
+        rendered_img_p = info["colors"].permute(0, 3, 1, 2)
+        gt_img_p = info["pixels"].permute(0, 3, 1, 2)
 
-        current_scene_encoding = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0],
-                                                                                              dtype=torch.bool, device=params["means"].device
-                                                                                         )).mean(dim=0)
+        current_scene_encoding = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device)).mean(dim=0).detach()
+
+        r = self.reward_patch_radius
 
         while queue and (current_step - queue[0]["step"]) >= self.reward_delay:
             exp = queue.popleft()
 
-            extrinsic_reward = (exp["initial_lpips"] - current_lpips) * 10.0
+            y, x = exp["pixel_y"], exp["pixel_x"]
+            current_patch = rendered_img_p[..., y-r:y+r, x-r:x+r]
+            gt_patch = gt_img_p[..., y-r:y+r, x-r:x+r]
+            if current_patch.shape[-1] < 1 or current_patch.shape[-2] < 1: continue
 
+            current_patch_lpips = self.lpips_metric(current_patch, gt_patch)
+
+            extrinsic_reward = (exp["initial_patch_lpips"] - current_patch_lpips) * 10.0
             predicted_next_encoding = self.world_model(exp["scene_encoding"])
-            intrinsic_reward = F.mse_loss(predicted_next_encoding, current_scene_encoding.detach())
+            intrinsic_reward = F.mse_loss(predicted_next_encoding, current_scene_encoding)
+            reward = (extrinsic_reward + self.intrinsic_reward_factor * intrinsic_reward + self.uncertainty_bonus_factor * exp["uncertainty"])
 
-            gauss_count_now = params["means"].shape[0]
-            penalty = self.gauss_count_penalty_factor * max(0, gauss_count_now - exp["initial_gauss_count"])
-
-            uncertainty_bonus = exp["uncertainty"]
-
-            reward = (extrinsic_reward
-                      + self.intrinsic_reward_factor * intrinsic_reward
-                        + self.uncertainty_bonus_factor * uncertainty_bonus
-                      - penalty)
-
-            reward = reward.clamp(-2.0, 2.0)
-
-            if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
-                td = TensorDict({
-                    "features": exp["features"],
-                    "next_features": exp["features"], # approximation: next state's features are the same gaussian's
-                    # new features
-                    "action": exp["action"],
-                    "log_prob": exp["log_prob"], "value": exp["value"],
-                    "reward": reward.detach(),
-                }, batch_size=[])
-                state["replay_buffer"].add(td)
-
-
-
+            td = TensorDict({
+                "features": exp["features"], "next_features": exp["features"], # Approximation
+                "action": exp["action"], "log_prob": exp["log_prob"],
+                "value": exp["value"], "reward": reward.clamp(-2.0, 2.0).detach(),
+            }, batch_size=[])
+            state["replay_buffer"].add(td)
 
     @torch.no_grad()
     def _get_features_from_graph(self, params: dict, state: dict, subset_mask: Tensor) -> Tensor:
+        state["params_for_features"] = params
         device = params["means"].device
         all_indices = torch.where(subset_mask)[0]
         if all_indices.numel() == 0:

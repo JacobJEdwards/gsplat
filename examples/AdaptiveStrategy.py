@@ -151,6 +151,8 @@ class AdaptiveStrategy(DefaultStrategy):
                 storage=LazyMemmapStorage(max_size=50_000), sampler=RandomSampler(), batch_size=64,
             ),
             "reward_queue": deque(maxlen=20_000),
+            "l1_loss_map": None,
+            "detail_error_map": None,
         })
 
         return state
@@ -190,6 +192,8 @@ class AdaptiveStrategy(DefaultStrategy):
             state["rssm_state"] = self.rssm.get_initial_state(1, params["means"].device)
 
         state["age"] += 1
+        state["l1_loss_map"] = info.get("l1_loss_map", None)
+        state["detail_error_map"] = info.get("detail_error_map", None)
 
         self._update_quality_map(params, state, info)
         self._process_rewards(params, state, step)

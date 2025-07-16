@@ -51,8 +51,6 @@ class AdaptiveStrategy(DefaultStrategy):
     reward_delay: int = 200
     max_densification_subset: int = 50_000
 
-    prune_opacity_threshold: float = 0.005
-
     prune_ac_net: Any = field(default=None, repr=False)
     prune_ac_optimizer: Any = field(default=None, repr=False)
 
@@ -141,7 +139,10 @@ class AdaptiveStrategy(DefaultStrategy):
     def prune_gs(self, params: dict, optimizers: dict, state: dict, is_imitation_phase: bool) -> int:
         device = params["means"].device
         opacities = torch.sigmoid(params["opacities"].flatten())
-        candidate_mask = opacities < self.prune_opacity_threshold
+        is_too_transparent = opacities < self.prune_opa
+        is_too_large = torch.exp(params["scales"]).max(dim=-1).values > self.prune_scale3d * state["scene_scale"]
+
+        candidate_mask = is_too_transparent | is_too_large
 
         if candidate_mask.sum() == 0:
             return 0
@@ -201,7 +202,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         if is_imitation_phase:
             scales = torch.exp(params["scales"][original_indices])
-            is_large_mask = scales.max(dim=-1).values > state["scene_scale"]
+            is_large_mask = scales.max(dim=-1).values > self.grow_scale3d * state["scene_scale"]
             labels = torch.ones(len(original_indices), dtype=torch.long, device=device)
             labels[~is_large_mask] = 2
             for i in range(len(original_indices)):

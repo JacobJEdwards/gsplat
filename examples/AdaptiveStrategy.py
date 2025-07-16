@@ -282,7 +282,7 @@ class AdaptiveStrategy(DefaultStrategy):
         state.update(state_to_modify)
 
         action_one_hot = F.one_hot(torch.tensor([action_choice]), num_classes=3).float().to(device)
-        action_one_hot = action_one_hot.squeeze(0)
+        # action_one_hot = action_one_hot.squeeze(0)
 
         post_state, _ = self.rssm.observe(scene_encoding.detach(), action_one_hot, state["rssm_state"])
         state["rssm_state"] = post_state

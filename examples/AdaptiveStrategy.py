@@ -158,7 +158,7 @@ class AdaptiveStrategy(DefaultStrategy):
             for i in range(len(original_indices)):
                 experience = TensorDict({
                     "features": features[i],
-                    "action_label": labels[i]
+                    "action": labels[i]
                 }, batch_size=[])
                 state["prune_replay_buffer"].add(experience)
             actions = labels
@@ -253,7 +253,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         batch = replay_buffer.sample().to(device)
         features = batch.get("features")
-        labels = batch.get("action_label").squeeze(-1)
+        labels = batch.get("action").squeeze(-1)
 
         action_logits, _ = agent_net(features)
         loss = F.cross_entropy(action_logits, labels)

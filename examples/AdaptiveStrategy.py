@@ -76,12 +76,10 @@ class AdaptiveStrategy(DefaultStrategy):
             "view_proj_matrix": None,
             "prune_replay_buffer": TensorDictReplayBuffer(
                 storage=LazyMemmapStorage(max_size=30_000), sampler=RandomSampler(), batch_size=512,
-                prototype=schema.clone(),
             ),
             "prune_reward_queue": deque(maxlen=10_000),
             "grow_replay_buffer": TensorDictReplayBuffer(
                 storage=LazyMemmapStorage(max_size=30_000), sampler=RandomSampler(), batch_size=512,
-                prototype=schema.clone(),
             ),
             "grow_reward_queue": deque(maxlen=10_000),
         })
@@ -113,8 +111,13 @@ class AdaptiveStrategy(DefaultStrategy):
         if step == self.imitation_steps:
             if self.verbose:
                 print(f"--- End of Imitation Phase at step {step}. Clearing replay buffers. ---")
-            state["prune_replay_buffer"].empty()
-            state["grow_replay_buffer"].empty()
+
+            state["prune_replay_buffer"] = TensorDictReplayBuffer(
+                storage=LazyMemmapStorage(max_size=30_000), sampler=RandomSampler(), batch_size=512,
+            ),
+            state["grow_replay_buffer"] = TensorDictReplayBuffer(
+                storage=LazyMemmapStorage(max_size=30_000), sampler=RandomSampler(), batch_size=512,
+            ),
 
         is_imitation_phase = step < self.imitation_steps
 

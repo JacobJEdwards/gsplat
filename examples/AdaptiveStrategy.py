@@ -43,10 +43,10 @@ class AdaptiveStrategy(DefaultStrategy):
     feature_dim: int = 7
     hidden_dim: int = 64
     learning_rate: float = 1e-4
-    ppo_clip_epsilon: float = 0.2
-    entropy_loss_weight: float = 0.01
+    ppo_clip_epsilon: float = 0.15
+    entropy_loss_weight: float = 0.05
 
-    reward_patch_radius: int = 4
+    reward_patch_radius: int = 9
     reward_delay: int = 200
     max_densification_subset: int = 100_000
 
@@ -192,7 +192,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         no_prune = state["age"] < 800
 
-        is_prune &= ~no_prune
+        # is_prune &= ~no_prune
 
 
         n_prune = is_prune.sum().item()

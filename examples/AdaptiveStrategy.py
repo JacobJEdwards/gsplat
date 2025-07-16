@@ -159,7 +159,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     def _initialize_learning_components(self, device: torch.device) -> None:
         self.graph_encoder = GraphEncoder(self.gnn_input_dim, self.gnn_hidden_dim, self.gnn_output_dim).to(device)
-        self.rssm = RSSM(self.gnn_output_dim, 2, self.stoch_dim, self.deter_dim, self.wm_hidden_dim).to(device)
+        self.rssm = RSSM(self.gnn_output_dim, 3, self.stoch_dim, self.deter_dim, self.wm_hidden_dim).to(device)
         self.actor_critic = LatentActorCritic(self.stoch_dim + self.deter_dim, self.wm_hidden_dim, 3).to(device)
 
         wm_params = list(self.graph_encoder.parameters()) + list(self.rssm.parameters())

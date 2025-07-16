@@ -94,6 +94,11 @@ class AdaptiveStrategy(DefaultStrategy):
     reward_delay: int = 400
     gauss_count_penalty_factor: float = 0.01
 
+    num_reward_views: int = 4
+
+    reward_validation_set: list[dict] = field(default_factory=list, repr=False)
+    rasterize_fn: Any = field(default=None, repr=False)
+
     max_densification_subset: int = 50_000
 
     graph_encoder: Any = field(default=None, repr=False)
@@ -103,6 +108,46 @@ class AdaptiveStrategy(DefaultStrategy):
     wm_optimizer: Any = field(default=None, repr=False)
     lpips_metric: Any = field(default=None, repr=False)
     writer: Any = field(default=None, repr=False)
+
+    def setup_validation_set(self, validation_dataset: torch.utils.data.Dataset):
+        """
+        IMPORTANT: This method must be called by the trainer once at initialization.
+        It selects a fixed subset of the validation data to use for stable reward calculation.
+        """
+        if not validation_dataset: return
+
+        device = next(self.graph_encoder.parameters()).device
+        indices = torch.randperm(len(validation_dataset))[:self.num_reward_views].tolist()
+
+        for i in indices:
+            data = validation_dataset[i]
+            self.reward_validation_set.append({
+                "camtoworld": data["camtoworld"].to(device),
+                "K": data["K"].to(device),
+                "gt_image": (data["image"] / 255.0).to(device),
+                "height": data["image"].shape[0],
+                "width": data["image"].shape[1],
+            })
+        if self.verbose:
+            print(f"Created a fixed reward validation set with {len(self.reward_validation_set)} views.")
+
+    @torch.no_grad()
+    def _calculate_avg_lpips(self, params: dict) -> Tensor:
+        total_lpips = 0.0
+        for view_data in self.reward_validation_set:
+            render_colors, _, _ = self.rasterize_fn(
+                camtoworlds=view_data["camtoworld"].unsqueeze(0),
+                Ks=view_data["K"].unsqueeze(0),
+                width=view_data["width"],
+                height=view_data["height"],
+                means=params["means"], scales=params["scales"], quats=params["quats"],
+                opacities=params["opacities"], sh0=params["sh0"], shN=params["shN"]
+            )
+            rendered_img_p = render_colors.permute(0, 3, 1, 2)
+            gt_img_p = view_data["gt_image"].permute(2, 0, 1).unsqueeze(0)
+            total_lpips += self.lpips_metric(rendered_img_p, gt_img_p)
+
+        return total_lpips / len(self.reward_validation_set)
 
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
@@ -245,8 +290,9 @@ class AdaptiveStrategy(DefaultStrategy):
             _, values = self.actor_critic(per_gaussian_features)
 
 
+        initial_avg_lpips = self._calculate_avg_lpips(params)
         self._queue_per_node_experience(state, info, per_gaussian_features, actions, action_dist.log_prob(actions),
-                                        values, uncertainty)
+                                        values, uncertainty, initial_avg_lpips)
 
         split_action_mask = (actions == 1)
         duplicate_action_mask = (actions == 2)
@@ -330,11 +376,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     @torch.no_grad()
     def _queue_per_node_experience(self, state: dict, info: dict, features: Tensor, actions: Tensor, log_probs: Tensor,
-                                   values: Tensor, uncertainty: Tensor) -> None:
-
-        rendered_img = torch.clamp(info["colors"], 0.0, 1.0).permute(0, 3, 1, 2)
-        gt_img = torch.clamp(info["pixels"], 0.0, 1.0).permute(0, 3, 1, 2)
-        initial_lpips = self.lpips_metric(rendered_img, gt_img)
+                                   values: Tensor, uncertainty: Tensor, initial_avg_lpips: Tensor) -> None:
 
         scene_encoding = features.mean(dim=0).detach()
 
@@ -347,7 +389,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 "value": values[i].detach(),
                 "uncertainty": uncertainty[i].detach(),
                 "scene_encoding": scene_encoding,
-                "initial_lpips": initial_lpips.detach(),
+                "initial_avg_lpips": initial_avg_lpips.detach(),
                 "initial_gauss_count": state["age"].shape[0]
             }
             state["reward_queue"].append(experience)
@@ -360,15 +402,12 @@ class AdaptiveStrategy(DefaultStrategy):
         with torch.no_grad(), autocast(enabled=False, device_type="cuda"):
             current_scene_encoding = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device)).mean(dim=0).detach()
 
-
-        rendered_img = torch.clamp(info["colors"], 0.0, 1.0).permute(0, 3, 1, 2)
-        gt_img = torch.clamp(info["pixels"], 0.0, 1.0).permute(0, 3, 1, 2)
-        current_lpips = self.lpips_metric(rendered_img, gt_img)
+        current_avg_lpips = self._calculate_avg_lpips(params)
 
         while queue and (current_step - queue[0]["step"]) >= self.reward_delay:
             exp = queue.popleft()
 
-            extrinsic_reward = (exp["initial_lpips"] - current_lpips) * 10.0
+            extrinsic_reward = (exp["initial_avg_lpips"] - current_avg_lpips) * 50.0
 
             predicted_next_encoding = self.world_model(exp["scene_encoding"])
             intrinsic_reward = F.mse_loss(predicted_next_encoding, current_scene_encoding.detach())

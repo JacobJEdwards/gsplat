@@ -40,7 +40,7 @@ class AdaptiveStrategy(DefaultStrategy):
     refine_every: int = 400
     learn_every: int = 200
 
-    feature_dim: int = 7
+    feature_dim: int = 17
     hidden_dim: int = 64
     learning_rate: float = 1e-4
     ppo_clip_epsilon: float = 0.2
@@ -250,6 +250,9 @@ class AdaptiveStrategy(DefaultStrategy):
             total_new = (n_split * 2) + n_duplicate
             state_to_modify["age"][-total_new:] = 0
 
+        state["prev_grad2d"] = state["grad2d"] / state["count"].clamp_min(1)
+        state["prev_opacity"] = torch.sigmoid(params["opacities"].flatten())
+
         state.update(state_to_modify)
         return n_split, n_duplicate
 
@@ -357,59 +360,75 @@ class AdaptiveStrategy(DefaultStrategy):
 
     @torch.no_grad()
     def _get_simplified_features(self, params: dict, state: dict, subset_mask: Tensor) -> Tensor:
-        n_subset = subset_mask.sum().item()
-        if n_subset == 0:
-            return torch.zeros(0, self.feature_dim, device=params["means"].device)
-
+        num_subset = subset_mask.sum().item()
         device = params["means"].device
-        features = torch.zeros(n_subset, self.feature_dim, device=device)
+        step = state.get("step", 0)
+
+        means3d_subset = params["means"][subset_mask]
 
         state["params_for_features"] = params
 
-        grads2d = state["grad2d"][subset_mask]
-        counts = state["count"][subset_mask].clamp_min(1)
-        features[:, 0] = (grads2d / counts) / self.grow_grad2d
-        scales = params["scales"][subset_mask]
-        features[:, 1] = torch.log(scales.max(dim=-1).values / state["scene_scale"])
-        features[:, 2] = params["opacities"][subset_mask].flatten()
-        features[:, 3] = state["age"][subset_mask] / 1000.0
+        # if state.get("l1_loss_map") is None:
+        #     return None
 
-        if n_subset > 5:
-            means3d_subset = params["means"][subset_mask]
-            dists, _ = knn_with_ids(means3d_subset, K=5 + 1)
-            features[:, 4] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
+        # h, w = state["l1_loss_map"].shape
+        # patch_coords_x, patch_coords_y, pixel_coords_x, pixel_coords_y, valid_mask = self._project_to_patch_coords(
+        #     means3d_subset, state["view_proj_matrix"], h, w
+        # )
 
-        gt_pixels_full = state["pixels"]
-        gt_pixels = gt_pixels_full.squeeze(0) if gt_pixels_full is not None and gt_pixels_full.dim() == 4 else gt_pixels_full
+        features = torch.zeros(num_subset, self.feature_dim, device=device)
 
-        if gt_pixels is not None:
-            h, w, _ = gt_pixels.shape
-            means_subset = params["means"][subset_mask]
-            means_h = F.pad(means_subset, (0, 1), value=1.0)
-            p_hom = means_h @ state["view_proj_matrix"]
-            p_w = 1.0 / (p_hom[:, 3].clamp_min(1e-6))
-            p_proj = p_hom[:, :2] * p_w[:, None]
+        opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
+        features[:, 0] = opacities_subset
+        scales = torch.exp(params["scales"][subset_mask])
+        features[:, 1] = scales.max(dim=-1).values / state["scene_scale"]
+        features[:, 2] = scales.min(dim=-1).values / state["scene_scale"]
+        features[:, 3] = scales.mean(dim=-1) / state["scene_scale"]
+        features[:, 4] = torch.norm(params["sh0"][subset_mask], dim=(-1, -2))
 
-            pixel_x = torch.clamp(((p_proj[:, 0] * 0.5 + 0.5) * w), 0, w - 1).long()
-            pixel_y = torch.clamp(((p_proj[:, 1] * 0.5 + 0.5) * h), 0, h - 1).long()
+        # valid_indices = torch.where(valid_mask)[0]
+        # if valid_indices.numel() > 0:
+        #     features[valid_indices, 5] = state["l1_loss_map"][pixel_coords_y[valid_indices], pixel_coords_x[
+        #         valid_indices]]
+            # features[valid_indices, 6] = state["detail_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
 
-            r = self.reward_patch_radius
-            patch_complexities = torch.zeros(n_subset, device=device)
-            for i in range(n_subset):
-                y, x = pixel_y[i], pixel_x[i]
-                y_min, y_max = max(0, y - r), min(h, y + r + 1)
-                x_min, x_max = max(0, x - r), min(w, x + r + 1)
-                patch = gt_pixels[y_min:y_max, x_min:x_max]
-                if patch.numel() > 0:
-                    patch_complexities[i] = patch.mean(dim=-1).std()
+        # age
+        features[:, 7] = state["age"][subset_mask].float() / self.refine_stop_iter
 
-            features[:, 5] = patch_complexities
+        if len(params["means"]) > 40:
+            dists, idxs = knn_with_ids(means3d_subset, K=41)
+            neighbor_idxs = idxs[:, 1:]
 
-        contribution = state.get("gaussian_contribution")
-        if contribution is not None:
-            features[:, 6] = contribution[subset_mask]
+            features[:, 8] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
+
+            neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
+            neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
+            neighbor_sh0 = params["sh0"][neighbor_idxs].squeeze(-2)
+
+            sh0_subset = params["sh0"][subset_mask]
+
+            features[:, 9] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
+            features[:, 10] = neighbor_opacities.mean(dim=-1)
+            features[:, 11] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
+
+        current_grad = state["grad2d"][subset_mask] / state["count"][subset_mask].clamp_min(1)
+        features[:, 12] = current_grad
+
+        if state.get("prev_grad2d") is not None and state.get("prev_opacity") is not None:
+            time_delta = self.refine_every
+            prev_grad_subset = state["prev_grad2d"][subset_mask]
+            prev_opacity_subset = state["prev_opacity"][subset_mask]
+
+            features[:, 13] = (current_grad - prev_grad_subset) / time_delta
+            features[:, 14] = (opacities_subset - prev_opacity_subset) / time_delta
+
+        if state.get("significance") is not None and state["significance"].numel() == len(subset_mask):
+            features[:, 15] = state["significance"][subset_mask]
+
+        features[:, 16] = step / self.refine_stop_iter
 
         return torch.nan_to_num(features, 0.0)
+
 
     def _update_quality_map(self, params: dict, state: dict, info: dict):
         if info.get("camtoworlds") is None: return

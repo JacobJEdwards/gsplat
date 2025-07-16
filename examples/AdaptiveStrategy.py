@@ -346,12 +346,19 @@ class AdaptiveStrategy(DefaultStrategy):
         scene_encoding = features.mean(dim=0).detach()
         r = self.reward_patch_radius
 
+        min_patch_size = 16
+
         for i in range(features.shape[0]):
             y, x = pixel_y[i], pixel_x[i]
-            initial_patch = rendered_img_p[..., y-r:y+r, x-r:x+r]
-            gt_patch = gt_img_p[..., y-r:y+r, x-r:x+r]
+            # Extract patches
+            y_start, y_end = max(0, y - r), min(info["height"], y + r)
+            x_start, x_end = max(0, x - r), min(info["width"], x + r)
 
-            if initial_patch.shape[-1] < 1 or initial_patch.shape[-2] < 1: continue
+            initial_patch = rendered_img_p[..., y_start:y_end, x_start:x_end]
+            gt_patch = gt_img_p[..., y_start:y_end, x_start:x_end]
+
+            if initial_patch.shape[-1] < min_patch_size or initial_patch.shape[-2] < min_patch_size:
+                continue
 
             initial_patch_lpips = self.lpips_metric(initial_patch, gt_patch)
 

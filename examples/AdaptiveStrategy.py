@@ -43,12 +43,12 @@ class AdaptiveStrategy(DefaultStrategy):
     feature_dim: int = 7
     hidden_dim: int = 64
     learning_rate: float = 1e-4
-    ppo_clip_epsilon: float = 0.15
-    entropy_loss_weight: float = 0.05
+    ppo_clip_epsilon: float = 0.2
+    entropy_loss_weight: float = 0.01
 
-    reward_patch_radius: int = 9
+    reward_patch_radius: int = 4
     reward_delay: int = 200
-    max_densification_subset: int = 100_000
+    max_densification_subset: int = 50_000
 
     prune_ac_net: Any = field(default=None, repr=False)
     prune_ac_optimizer: Any = field(default=None, repr=False)
@@ -190,11 +190,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         is_prune = is_prune_original | is_prune_significant
 
-        no_prune = state["age"] < 800
-
-        # is_prune &= ~no_prune
-
-
         n_prune = is_prune.sum().item()
         if n_prune > 0:
             per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity",
@@ -254,9 +249,6 @@ class AdaptiveStrategy(DefaultStrategy):
         if n_split > 0 or n_duplicate > 0:
             total_new = (n_split * 2) + n_duplicate
             state_to_modify["age"][-total_new:] = 0
-
-        state["prev_grad2d"] = state["grad2d"] / state["count"].clamp_min(1)
-        state["prev_opacity"] = torch.sigmoid(params["opacities"].flatten())
 
         state.update(state_to_modify)
         return n_split, n_duplicate
@@ -414,34 +406,10 @@ class AdaptiveStrategy(DefaultStrategy):
             features[:, 5] = patch_complexities
 
         contribution = state.get("gaussian_contribution")
-
         if contribution is not None:
             features[:, 6] = contribution[subset_mask]
 
-        # means3d_subset = params["means"][subset_mask]
-        # dists, idxs = knn_with_ids(means3d_subset, K=41)
-        # neighbor_idxs = idxs[:, 1:]
-        #
-        # features[:, 7] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
-        #
-        # neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
-        # neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
-        # neighbor_sh0 = params["sh0"][neighbor_idxs].squeeze(-2)
-        #
-        # sh0_subset = params["sh0"][subset_mask]
-        #
-        # features[:, 8] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
-        # features[:, 9] = neighbor_opacities.mean(dim=-1)
-        # features[:, 10] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
-
-        # features[:, 12] = neighbor_scales.std(dim=-1) / state["scene_scale"]
-        # features[:, 13] = neighbor_opacities.std(dim=-1)
-        # features[:, 14] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).std(dim=-1)
-        # features[:, 15] = state["radii"][subset_mask] / state["scene_scale"]
-        # features[:, 16] = state["significance"][subset_mask] if "significance" in state else 0.0
-
-        return features
-
+        return torch.nan_to_num(features, 0.0)
 
     def _update_quality_map(self, params: dict, state: dict, info: dict):
         if info.get("camtoworlds") is None: return

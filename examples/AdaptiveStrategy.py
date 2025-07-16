@@ -414,7 +414,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         means = params["means"][subset_mask]
         scales = torch.log(torch.exp(params["scales"][subset_mask]).mean(dim=-1, keepdim=True))
-        opacities = params["opacities"][subset_mask]
+        opacities = params["opacities"][subset_mask].reshape(-1, 1)
         quats = params["quats"][subset_mask]
         ages = state["age"][subset_mask].unsqueeze(-1).float() / 1000.0
         grads2d = (state["grad2d"][subset_mask] / state["count"][subset_mask].clamp_min(1.0)).unsqueeze(-1)

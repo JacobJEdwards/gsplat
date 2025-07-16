@@ -298,7 +298,7 @@ class AdaptiveStrategy(DefaultStrategy):
         with autocast(enabled=False, device_type="cuda"), torch.no_grad():
             rewards = (rewards_raw - rewards_raw.mean()) / (rewards_raw.std() + 1e-8)
 
-            next_values = self.actor_critic(self.graph_encoder.output_head(next_scene_encodings))[1]
+            next_values = self.actor_critic(next_scene_encodings)[1]
 
             delta = rewards + 0.99 * next_values - old_values
             advantages = (delta - delta.mean()) / (delta.std() + 1e-8)

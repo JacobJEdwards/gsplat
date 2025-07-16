@@ -434,7 +434,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         encoded_features = self.graph_encoder(node_features, edge_index, edge_attr=edge_attr)
 
-        scene_encoding = encoded_features.mean(dim=0)
+        scene_encoding = encoded_features.mean(dim=0, keepdim=True)
 
         return encoded_features, scene_encoding
 

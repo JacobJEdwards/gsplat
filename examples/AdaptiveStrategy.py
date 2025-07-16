@@ -42,7 +42,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     feature_dim: int = 17
     hidden_dim: int = 64
-    learning_rate: float = 1e-4
+    learning_rate: float = 3e-4
     ppo_clip_epsilon: float = 0.2
     entropy_loss_weight: float = 0.01
 
@@ -80,9 +80,9 @@ class AdaptiveStrategy(DefaultStrategy):
         return state
 
     def _initialize_learning_components(self, device: torch.device) -> None:
-        self.prune_ac_net = SimpleActorCritic(self.feature_dim, self.hidden_dim, 2).to(device)
-        self.prune_ac_optimizer = torch.optim.AdamW(self.prune_ac_net.parameters(), lr=self.learning_rate)
-
+        # self.prune_ac_net = SimpleActorCritic(self.feature_dim, self.hidden_dim, 2).to(device)
+        # self.prune_ac_optimizer = torch.optim.AdamW(self.prune_ac_net.parameters(), lr=self.learning_rate)
+        #
         self.grow_ac_net = SimpleActorCritic(self.feature_dim, self.hidden_dim, 3).to(device)
         self.grow_ac_optimizer = torch.optim.AdamW(self.grow_ac_net.parameters(), lr=self.learning_rate)
 
@@ -139,7 +139,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 print(f"Step {step}: Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}.")
 
         if step > self.refine_start_iter and step % self.learn_every == 0:
-            self._train_rl_agent(state, agent_type="prune")
+            # self._train_rl_agent(state, agent_type="prune")
             self._train_rl_agent(state, agent_type="grow")
 
         if step % self.reset_every == 0 and step > 0:

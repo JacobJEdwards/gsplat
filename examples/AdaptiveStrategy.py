@@ -41,7 +41,9 @@ class PerNodeActorCritic(nn.Module):
         super().__init__()
         self.shared_net = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim), nn.ELU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.ELU()
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim), nn.ELU(),
+            nn.Dropout(0.1),
         )
         self.actor_head = nn.Linear(hidden_dim, action_dim)
         self.critic_head = nn.Linear(hidden_dim, 1)
@@ -86,6 +88,8 @@ class AdaptiveStrategy(DefaultStrategy):
     entropy_loss_weight: float = 0.01
     critic_loss_weight: float = 0.5
     intrinsic_reward_factor: float = 0.1
+
+    uncertainty_bonus_factor: float = 0.05
 
     reward_delay: int = 400
     gauss_count_penalty_factor: float = 0.01
@@ -226,11 +230,32 @@ class AdaptiveStrategy(DefaultStrategy):
         original_indices = torch.where(candidate_mask)[0]
 
         per_gaussian_features = self._get_features_from_graph(params, state, candidate_mask)
-        action_dist, values = self.actor_critic(per_gaussian_features.detach())
+
+        self.actor_critic.train()
+
+        num_passes = 5
+        all_logits = []
+        with torch.no_grad():
+            for _ in range(num_passes):
+                action_dist, _ = self.actor_critic(per_gaussian_features)
+                all_logits.append(action_dist.logits)
+
+        all_logits_tensor = torch.stack(all_logits)
+        uncertainty = all_logits_tensor.var(dim=0).mean(dim=-1)
+
+        self.actor_critic.eval()
+
+        mean_logits = all_logits_tensor.mean(dim=0)
+        action_dist = Categorical(logits=mean_logits)
         actions = action_dist.sample()
 
+        _, values = self.actor_critic(per_gaussian_features)
+
+        # action_dist, values = self.actor_critic(per_gaussian_features.detach())
+        # actions = action_dist.sample()
+
         self._queue_per_node_experience(state, info, per_gaussian_features, actions, action_dist.log_prob(actions),
-                                        values, original_indices)
+                                        values, uncertainty)
 
         split_action_mask = (actions == 1)
         duplicate_action_mask = (actions == 2)
@@ -309,7 +334,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     @torch.no_grad()
     def _queue_per_node_experience(self, state: dict, info: dict, features: Tensor, actions: Tensor, log_probs: Tensor,
-                                   values: Tensor, indices: Tensor):
+                                   values: Tensor, uncertainty: Tensor) -> None:
 
         rendered_img = torch.clamp(info["colors"], 0.0, 1.0).permute(0, 3, 1, 2)
         gt_img = torch.clamp(info["pixels"], 0.0, 1.0).permute(0, 3, 1, 2)
@@ -324,6 +349,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 "action": actions[i].detach(),
                 "log_prob": log_probs[i].detach(),
                 "value": values[i].detach(),
+                "uncertainty": uncertainty[i].detach(),
                 "scene_encoding": scene_encoding,
                 "initial_lpips": initial_lpips.detach(),
                 "initial_gauss_count": state["age"].shape[0]
@@ -354,7 +380,13 @@ class AdaptiveStrategy(DefaultStrategy):
             gauss_count_now = params["means"].shape[0]
             penalty = self.gauss_count_penalty_factor * max(0, gauss_count_now - exp["initial_gauss_count"])
 
-            reward = extrinsic_reward + self.intrinsic_reward_factor * intrinsic_reward - penalty
+            uncertainty_bonus = exp["uncertainty"]
+
+            reward = (extrinsic_reward
+                      + self.intrinsic_reward_factor * intrinsic_reward
+                        + self.uncertainty_bonus_factor * uncertainty_bonus
+                      - penalty)
+
             reward = reward.clamp(-2.0, 2.0)
 
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:

@@ -72,7 +72,7 @@ class RSSM(nn.Module):
         )
 
     def observe(self, scene_embed: Tensor, action: Tensor, prev_state: RSSMState) -> Tuple[RSSMState, RSSMState]:
-        prior_state = self._imagine_step(prev_state, action)
+        prior_state = self.imagine_step(prev_state, action)
 
         x = torch.cat([prev_state.deter, scene_embed], -1)
         mean, std = self.representation_model(x).chunk(2, dim=-1)

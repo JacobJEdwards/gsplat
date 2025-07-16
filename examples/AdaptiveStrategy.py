@@ -94,7 +94,7 @@ class AdaptiveStrategy(DefaultStrategy):
     reward_delay: int = 400
     gauss_count_penalty_factor: float = 0.01
 
-    max_densification_subset: int = 100_000
+    max_densification_subset: int = 50_000
 
     graph_encoder: Any = field(default=None, repr=False)
     actor_critic: Any = field(default=None, repr=False)

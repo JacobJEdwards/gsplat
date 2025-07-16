@@ -416,7 +416,7 @@ class AdaptiveStrategy(DefaultStrategy):
         # age
         features[:, 7] = state["age"][subset_mask].float() / self.refine_stop_iter
 
-        if self.knn_fn is not None and len(params["means"]) > 40:
+        if len(params["means"]) > 40:
             dists, idxs = knn_with_ids(means3d_subset, K=41)
             neighbor_idxs = idxs[:, 1:]
 

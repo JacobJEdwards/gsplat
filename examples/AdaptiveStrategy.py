@@ -62,13 +62,6 @@ class AdaptiveStrategy(DefaultStrategy):
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
 
-        schema = TensorDict({
-            "features": torch.zeros(self.feature_dim),
-            "action": torch.zeros((), dtype=torch.long),
-            "log_prob": torch.zeros(()),
-            "reward": torch.zeros(()),
-        }, batch_size=[])
-
         state.update({
             "age": None,
             "l1_loss_map": None,
@@ -111,13 +104,12 @@ class AdaptiveStrategy(DefaultStrategy):
         if step == self.imitation_steps:
             if self.verbose:
                 print(f"--- End of Imitation Phase at step {step}. Clearing replay buffers. ---")
-
             state["prune_replay_buffer"] = TensorDictReplayBuffer(
                 storage=LazyMemmapStorage(max_size=30_000), sampler=RandomSampler(), batch_size=512,
-            ),
+            )
             state["grow_replay_buffer"] = TensorDictReplayBuffer(
                 storage=LazyMemmapStorage(max_size=30_000), sampler=RandomSampler(), batch_size=512,
-            ),
+            )
 
         is_imitation_phase = step < self.imitation_steps
 

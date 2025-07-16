@@ -121,8 +121,8 @@ class AdaptiveStrategy(DefaultStrategy):
             self._process_rewards(state, step)
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
-            n_split, n_duplicate = self.grow_gs(params, optimizers, state, is_imitation_phase)
             n_prune = self.prune_gs(params, optimizers, state, is_imitation_phase)
+            n_split, n_duplicate = self.grow_gs(params, optimizers, state, is_imitation_phase)
             if self.verbose:
                 print(f"Step {step} ({'Imitation' if is_imitation_phase else 'RL'}): Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}.")
 
@@ -168,7 +168,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         n_prune = global_prune_mask.sum().item()
         if n_prune > 0:
-            state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age"]}
+            state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "gaussian_contribution"]}
             remove(params, optimizers, state_to_modify, global_prune_mask)
             state.update(state_to_modify)
 
@@ -208,7 +208,7 @@ class AdaptiveStrategy(DefaultStrategy):
             actions = action_dist.sample()
             self._queue_rl_experience(state, features, actions, action_dist.log_prob(actions), original_indices, "grow")
 
-        state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age"]}
+        state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age", "gaussian_contribution"]}
         split_mask = (actions == 1)
         duplicate_mask = (actions == 2)
 

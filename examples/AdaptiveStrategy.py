@@ -60,6 +60,7 @@ class SimpleActorCritic(nn.Module):
 class AdaptiveStrategy(DefaultStrategy):
     refine_every: int = 400
     learn_every: int = 200
+    initial_exploration_steps: int = 2000
 
     feature_dim: int = 7
     hidden_dim: int = 64

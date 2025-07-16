@@ -511,7 +511,8 @@ class Runner:
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
-        self.ssim_for_map = StructuralSimilarityIndexMeasure(data_range=1.0, reduction='none').to(self.device)
+        self.ssim_for_map = StructuralSimilarityIndexMeasure(data_range=1.0, reduction='none',
+                                                             return_full_image=True).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
         if cfg.lpips_net == "alex":

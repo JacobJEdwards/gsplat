@@ -41,12 +41,12 @@ class AdaptiveStrategy(DefaultStrategy):
 
     feature_dim: int = 7
     hidden_dim: int = 64
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-3
     ppo_clip_epsilon: float = 0.2
     entropy_loss_weight: float = 0.01
 
     reward_patch_radius: int = 4
-    reward_delay: int = 200
+    reward_delay: int = 500
     max_densification_subset: int = 100_000
 
     prune_ac_net: Any = field(default=None, repr=False)

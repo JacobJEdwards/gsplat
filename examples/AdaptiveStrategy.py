@@ -227,7 +227,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 "log_prob": log_probs[i].detach(),
                 "pixel_x": x,
                 "pixel_y": y,
-                "initial_error": initial_patch_error,
+                "initial_patch_error": initial_patch_error,
             }
             state["reward_queue"].append(experience)
 

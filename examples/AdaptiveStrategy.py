@@ -47,7 +47,7 @@ class AdaptiveStrategy(DefaultStrategy):
     ppo_clip_epsilon: float = 0.
     entropy_loss_weight: float = 0.1
     critic_loss_weight: float = 0.5
-    reward_delay: int = 200
+    reward_delay: int = 500
     max_densification_subset: int = 100_000
 
     prune_opacity_threshold: float = 0.005

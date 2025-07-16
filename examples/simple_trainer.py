@@ -511,6 +511,7 @@ class Runner:
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+        self.ssim_for_map = StructuralSimilarityIndexMeasure(data_range=1.0, reduction='none').to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
         if cfg.lpips_net == "alex":
@@ -738,6 +739,19 @@ class Runner:
                 info=info,
             )
 
+            with torch.no_grad():
+                colors_p = colors.permute(0, 3, 1, 2)
+                pixels_p = pixels.permute(0, 3, 1, 2)
+
+                ssim_map = self.ssim_for_map(colors_p, pixels_p)
+
+                ssim_error_map = (1.0 - ssim_map) / 2.0
+
+                pad_size = (11 - 1) // 2
+                ssim_error_map = F.pad(ssim_error_map, (pad_size, pad_size, pad_size, pad_size), 'replicate')
+
+                ssim_error_map = ssim_error_map.squeeze(1)
+
             # loss
             l1_loss_unreduced = torch.abs(colors - pixels)
             l1_loss_map = l1_loss_unreduced.mean(dim=-1).detach().squeeze() # [B, H, W, 1]
@@ -927,6 +941,7 @@ class Runner:
                 info["image_ids"] = image_ids
                 info["l1_loss_map"] = l1_loss_map
                 info["detail_error_map"] = detail_loss_map
+                info["ssim_error_map"] = ssim_error_map.detach()
 
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,

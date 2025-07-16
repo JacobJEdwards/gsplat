@@ -411,7 +411,7 @@ class AdaptiveStrategy(DefaultStrategy):
         if valid_indices.numel() > 0:
             features[valid_indices, 5] = state["l1_loss_map"][pixel_coords_y[valid_indices], pixel_coords_x[
                 valid_indices]]
-            features[valid_indices, 6] = state["detail_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
+            # features[valid_indices, 6] = state["detail_error_map"][pixel_coords_y[valid_indices], pixel_coords_x[valid_indices]]
 
         # age
         features[:, 7] = state["age"][subset_mask].float() / self.refine_stop_iter

@@ -366,6 +366,8 @@ class AdaptiveStrategy(DefaultStrategy):
         device = params["means"].device
         features = torch.zeros(n_subset, self.feature_dim, device=device)
 
+        state["params_for_features"] = params
+
         grads2d = state["grad2d"][subset_mask]
         counts = state["count"][subset_mask].clamp_min(1)
         features[:, 0] = (grads2d / counts) / self.grow_grad2d

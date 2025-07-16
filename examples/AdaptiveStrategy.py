@@ -208,7 +208,7 @@ class AdaptiveStrategy(DefaultStrategy):
             for i in range(len(original_indices)):
                 experience = TensorDict({
                     "features": features[i],
-                    "action_label": labels[i]
+                    "action": labels[i]
                 }, batch_size=[])
                 state["grow_replay_buffer"].add(experience)
             actions = labels

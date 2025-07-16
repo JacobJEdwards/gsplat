@@ -44,8 +44,8 @@ class AdaptiveStrategy(DefaultStrategy):
     hidden_dim: int = 64
     action_dim: int = 4  # 0: No-op, 1: Prune, 2: Split, 3: Duplicate
     learning_rate: float = 1e-4
-    ppo_clip_epsilon: float = 0.15
-    entropy_loss_weight: float = 0.015
+    ppo_clip_epsilon: float = 0.
+    entropy_loss_weight: float = 0.01
     reward_delay: int = 200
     max_densification_subset: int = 100_000
 
@@ -68,6 +68,7 @@ class AdaptiveStrategy(DefaultStrategy):
         state.update({
             "age": None,
             "l1_loss_map": None,
+            "detail_error_map": None,
             "view_proj_matrix": None,
             "replay_buffer": replay_buffer,
             "reward_queue": reward_queue,
@@ -99,6 +100,7 @@ class AdaptiveStrategy(DefaultStrategy):
             state["age"] = torch.zeros(params["means"].shape[0], dtype=torch.int32, device=params["means"].device)
 
         state["age"] += 1
+        state["detail_error_map"] = info.get("detail_error_map")
         state["l1_loss_map"] = info.get("l1_loss_map")
         state["pixels"] = info.get("pixels")
         state["gaussian_contribution"] = info.get("gaussian_contribution")
@@ -108,7 +110,7 @@ class AdaptiveStrategy(DefaultStrategy):
         self._process_rewards(state, step)
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
-            if state.get("pixels") is not None and state.get("gaussian_contribution") is not None:
+            if state.get("detail_error_map") is not None and state.get("pixels") is not None:
                 n_prune, n_split, n_duplicate = self._update_geometry(params, optimizers, state, step)
                 if self.verbose:
                     print(f"Step {step}: Pruned {n_prune}, Split {n_split}, Duplicated {n_duplicate}. Now "
@@ -195,19 +197,20 @@ class AdaptiveStrategy(DefaultStrategy):
         original_indices = torch.where(candidate_mask)[0]
 
         features = self._get_simplified_features(params, state, candidate_mask)
+
         self.ac_net.eval()
         action_logits, _ = self.ac_net(features)
         action_dist = Categorical(logits=action_logits)
         actions = action_dist.sample()
         log_probs = action_dist.log_prob(actions)
 
-        l1_loss_map = state["l1_loss_map"].squeeze() if state["l1_loss_map"].dim() > 2 else state["l1_loss_map"]
-        h, w = l1_loss_map.shape
+        detail_error_map = state["detail_error_map"].squeeze()
+        h, w = detail_error_map.shape
+
         means_h = F.pad(params["means"][original_indices], (0, 1), value=1.0)
         p_hom = means_h @ state["view_proj_matrix"]
         p_w = 1.0 / (p_hom[:, 3].clamp_min(1e-6))
         p_proj = p_hom[:, :2] * p_w[:, None]
-
         pixel_x = torch.clamp(((p_proj[:, 0] * 0.5 + 0.5) * w), 0, w - 1).long()
         pixel_y = torch.clamp(((p_proj[:, 1] * 0.5 + 0.5) * h), 0, h - 1).long()
 
@@ -217,7 +220,7 @@ class AdaptiveStrategy(DefaultStrategy):
             y_min, y_max = max(0, y - r), min(h, y + r + 1)
             x_min, x_max = max(0, x - r), min(w, x + r + 1)
 
-            initial_error_patch = l1_loss_map[y_min:y_max, x_min:x_max]
+            initial_error_patch = detail_error_map[y_min:y_max, x_min:x_max]
             initial_patch_error = initial_error_patch.mean() if initial_error_patch.numel() > 0 else torch.tensor(0.0, device=device)
 
             experience = {
@@ -284,19 +287,18 @@ class AdaptiveStrategy(DefaultStrategy):
         while state["reward_queue"] and (current_step - state["reward_queue"][0]["step"]) >= self.reward_delay:
             exp = state["reward_queue"].popleft()
 
-            if state.get("l1_loss_map") is None:
+            detail_error_map = state.get("detail_error_map")
+            if detail_error_map is None:
                 continue
 
-            l1_loss_map = state["l1_loss_map"]
-
-            l1_loss_map = l1_loss_map.squeeze() if l1_loss_map.dim() > 2 else l1_loss_map
-            h, w = l1_loss_map.shape
+            detail_error_map = detail_error_map.squeeze()
+            h, w = detail_error_map.shape
             y, x = exp["pixel_y"], exp["pixel_x"]
             y_min, y_max = max(0, y - r), min(h, y + r + 1)
             x_min, x_max = max(0, x - r), min(w, x + r + 1)
 
-            new_error_patch = l1_loss_map[y_min:y_max, x_min:x_max]
-            new_patch_error = new_error_patch.mean() if new_error_patch.numel() > 0 else torch.tensor(0.0, device=l1_loss_map.device)
+            new_error_patch = detail_error_map[y_min:y_max, x_min:x_max]
+            new_patch_error = new_error_patch.mean() if new_error_patch.numel() > 0 else torch.tensor(0.0, device=detail_error_map.device)
 
             initial_patch_error = exp["initial_patch_error"]
             reward = initial_patch_error - new_patch_error

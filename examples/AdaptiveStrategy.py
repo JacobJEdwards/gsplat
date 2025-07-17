@@ -40,20 +40,21 @@ class AdaptiveStrategy(DefaultStrategy):
     learn_every: int = 100
 
     ac_hidden_dim: int = 64
-    ac_feature_dim: int = 10
+    ac_feature_dim: int = 13
     ac_action_dim: int = 3  # 0:None, 1:Split, 2:Duplicate
 
     ac_learning_rate: float = 3e-4
     ppo_clip_epsilon: float = 0.2
-    entropy_loss_weight: float = 0.01
+    entropy_loss_weight: float = 0.05
     critic_loss_weight: float = 0.5
     gamma: float = 0.99 # Discount factor for future rewards (though actions are now immediate)
+    local_reward_scale: float = 50.0
 
     reward_weight_ssim: float = 10.0
     reward_weight_l1: float = 20.0
     gauss_count_penalty_factor: float = 0.005
 
-    max_densification_subset: int = 25_000
+    max_densification_subset: int = 15_000
     prune_min_age: int = 1000
     prune_significance_thresh: float = 0.01
 
@@ -72,9 +73,9 @@ class AdaptiveStrategy(DefaultStrategy):
             "age": None,
             "significance": None,
             "replay_buffer": TensorDictReplayBuffer(
-                storage=LazyMemmapStorage(max_size=50_000),
+                storage=LazyMemmapStorage(max_size=20_000),
                 sampler=RandomSampler(),
-                batch_size=1024,
+                batch_size=512,
             ),
         })
         return state
@@ -85,7 +86,7 @@ class AdaptiveStrategy(DefaultStrategy):
         ac_params = list(self.actor_critic.parameters())
         self.ac_optimizer = torch.optim.AdamW(ac_params, lr=self.ac_learning_rate)
         if self.verbose:
-            print("🧠 Initialized Densification Agent (AC).")
+            print("Initialized Densification Agent (AC).")
 
     def step_post_backward(
             self,
@@ -215,11 +216,15 @@ class AdaptiveStrategy(DefaultStrategy):
             actions = action_dist.sample()
             log_probs = action_dist.log_prob(actions)
 
-        # initial_loss = self._calculate_render_loss(params, info, step)
-        initial_ssim = state.get("ssim")
-        l1_loss = state.get("l1_loss")
+            xy_view_subset = info["xy_view"][original_indices] # Shape: [num_candidates, 2]
+            h, w = info["l1_loss_map"].shape
+            grid = xy_view_subset.clone()
+            grid[:, 0] = (grid[:, 0] / (w - 1)) * 2 - 1
+            grid[:, 1] = (grid[:, 1] / (h - 1)) * 2 - 1
+            grid = grid.unsqueeze(0).unsqueeze(1) # Shape: [1, 1, num_candidates, 2]
 
-        initial_loss = self.reward_weight_ssim * (1.0 - initial_ssim) + self.reward_weight_l1 * l1_loss
+            l1_map_unsqueezed = info["l1_loss_map"].unsqueeze(0).unsqueeze(0)
+            initial_local_error = F.grid_sample(l1_map_unsqueezed, grid, align_corners=True).squeeze()
 
         per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance", "age", "gaussian_contribution"]
         state_to_modify = {k: v for k, v in state.items() if k in per_gaussian_state_keys}
@@ -245,13 +250,23 @@ class AdaptiveStrategy(DefaultStrategy):
 
 
         with torch.no_grad():
-            final_loss = self._calculate_render_loss(params, info, step)
+            final_rendered_output = self.rasterizer_fn(
+                params=params,
+                view_matrix=torch.linalg.inv(info["camtoworlds"]),
+                proj_matrix=info["Ks"],
+                camera_params=(w, h, info["Ks"][0, 0, 0], info["Ks"][0, 1, 1]),
+            )["colors"]
+            final_l1_map = (final_rendered_output - info["pixels"]).abs().mean(dim=-1).squeeze(0)
 
-            loss_improvement_reward = initial_loss.detach() - final_loss.detach()
-            gauss_count_penalty = self.gauss_count_penalty_factor * (actions > 0).float() # Penalize non-None actions
-            reward = loss_improvement_reward - gauss_count_penalty
-            num_added_to_buffer = per_gaussian_features.shape[0]
-            for i in range(num_added_to_buffer):
+            final_l1_map_unsqueezed = final_l1_map.unsqueeze(0).unsqueeze(0)
+            final_local_error = F.grid_sample(final_l1_map_unsqueezed, grid, align_corners=True).squeeze()
+
+            local_reward = (initial_local_error - final_local_error) * self.local_reward_scale
+
+            gauss_count_penalty = self.gauss_count_penalty_factor * (actions > 0).float()
+            reward = local_reward - gauss_count_penalty
+
+            for i in range(num_candidates):
                 if len(state["replay_buffer"]) >= state["replay_buffer"]._storage.max_size:
                     break
 
@@ -326,9 +341,10 @@ class AdaptiveStrategy(DefaultStrategy):
         if num_subset == 0:
             return None
         device = params["means"].device
-        means3d_subset = params["means"][subset_mask]
 
         features = torch.zeros(num_subset, self.ac_feature_dim, device=device)
+
+        means3d_subset = params["means"][subset_mask]
         opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
         features[:, 0] = opacities_subset
 
@@ -336,24 +352,43 @@ class AdaptiveStrategy(DefaultStrategy):
         features[:, 1] = scales.max(dim=-1).values / state["scene_scale"]
         features[:, 2] = scales.min(dim=-1).values / state["scene_scale"]
         features[:, 3] = scales.mean(dim=-1) / state["scene_scale"]
-
         features[:, 4] = torch.norm(params["sh0"][subset_mask], dim=(-1, -2))
 
+        all_indices = torch.where(subset_mask)[0]
+        chunk_size = 1000
+
         if self.knn_fn is not None and len(params["means"]) > 5:
-            dists, idxs = self.knn_fn(means3d_subset, K=5 + 1)
-            neighbor_idxs = idxs[:, 1:]
+            for i in range(0, num_subset, chunk_size):
+                chunk_end = min(i + chunk_size, num_subset)
+                chunk_indices = all_indices[i:chunk_end]
+                means3d_chunk = params["means"][chunk_indices]
 
-            features[:, 5] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
+                dists, idxs = self.knn_fn(means3d_chunk, K=5 + 1)
+                neighbor_idxs = idxs[:, 1:]
 
-            neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
-            neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
-            neighbor_sh0 = params["sh0"][neighbor_idxs].squeeze(-2)
-            sh0_subset = params["sh0"][subset_mask]
+                features[i:chunk_end, 5] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
 
-            features[:, 6] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
-            features[:, 7] = neighbor_opacities.mean(dim=-1)
-            features[:, 8] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
+                neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
+                features[i:chunk_end, 6] = (neighbor_scales.mean(dim=-1) / state["scene_scale"])
 
-        features[:, 9] = step / self.refine_stop_iter
+                neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
+                features[i:chunk_end, 7] = neighbor_opacities.mean(dim=-1)
+
+                neighbor_sh0 = params["sh0"][neighbor_idxs].squeeze(-2)
+                sh0_chunk = params["sh0"][chunk_indices]
+                features[i:chunk_end, 8] = torch.norm(neighbor_sh0 - sh0_chunk, dim=-1).mean(dim=-1)
+
+        grad2d_subset = state["grad2d"][subset_mask]
+        count_subset = state["count"][subset_mask]
+        features[:, 9] = grad2d_subset / count_subset.clamp_min(1.0)
+
+        age_subset = state["age"][subset_mask]
+        features[:, 10] = torch.log1p(age_subset.float())
+
+        max_scale = scales.max(dim=-1).values
+        min_scale = scales.min(dim=-1).values
+        features[:, 11] = max_scale / min_scale.clamp_min(1e-8)
+
+        features[:, 12] = step / self.refine_stop_iter
 
         return torch.nan_to_num(features, 0.0)

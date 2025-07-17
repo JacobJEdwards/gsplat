@@ -248,15 +248,18 @@ class AdaptiveStrategy(DefaultStrategy):
             loss_improvement_reward = initial_loss.detach() - final_loss.detach()
             gauss_count_penalty = self.gauss_count_penalty_factor * (actions > 0).float() # Penalize non-None actions
             reward = loss_improvement_reward - gauss_count_penalty
+            num_added_to_buffer = per_gaussian_features.shape[0]
+            for i in range(num_added_to_buffer):
+                if len(state["replay_buffer"]) >= state["replay_buffer"]._storage.max_size:
+                    break
 
-            if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
                 td = TensorDict({
-                    "features": per_gaussian_features.detach(),
-                    "action": actions.detach().unsqueeze(-1),
-                    "log_prob": log_probs.detach().unsqueeze(-1),
-                    "value": values.detach().unsqueeze(-1),
-                    "reward": reward.clamp(-5.0, 5.0).detach().unsqueeze(-1),
-                }, batch_size=[per_gaussian_features.shape[0]])
+                    "features": per_gaussian_features[i].detach(),
+                    "action": actions[i].detach().unsqueeze(0),
+                    "log_prob": log_probs[i].detach().unsqueeze(0),
+                    "value": values[i].detach().unsqueeze(0),
+                    "reward": reward[i].clamp(-5.0, 5.0).detach().unsqueeze(0),
+                }, batch_size=[])
                 state["replay_buffer"].add(td)
 
             if self.writer:

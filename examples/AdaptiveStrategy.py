@@ -162,6 +162,11 @@ class AdaptiveStrategy(DefaultStrategy):
             state["age"] = torch.zeros(params["means"].shape[0], dtype=torch.int32, device=params["means"].device)
 
         state["age"] += 1
+        state["camtoworlds"] = info.get("camtoworlds", None)
+        state["Ks"] = info.get("Ks", None)
+        state["image_ids"] = info.get("image_ids", None)
+        state["pixels"] = info.get("pixels", None)
+        state["colors"] = info.get("colors", None)
 
         self._process_rewards(params, state, step)
         self._update_state(params, state, info, packed=packed)
@@ -332,7 +337,8 @@ class AdaptiveStrategy(DefaultStrategy):
                 "action": actions[i].detach(), "log_prob": log_probs[i].detach(),
                 "value": values[i].detach(), "scene_encoding": scene_encoding,
                 "initial_avg_metrics": {k: v for k, v in initial_avg_metrics.items()},
-                "initial_gauss_count": state["age"].shape[0]
+                "initial_gauss_count": state["age"].shape[0],
+                "camtoworlds": state.get("camtoworlds", None),
             }
             state["reward_queue"].append(experience)
 

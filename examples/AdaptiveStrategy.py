@@ -1,11 +1,13 @@
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Tuple
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn, autocast
-from torch.distributions import Categorical, Independent, kl_divergence, Normal
+from torch.distributions import Categorical
+
+import torchmetrics
 
 from ops import duplicate, split
 from utils import knn_with_ids, create_view_proj_matrix
@@ -15,13 +17,6 @@ from tensordict import TensorDict
 from torchrl.data import RandomSampler, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyMemmapStorage
 import torch_geometric.nn as gnn
-
-@dataclass
-class RSSMState:
-    mean: Tensor
-    std: Tensor
-    stoch: Tensor
-    deter: Tensor
 
 class GraphEncoder(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
@@ -94,6 +89,12 @@ class AdaptiveStrategy(DefaultStrategy):
     reward_delay: int = 400
     gauss_count_penalty_factor: float = 0.01
 
+    reward_weight_lpips: float = 50.0
+    reward_weight_psnr: float = 0.1
+    reward_weight_ssim: float = 10.0
+    reward_weight_l1: float = 20.0
+    reward_weight_mse: float = 20.0
+
     num_reward_views: int = 4
 
     reward_validation_set: list[dict] = field(default_factory=list, repr=False)
@@ -107,6 +108,8 @@ class AdaptiveStrategy(DefaultStrategy):
     ac_optimizer: Any = field(default=None, repr=False)
     wm_optimizer: Any = field(default=None, repr=False)
     lpips_metric: Any = field(default=None, repr=False)
+    psnr_metric: Any = field(default=None, repr=False)
+    ssim_metric: Any = field(default=None, repr=False)
     writer: Any = field(default=None, repr=False)
 
     def setup_validation_set(self, validation_dataset: torch.utils.data.Dataset, device: torch.device) -> None:
@@ -120,7 +123,6 @@ class AdaptiveStrategy(DefaultStrategy):
                 "camtoworld": data["camtoworld"].to(device),
                 "K": data["K"].to(device),
                 "pixels": data["image"].to(device) / 255.0,
-                # "image_id": data["image_id"].to(device),
             })
         if self.verbose:
             print(f"Created a fixed reward validation set with {len(self.reward_validation_set)} views.")
@@ -144,19 +146,19 @@ class AdaptiveStrategy(DefaultStrategy):
         gt_img_p = pixels.permute(0, 3, 1, 2)
 
         lpips_score = self.lpips_metric(rendered_img_p, gt_img_p)
-        l1_loss_map = F.l1_loss(rendered_img_p, gt_img_p, reduction='none').mean(dim=0)
-        detail_error_map = F.mse_loss(rendered_img_p, gt_img_p, reduction='none').mean(dim=0)
-        detail_error_map = detail_error_map.clamp(0.0, 1.0)
-        detail_error_map = detail_error_map.mean(dim=0, keepdim=True)
+        psnr_score = self.psnr_metric(rendered_img_p, gt_img_p)
+        ssim_score = self.ssim_metric(rendered_img_p, gt_img_p)
+        l1_loss = F.l1_loss(rendered_img_p, gt_img_p)
+        mse_loss = F.mse_loss(rendered_img_p, gt_img_p)
 
         metrics = {
-            "lpips_score": lpips_score.item(),
-            "l1_loss_map": l1_loss_map,
-            "detail_error_map": detail_error_map,
+            "lpips": lpips_score.item(),
+            "psnr": psnr_score.item(),
+            "ssim": ssim_score.item(),
+            "l1": l1_loss.item(),
+            "mse": mse_loss.item(),
         }
-
         return metrics
-
 
 
     @torch.no_grad()
@@ -190,18 +192,18 @@ class AdaptiveStrategy(DefaultStrategy):
         gt_img_p = gt_pixels.permute(0, 3, 1, 2)
 
         total_lpips = self.lpips_metric(rendered_img_p, gt_img_p)
-        l1_loss_map = F.l1_loss(rendered_img_p, gt_img_p, reduction='none').mean(dim=0)
-        detail_error_map = F.mse_loss(rendered_img_p, gt_img_p, reduction='none').mean(dim=0)
-
-        detail_error_map = detail_error_map.clamp(0.0, 1.0)
-        detail_error_map = detail_error_map.mean(dim=0, keepdim=True)
+        total_psnr = self.psnr_metric(rendered_img_p, gt_img_p)
+        total_ssim = self.ssim_metric(rendered_img_p, gt_img_p)
+        total_l1 = F.l1_loss(rendered_img_p, gt_img_p)
+        total_mse = F.mse_loss(rendered_img_p, gt_img_p)
 
         return {
-            "lpips_score": total_lpips.mean(),
-            "l1_loss_map": l1_loss_map.mean(),
-            "detail_error_map": detail_error_map.mean(),
+            "lpips": total_lpips.mean(),
+            "psnr": total_psnr.mean(),
+            "ssim": total_ssim.mean(),
+            "l1": total_l1.mean(),
+            "mse": total_mse.mean(),
         }
-
 
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
@@ -344,9 +346,9 @@ class AdaptiveStrategy(DefaultStrategy):
             _, values = self.actor_critic(per_gaussian_features)
 
 
-        initial_avg_lpips = self._calculate_avg_metrics(params, step=state["step"])["lpips_score"]
+        initial_avg_metrics = self._calculate_avg_metrics(params, step=state["step"])["lpips_score"]
         self._queue_per_node_experience(state, info, per_gaussian_features, actions, action_dist.log_prob(actions),
-                                        values, uncertainty, initial_avg_lpips)
+                                        values, uncertainty, initial_avg_metrics)
 
         split_action_mask = (actions == 1)
         duplicate_action_mask = (actions == 2)
@@ -430,20 +432,17 @@ class AdaptiveStrategy(DefaultStrategy):
 
     @torch.no_grad()
     def _queue_per_node_experience(self, state: dict, info: dict, features: Tensor, actions: Tensor, log_probs: Tensor,
-                                   values: Tensor, uncertainty: Tensor, initial_avg_lpips: Tensor) -> None:
+                                   values: Tensor, uncertainty: Tensor, initial_avg_metrics: dict) -> None:
 
         scene_encoding = features.mean(dim=0).detach()
 
         for i in range(features.shape[0]):
             experience = {
-                "step": state["step"],
-                "features": features[i].detach(),
-                "action": actions[i].detach(),
-                "log_prob": log_probs[i].detach(),
-                "value": values[i].detach(),
-                "uncertainty": uncertainty[i].detach(),
+                "step": state["step"], "features": features[i].detach(),
+                "action": actions[i].detach(), "log_prob": log_probs[i].detach(),
+                "value": values[i].detach(), "uncertainty": uncertainty[i].detach(),
                 "scene_encoding": scene_encoding,
-                "initial_avg_lpips": initial_avg_lpips.detach(),
+                "initial_avg_metrics": {k: v.detach() for k, v in initial_avg_metrics.items()},
                 "initial_gauss_count": state["age"].shape[0]
             }
             state["reward_queue"].append(experience)
@@ -454,28 +453,44 @@ class AdaptiveStrategy(DefaultStrategy):
         if not queue or (current_step - queue[0]["step"]) < self.reward_delay: return
 
         with torch.no_grad(), autocast(enabled=False, device_type="cuda"):
-            current_scene_encoding = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device)).mean(dim=0).detach()
+            all_node_features = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device))
+            if all_node_features.shape[0] == 0: return
+            current_scene_encoding = all_node_features.mean(dim=0).detach()
 
-        current_avg_lpips = self._calculate_avg_lpips(params, step=current_step)
+        current_avg_metrics = self._calculate_avg_metrics(params, step=current_step)
+
+        for name, val in current_avg_metrics.items():
+            self.writer.add_scalar(f"metrics/avg_{name}", val, current_step)
 
         while queue and (current_step - queue[0]["step"]) >= self.reward_delay:
             exp = queue.popleft()
 
-            extrinsic_reward = (exp["initial_avg_lpips"] - current_avg_lpips) * 50.0
+            initial_metrics = exp["initial_avg_metrics"]
+
+            delta_lpips = initial_metrics["lpips"] - current_avg_metrics["lpips"]
+            delta_l1 = initial_metrics["l1"] - current_avg_metrics["l1"]
+            delta_mse = initial_metrics["mse"] - current_avg_metrics["mse"]
+
+            delta_psnr = current_avg_metrics["psnr"] - initial_metrics["psnr"]
+            delta_ssim = current_avg_metrics["ssim"] - initial_metrics["ssim"]
+
+            extrinsic_reward = (
+                    self.reward_weight_lpips * delta_lpips +
+                    self.reward_weight_psnr * delta_psnr +
+                    self.reward_weight_ssim * delta_ssim +
+                    self.reward_weight_l1 * delta_l1 +
+                    self.reward_weight_mse * delta_mse
+            )
 
             predicted_next_encoding = self.world_model(exp["scene_encoding"])
             intrinsic_reward = F.mse_loss(predicted_next_encoding, current_scene_encoding.detach())
-
             gauss_count_now = params["means"].shape[0]
             penalty = self.gauss_count_penalty_factor * max(0, gauss_count_now - exp["initial_gauss_count"])
-
             uncertainty_bonus = exp["uncertainty"]
-
             reward = (extrinsic_reward
                       + self.intrinsic_reward_factor * intrinsic_reward
                       + self.uncertainty_bonus_factor * uncertainty_bonus
                       - penalty)
-
             reward = reward.clamp(-2.0, 2.0)
 
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:

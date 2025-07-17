@@ -145,14 +145,14 @@ class AdaptiveStrategy(DefaultStrategy):
         rendered_img_p = render_colors.permute(0, 3, 1, 2)
         gt_img_p = pixels.permute(0, 3, 1, 2)
 
-        lpips_score = self.lpips_metric(rendered_img_p, gt_img_p)
+        # lpips_score = self.lpips_metric(rendered_img_p, gt_img_p)
         psnr_score = self.psnr_metric(rendered_img_p, gt_img_p)
         ssim_score = self.ssim_metric(rendered_img_p, gt_img_p)
         l1_loss = F.l1_loss(rendered_img_p, gt_img_p)
         mse_loss = F.mse_loss(rendered_img_p, gt_img_p)
 
         metrics = {
-            "lpips": lpips_score.item(),
+            # "lpips": lpips_score.item(),
             "psnr": psnr_score.item(),
             "ssim": ssim_score.item(),
             "l1": l1_loss.item(),
@@ -191,14 +191,14 @@ class AdaptiveStrategy(DefaultStrategy):
         rendered_img_p = render_colors.permute(0, 3, 1, 2)
         gt_img_p = gt_pixels.permute(0, 3, 1, 2)
 
-        total_lpips = self.lpips_metric(rendered_img_p, gt_img_p)
+        # total_lpips = self.lpips_metric(rendered_img_p, gt_img_p)
         total_psnr = self.psnr_metric(rendered_img_p, gt_img_p)
         total_ssim = self.ssim_metric(rendered_img_p, gt_img_p)
         total_l1 = F.l1_loss(rendered_img_p, gt_img_p)
         total_mse = F.mse_loss(rendered_img_p, gt_img_p)
 
         return {
-            "lpips": total_lpips.mean(),
+            # "lpips": total_lpips.mean(),
             "psnr": total_psnr.mean(),
             "ssim": total_ssim.mean(),
             "l1": total_l1.mean(),
@@ -467,7 +467,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
             initial_metrics = exp["initial_avg_metrics"]
 
-            delta_lpips = initial_metrics["lpips"] - current_avg_metrics["lpips"]
+            # delta_lpips = initial_metrics["lpips"] - current_avg_metrics["lpips"]
             delta_l1 = initial_metrics["l1"] - current_avg_metrics["l1"]
             delta_mse = initial_metrics["mse"] - current_avg_metrics["mse"]
 
@@ -475,7 +475,7 @@ class AdaptiveStrategy(DefaultStrategy):
             delta_ssim = current_avg_metrics["ssim"] - initial_metrics["ssim"]
 
             extrinsic_reward = (
-                    self.reward_weight_lpips * delta_lpips +
+                    # self.reward_weight_lpips * delta_lpips +
                     self.reward_weight_psnr * delta_psnr +
                     self.reward_weight_ssim * delta_ssim +
                     self.reward_weight_l1 * delta_l1 +

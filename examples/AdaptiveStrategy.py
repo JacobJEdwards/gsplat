@@ -251,12 +251,21 @@ class AdaptiveStrategy(DefaultStrategy):
 
 
         with torch.no_grad():
-            final_rendered_output = self.rasterizer_fn(
-                params=params,
-                view_matrix=torch.linalg.inv(info["camtoworlds"]),
-                proj_matrix=info["Ks"],
-                camera_params=(w, h, info["Ks"][0, 0, 0], info["Ks"][0, 1, 1]),
-            )["colors"]
+            pixels = info["pixels"]
+            width, height = pixels.shape[2], pixels.shape[1]
+
+            final_rendered_output, _, _ = self.rasterizer_fn(
+                camtoworlds=info["camtoworlds"],
+                Ks=info["Ks"],
+                width=width, height=height,
+                sh_degree=min(step // 1000, 3),
+                near_plane=0.01, far_plane=1e10,
+                render_mode="RGB",
+                means=params["means"], scales=torch.exp(params["scales"]),
+                quats=params["quats"],
+                opacities=torch.sigmoid(params["opacities"]),
+                colors=torch.cat([params["sh0"], params["shN"]], dim=1),
+            )
             final_l1_map = (final_rendered_output - info["pixels"]).abs().mean(dim=-1).squeeze(0)
 
             final_l1_map_unsqueezed = final_l1_map.unsqueeze(0).unsqueeze(0)

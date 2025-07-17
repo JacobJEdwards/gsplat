@@ -491,8 +491,10 @@ class AdaptiveStrategy(DefaultStrategy):
                     self.reward_weight_mse * delta_mse
             )
 
-            predicted_next_encoding = self.world_model(exp["scene_encoding"])
-            intrinsic_reward = F.mse_loss(predicted_next_encoding, current_scene_encoding.detach())
+            with autocast(enabled=True, device_type="cuda"):
+                predicted_next_encoding = self.world_model(exp["scene_encoding"])
+                intrinsic_reward = F.mse_loss(predicted_next_encoding, current_scene_encoding.detach())
+
             gauss_count_now = params["means"].shape[0]
             penalty = self.gauss_count_penalty_factor * max(0, gauss_count_now - exp["initial_gauss_count"])
             uncertainty_bonus = exp["uncertainty"]

@@ -157,6 +157,7 @@ class AdaptiveStrategy(DefaultStrategy):
             state.update(state_to_modify)
         return n_prune
 
+    @torch.no_grad()
     def _calculate_render_loss(self, params: dict, info: dict, step: int) -> Tensor:
         sh_degree_to_use = min(step // 1000, 3)
         colors = torch.cat([params["sh0"], params["shN"]], 1)
@@ -242,9 +243,10 @@ class AdaptiveStrategy(DefaultStrategy):
             state_to_modify["age"][-num_new:] = 0
         state.update(state_to_modify)
 
-        final_loss = self._calculate_render_loss(params, info, step)
 
         with torch.no_grad():
+            final_loss = self._calculate_render_loss(params, info, step)
+
             loss_improvement_reward = initial_loss.detach() - final_loss.detach()
             gauss_count_penalty = self.gauss_count_penalty_factor * (actions > 0).float() # Penalize non-None actions
             reward = loss_improvement_reward - gauss_count_penalty

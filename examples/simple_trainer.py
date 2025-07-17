@@ -527,7 +527,7 @@ class Runner:
             cfg.strategy.lpips_metric = self.lpips
             cfg.strategy.ssim_metric = fused_ssim
             cfg.strategy.psnr_metric = self.psnr
-            cfg.strategy.setup_validation_set(self.trainset, device=self.device)
+            # cfg.strategy.setup_validation_set(self.trainset, device=self.device)
             cfg.strategy.rasterize_fn = self.rasterize_splats
 
 

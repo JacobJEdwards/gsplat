@@ -436,7 +436,7 @@ class AdaptiveStrategy(DefaultStrategy):
         self.writer.add_scalar("agent/critic_loss", critic_loss.item(), state["step"])
         self.writer.add_scalar("agent/entropy_loss", entropy_loss.item(), state["step"])
         self.writer.add_scalar("agent/wm_loss", wm_loss.item(), state["step"])
-        self.writer.add_scalar("agent/mean_reward", rewards.mean().item(), state["step"])
+        self.writer.add_scalar("agent/mean_reward", rewards_raw.mean().item(), state["step"])
 
 
     @torch.no_grad()

@@ -398,7 +398,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         self.wm_optimizer.zero_grad()
         # wm_loss.backward()
-        self.grad_scaler.backward(wm_loss)
+        self.grad_scaler.scale(wm_loss).backward()
         # self.wm_optimizer.step()
         self.grad_scaler.step(self.wm_optimizer)
 
@@ -425,7 +425,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         self.ac_optimizer.zero_grad()
         # ac_loss.backward()
-        self.grad_scaler.backward(ac_loss)
+        self.grad_scaler.scale(ac_loss).backward()
         # self.ac_optimizer.step()
         self.grad_scaler.step(self.ac_optimizer)
         self.grad_scaler.update()

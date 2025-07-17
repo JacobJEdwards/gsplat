@@ -289,8 +289,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 }, batch_size=[])
                 state["replay_buffer"].add(td)
 
-            if self.writer:
-                self.writer.add_scalar("reward/immediate_reward_mean", reward.mean().item(), state["step"])
+            self.writer.add_scalar("reward/immediate_reward_mean", reward.mean().item(), state["step"])
 
         return n_split, n_duplicate
 
@@ -359,11 +358,10 @@ class AdaptiveStrategy(DefaultStrategy):
         ac_loss.backward()
         self.ac_optimizer.step()
 
-        if self.writer:
-            self.writer.add_scalar("agent/ac_loss", ac_loss.item(), state["step"])
-            self.writer.add_scalar("agent/actor_loss", actor_loss.item(), state["step"])
-            self.writer.add_scalar("agent/critic_loss", critic_loss.item(), state["step"])
-            self.writer.add_scalar("agent/mean_reward_raw", rewards.mean().item(), state["step"])
+        self.writer.add_scalar("agent/ac_loss", ac_loss.item(), state["step"])
+        self.writer.add_scalar("agent/actor_loss", actor_loss.item(), state["step"])
+        self.writer.add_scalar("agent/critic_loss", critic_loss.item(), state["step"])
+        self.writer.add_scalar("agent/mean_reward_raw", rewards.mean().item(), state["step"])
 
     @torch.no_grad()
     def _get_raw_features(self, params: dict, state: dict, subset_mask: Tensor, step: int) -> Tensor:

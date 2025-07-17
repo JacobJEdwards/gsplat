@@ -346,7 +346,7 @@ class AdaptiveStrategy(DefaultStrategy):
             _, values = self.actor_critic(per_gaussian_features)
 
 
-        initial_avg_metrics = self._calculate_avg_metrics(params, step=state["step"])["lpips_score"]
+        initial_avg_metrics = self._calculate_avg_metrics(params, step=state["step"])
         self._queue_per_node_experience(state, info, per_gaussian_features, actions, action_dist.log_prob(actions),
                                         values, uncertainty, initial_avg_metrics)
 

@@ -323,10 +323,12 @@ class AdaptiveStrategy(DefaultStrategy):
 
         # self.grad_scaler.update()
 
-        if self.writer:
-            self.writer.add_scalar("agent/ac_loss", ac_loss.item(), state["step"])
-            self.writer.add_scalar("agent/wm_loss", wm_loss.item(), state["step"])
-            self.writer.add_scalar("agent/mean_reward", rewards_raw.mean().item(), state["step"])
+        self.writer.add_scalar("agent/ac_loss", ac_loss.item(), state["step"])
+        self.writer.add_scalar("agent/wm_loss", wm_loss.item(), state["step"])
+        self.writer.add_scalar("agent/mean_reward", rewards_raw.mean().item(), state["step"])
+        self.writer.add_scalar("agent/entropy_loss", entropy_loss.item(), state["step"])
+        self.writer.add_scalar("agent/actor_loss", actor_loss.item(), state["step"])
+        self.writer.add_scalar("agent/critic_loss", critic_loss.item(), state["step"])
 
     @torch.no_grad()
     def _queue_per_node_experience(self, state: dict, features: Tensor, actions: Tensor, log_probs: Tensor, values: Tensor, initial_avg_metrics: dict):

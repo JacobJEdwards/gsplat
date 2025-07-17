@@ -324,7 +324,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 }, batch_size=[])
                 state["replay_buffer"].add(td)
 
-            self.writer.add_scalar("reward/extrinsic", extrinsic_reward.item(), current_step)
+            self.writer.add_scalar("reward/extrinsic", extrinsic_reward, current_step)
             self.writer.add_scalar("reward/intrinsic", intrinsic_reward.item(), current_step)
             self.writer.add_scalar("reward/total", reward.item(), current_step)
 

@@ -332,17 +332,19 @@ class AdaptiveStrategy(DefaultStrategy):
             wm_loss = F.mse_loss(next_scene_pred, next_scene_encodings.detach())
 
         self.wm_optimizer.zero_grad()
-        self.grad_scaler.scale(wm_loss).backward()
-        self.grad_scaler.step(self.wm_optimizer)
+        # self.grad_scaler.scale(wm_loss).backward()
+        # self.grad_scaler.step(self.wm_optimizer)
+        wm_loss.backward()
+        self.wm_optimizer.step()
 
-        with autocast(enabled=True, device_type="cuda"), torch.no_grad():
+        with autocast(enabled=False, device_type="cuda"), torch.no_grad():
             rewards = (rewards_raw - rewards_raw.mean()) / (rewards_raw.std() + 1e-8)
             next_values = self.actor_critic(next_scene_encodings)[1]
             delta = rewards + 0.99 * next_values - old_values # GAE
             advantages = (delta - delta.mean()) / (delta.std() + 1e-8)
             returns = advantages + old_values
 
-        with autocast(enabled=True, device_type="cuda"):
+        with autocast(enabled=False, device_type="cuda"):
             new_dist, new_values = self.actor_critic(features)
             new_log_probs = new_dist.log_prob(actions)
             ratio = torch.exp(new_log_probs - old_log_probs)
@@ -356,11 +358,15 @@ class AdaptiveStrategy(DefaultStrategy):
 
         self.gnn_optimizer.zero_grad()
         self.ac_optimizer.zero_grad()
-        self.grad_scaler.scale(ac_loss).backward()
-        self.grad_scaler.step(self.gnn_optimizer)
-        self.grad_scaler.step(self.ac_optimizer)
+        # self.grad_scaler.scale(ac_loss).backward()
+        # self.grad_scaler.step(self.gnn_optimizer)
+        # self.grad_scaler.step(self.ac_optimizer)
+        ac_loss.backward()
+        self.gnn_optimizer.step()
+        self.ac_optimizer.step()
 
-        self.grad_scaler.update()
+
+        # self.grad_scaler.update()
 
         if self.writer:
             self.writer.add_scalar("agent/ac_loss", ac_loss.item(), state["step"])
@@ -384,7 +390,7 @@ class AdaptiveStrategy(DefaultStrategy):
         queue = state["reward_queue"]
         if not queue or (current_step - queue[0]["step"]) < self.reward_delay: return
 
-        with torch.no_grad(), autocast(enabled=True, device_type="cuda"):
+        with torch.no_grad(), autocast(enabled=False, device_type="cuda"):
             all_node_features = self._get_motion_aware_features(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device), current_step)
             if all_node_features is None or all_node_features.shape[0] == 0: return
             current_scene_encoding = all_node_features.mean(dim=0).detach()
@@ -403,7 +409,7 @@ class AdaptiveStrategy(DefaultStrategy):
             delta_l1 = initial_metrics["l1"] - current_avg_metrics["l1"]
             extrinsic_reward = self.reward_weight_psnr * delta_psnr + self.reward_weight_ssim * delta_ssim + self.reward_weight_l1 * delta_l1
 
-            with autocast(enabled=True, device_type="cuda"):
+            with autocast(enabled=False, device_type="cuda"):
                 predicted_next_encoding = self.world_model(exp["scene_encoding"])
                 intrinsic_reward = F.mse_loss(predicted_next_encoding, current_scene_encoding.detach())
 

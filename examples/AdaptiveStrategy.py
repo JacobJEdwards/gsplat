@@ -166,7 +166,6 @@ class AdaptiveStrategy(DefaultStrategy):
         camtoworlds = info["camtoworlds"]
         Ks = info["Ks"]  # [1, 3, 3]
         pixels = info["pixels"]
-        pixels = pixels.unsqueeze(0)
         height, width = pixels.shape[1:3]
 
         render_colors, _, _ = self.rasterizer_fn(

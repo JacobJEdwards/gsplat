@@ -170,8 +170,8 @@ class AdaptiveStrategy(DefaultStrategy):
         height, width = pixels.shape[1:3]
 
         render_colors, _, _ = self.rasterizer_fn(
-            camtoworlds=camtoworlds.unsqueeze(0),
-            Ks=Ks.unsqueeze(0),
+            camtoworlds=camtoworlds,
+            Ks=Ks,
             width=width,
             height=height,
             sh_degree=sh_degree_to_use,

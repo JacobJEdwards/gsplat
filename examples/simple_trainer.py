@@ -752,7 +752,7 @@ class Runner:
             )
             l1loss = l1_loss_unreduced.mean(dim=(1, 2, 3))  # [B,]
             l1loss = l1loss.mean()  # average over batch
-            l1_loss_map = l1_loss_unreduced.mean(dim=0)
+            l1_loss_map = l1_loss_unreduced.mean(dim=(0, 1)).squeeze()
 
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"

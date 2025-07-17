@@ -254,9 +254,9 @@ class AdaptiveStrategy(DefaultStrategy):
                                        "significance", "age", "gaussian_contribution", "ac_hidden_states"]
             state_to_modify = {k: v for k, v in state.items() if k in per_gaussian_state_keys}
 
-            remove(params=params, optimizers=optimizers, state=state_to_prune, mask=is_prune)
+            remove(params=params, optimizers=optimizers, state=state_to_modify, mask=is_prune)
 
-            state.update(state_to_prune)
+            state.update(state_to_modify)
 
         return n_prune
 
@@ -277,7 +277,7 @@ class AdaptiveStrategy(DefaultStrategy):
         original_indices = torch.where(candidate_mask)[0]
 
         with autocast(enabled=True, device_type="cuda"):
-            per_gaussian_features, _, _ = self._get_motion_aware_features(params, state, candidate_mask, state["step"])
+            per_gaussian_features = self._get_motion_aware_features(params, state, candidate_mask, state["step"])
             if per_gaussian_features is None: return 0, 0
 
             action_dist, values = self.actor_critic(per_gaussian_features)
@@ -386,7 +386,7 @@ class AdaptiveStrategy(DefaultStrategy):
         if not queue or (current_step - queue[0]["step"]) < self.reward_delay: return
 
         with torch.no_grad(), autocast(enabled=True, device_type="cuda"):
-            all_node_features, _, _ = self._get_motion_aware_features(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device), current_step)
+            all_node_features = self._get_motion_aware_features(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device), current_step)
             if all_node_features is None or all_node_features.shape[0] == 0: return
             current_scene_encoding = all_node_features.mean(dim=0).detach()
 
@@ -421,15 +421,15 @@ class AdaptiveStrategy(DefaultStrategy):
                 state["replay_buffer"].add(td)
 
     @torch.no_grad()
-    def _get_motion_aware_features(self, params: dict, state: dict, subset_mask: Tensor, step: int) -> tuple[Tensor, tuple, Tensor]:
+    def _get_motion_aware_features(self, params: dict, state: dict, subset_mask: Tensor, step: int) -> Tensor:
         if state.get("ac_hidden_states") is None or state["ac_hidden_states"].shape[0] != params["means"].shape[0]:
             state["ac_hidden_states"] = torch.zeros((params["means"].shape[0], self.num_temporal_steps, self.gnn_hidden_dim * 2), device=params["means"].device)
 
         original_indices = torch.where(subset_mask)[0]
-        if original_indices.numel() == 0: return None, None, None
+        if original_indices.numel() == 0: return None
 
-        raw_features, coords, valid_mask = self._get_raw_features(params, state, subset_mask, step)
-        if raw_features is None: return None, None, None
+        raw_features = self._get_raw_features(params, state, subset_mask, step)
+        if raw_features is None: return None
 
         subset_means = params["means"][subset_mask]
         edge_index = knn_graph(subset_means, k=10, loop=True)
@@ -450,13 +450,17 @@ class AdaptiveStrategy(DefaultStrategy):
         motion_context, updated_history = self.gnn_net(raw_features, edge_index, edge_attr, temporal_history)
         state['ac_hidden_states'][original_indices] = updated_history
 
-        return motion_context, coords, valid_mask
+        return motion_context
 
     @torch.no_grad()
-    def _get_raw_features(self, params: dict, state: dict, subset_mask: Tensor, step: int) -> tuple[Tensor, tuple, Tensor]:
+    def _get_raw_features(self, params: dict, state: dict, subset_mask: Tensor, step: int) -> Tensor:
         num_subset = subset_mask.sum().item()
         device = params["means"].device
-        features = torch.zeros(num_subset, self.gnn_input_dim, device=device)
+
+        means3d_subset = params["means"][subset_mask]
+
+        feature_dim = 25
+        features = torch.zeros(num_subset, feature_dim, device=device)
 
         opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
         features[:, 0] = opacities_subset
@@ -465,10 +469,26 @@ class AdaptiveStrategy(DefaultStrategy):
         features[:, 2] = scales.min(dim=-1).values / state["scene_scale"]
         features[:, 3] = scales.mean(dim=-1) / state["scene_scale"]
         features[:, 4] = torch.norm(params["sh0"][subset_mask], dim=(-1, -2))
-        features[:, 5] = state["grad2d"][subset_mask] / state["count"][subset_mask].clamp_min(1.0)
+
+        if self.knn_fn is not None and len(params["means"]) > 5:
+            dists, idxs = self.knn_fn(means3d_subset, K=5 + 1)
+            neighbor_idxs = idxs[:, 1:]
+
+            features[:, 9] = dists[:, 1:].mean(dim=-1) / state["scene_scale"]
+
+            neighbor_scales = torch.exp(params["scales"][neighbor_idxs]).max(dim=-1).values
+            neighbor_opacities = torch.sigmoid(params["opacities"][neighbor_idxs].squeeze(-1))
+            neighbor_sh0 = params["sh0"][neighbor_idxs].squeeze(-2)
+
+            sh0_subset = params["sh0"][subset_mask]
+
+            features[:, 10] = neighbor_scales.mean(dim=-1) / state["scene_scale"]
+            features[:, 11] = neighbor_opacities.mean(dim=-1)
+            features[:, 12] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
+
         features[:, 19] = step / self.refine_stop_iter
 
-        return torch.nan_to_num(features, 0.0), None, None
+        return torch.nan_to_num(features, 0.0)
 
     @torch.no_grad()
     def _calculate_avg_metrics(self, params: dict, step: int) -> dict:

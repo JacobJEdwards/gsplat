@@ -141,6 +141,7 @@ class AdaptiveStrategy(DefaultStrategy):
             far_plane=1e10,
             means=params["means"], scales=torch.exp(params["scales"]), quats=params["quats"],
             opacities=torch.sigmoid(params["opacities"]), colors=colors,
+            packed=True,
         )
         rendered_img_p = render_colors.permute(0, 3, 1, 2)
         gt_img_p = pixels.permute(0, 3, 1, 2)

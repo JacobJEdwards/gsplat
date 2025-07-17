@@ -110,6 +110,8 @@ class AdaptiveStrategy(DefaultStrategy):
             state["age"] = torch.zeros(params["means"].shape[0], dtype=torch.int32, device=params["means"].device)
 
         state["age"] += 1
+        state["ssim"] = info["ssim"]
+        state["l1_loss"] = info["l1_loss"]
 
         self._update_state(params, state, info, packed=packed)
 

@@ -1,54 +1,20 @@
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Tuple
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn, autocast, GradScaler
 from torch.distributions import Categorical
 
-from torch_geometric.nn import knn_graph, TransformerConv
-
 from ops import duplicate, split
-from utils import knn_with_ids, create_view_proj_matrix, scatter_mean
+from utils import knn_with_ids
 from gsplat.strategy.default import DefaultStrategy
 from gsplat.strategy.ops import remove, reset_opa
 from tensordict import TensorDict
 from torchrl.data import RandomSampler, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyMemmapStorage
 
-class TemporalGaussianGNN(nn.Module):
-    """
-    A Graph Neural Network that processes Gaussian features both spatially and temporally.
-    It uses a TransformerConv for spatial aggregation and a GRU with attention for temporal context.
-    """
-    def __init__(self, input_dim: int, hidden_dim: int, edge_dim: int, num_temporal_steps: int = 8):
-        super().__init__()
-        self.temporal_steps = num_temporal_steps
-        self.spatial_gnn = TransformerConv(input_dim, hidden_dim, heads=2, edge_dim=edge_dim)
-        self.temporal_gru = nn.GRU(hidden_dim * 2, hidden_dim * 2, batch_first=True)
-        self.temporal_attention = nn.MultiheadAttention(hidden_dim * 2, num_heads=4, batch_first=True)
-        self.selu = nn.SELU()
-        self.norm1 = nn.LayerNorm(hidden_dim * 2)
-        self.norm2 = nn.LayerNorm(hidden_dim * 2)
-
-    def forward(self, gaussian_features: Tensor, edge_index: Tensor, edge_attr: Tensor, temporal_history: Tensor) -> tuple[Tensor, Tensor]:
-        # Spatial feature extraction
-        spatial_features = self.selu(self.spatial_gnn(gaussian_features, edge_index, edge_attr))
-
-        # Get context from historical features
-        temporal_features, _ = self.temporal_gru(temporal_history)
-
-        # Attend to temporal features using current spatial features as query
-        motion_context, _ = self.temporal_attention(
-            spatial_features.unsqueeze(1), temporal_features, temporal_features
-        )
-        motion_context = self.norm1(motion_context.squeeze(1) + spatial_features)
-
-        # Update the history by rolling the window and adding the new context
-        updated_history = torch.cat([temporal_history[:, 1:, :], motion_context.unsqueeze(1)], dim=1)
-
-        return self.norm2(motion_context), updated_history
 
 class PerNodeActorCritic(nn.Module):
     """
@@ -90,7 +56,7 @@ class WorldModel(nn.Module):
 @dataclass
 class AdaptiveStrategy(DefaultStrategy):
     """
-    An adaptive strategy using a Temporal GNN for feature extraction and a World Model
+    An adaptive strategy using a simple Actor-Critic and a World Model
     for intrinsic rewards, trained on image quality metrics from a fixed validation set.
     """
     # --- Control Frequencies ---
@@ -98,12 +64,9 @@ class AdaptiveStrategy(DefaultStrategy):
     learn_every: int = 100
 
     # --- Agent and Model Hyperparameters ---
-    num_temporal_steps: int = 8
-    gnn_hidden_dim: int = 32
     ac_hidden_dim: int = 64
     wm_hidden_dim: int = 128
-    gnn_input_dim: int = 10
-    gnn_edge_dim: int = 4
+    ac_feature_dim: int = 10
     ac_action_dim: int = 3 # 0:None, 1:Split, 2:Duplicate
 
     # --- Training Hyperparameters ---
@@ -130,12 +93,10 @@ class AdaptiveStrategy(DefaultStrategy):
     # --- State and Component Fields ---
     reward_validation_set: list[dict] = field(default_factory=list, repr=False)
     rasterizer_fn: Any = field(default=None, repr=False)
-    gnn_net: Any = field(default=None, repr=False)
     actor_critic: Any = field(default=None, repr=False)
     world_model: Any = field(default=None, repr=False)
     ac_optimizer: Any = field(default=None, repr=False)
     wm_optimizer: Any = field(default=None, repr=False)
-    gnn_optimizer: Any = field(default=None, repr=False)
     psnr_metric: Any = field(default=None, repr=False)
     ssim_metric: Any = field(default=None, repr=False)
     grad_scaler: Any = field(default=None, repr=False)
@@ -161,7 +122,6 @@ class AdaptiveStrategy(DefaultStrategy):
         state.update({
             "age": None,
             "significance": None,
-            "ac_hidden_states": None,
             "replay_buffer": TensorDictReplayBuffer(
                 storage=LazyMemmapStorage(max_size=150_000), sampler=RandomSampler(), batch_size=2048,
             ),
@@ -170,22 +130,18 @@ class AdaptiveStrategy(DefaultStrategy):
         return state
 
     def _initialize_learning_components(self, device: torch.device) -> None:
-        ac_feature_dim = self.gnn_hidden_dim * 2
-
-        self.gnn_net = TemporalGaussianGNN(self.gnn_input_dim, self.gnn_hidden_dim, self.gnn_edge_dim, self.num_temporal_steps).to(device)
-        self.actor_critic = PerNodeActorCritic(ac_feature_dim, self.ac_hidden_dim, self.ac_action_dim).to(device)
-        self.world_model = WorldModel(ac_feature_dim, self.wm_hidden_dim).to(device)
+        self.actor_critic = PerNodeActorCritic(self.ac_feature_dim, self.ac_hidden_dim, self.ac_action_dim).to(device)
+        self.world_model = WorldModel(self.ac_feature_dim, self.wm_hidden_dim).to(device)
 
         self.grad_scaler = GradScaler()
         self.knn_fn = knn_with_ids
 
         ac_params = list(self.actor_critic.parameters())
         self.ac_optimizer = torch.optim.AdamW(ac_params, lr=self.ac_learning_rate)
-        self.gnn_optimizer = torch.optim.AdamW(self.gnn_net.parameters(), lr=self.ac_learning_rate)
         self.wm_optimizer = torch.optim.AdamW(self.world_model.parameters(), lr=self.wm_learning_rate)
 
         if self.verbose:
-            print("🧠 Initialized Densification Agent (Temporal GNN + AC + World Model).")
+            print("🧠 Initialized Densification Agent (AC + World Model).")
 
     def step_post_backward(
             self,
@@ -250,7 +206,7 @@ class AdaptiveStrategy(DefaultStrategy):
         n_prune = is_prune.sum().item()
         if n_prune > 0:
             per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity",
-                                       "significance", "age", "gaussian_contribution", "ac_hidden_states"]
+                                       "significance", "age", "gaussian_contribution"]
             state_to_modify = {k: v for k, v in state.items() if k in per_gaussian_state_keys}
 
             remove(params=params, optimizers=optimizers, state=state_to_modify, mask=is_prune)
@@ -276,9 +232,7 @@ class AdaptiveStrategy(DefaultStrategy):
         original_indices = torch.where(candidate_mask)[0]
 
         with autocast(enabled=True, device_type="cuda"):
-            per_gaussian_features = self._get_motion_aware_features(params, state, candidate_mask, state["step"])
-            if per_gaussian_features is None: return 0, 0
-
+            per_gaussian_features = self._get_raw_features(params, state, candidate_mask, state["step"])
             action_dist, values = self.actor_critic(per_gaussian_features)
             actions = action_dist.sample()
 
@@ -286,7 +240,7 @@ class AdaptiveStrategy(DefaultStrategy):
         self._queue_per_node_experience(state, per_gaussian_features, actions, action_dist.log_prob(actions), values, initial_avg_metrics)
 
         per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity",
-                                   "significance", "age", "gaussian_contribution", "ac_hidden_states"]
+                                   "significance", "age", "gaussian_contribution"]
         state_to_modify = {k: v for k, v in state.items() if k in per_gaussian_state_keys}
 
         split_mask_subset = (actions == 1)
@@ -314,7 +268,6 @@ class AdaptiveStrategy(DefaultStrategy):
         if len(state["replay_buffer"]) < state["replay_buffer"].batch_size: return
         device = next(self.actor_critic.parameters()).device
 
-        self.gnn_net.train()
         self.actor_critic.train()
         self.world_model.train()
 
@@ -356,13 +309,10 @@ class AdaptiveStrategy(DefaultStrategy):
             entropy_loss = -new_dist.entropy().mean()
             ac_loss = actor_loss + self.critic_loss_weight * critic_loss + self.entropy_loss_weight * entropy_loss
 
-        self.gnn_optimizer.zero_grad()
         self.ac_optimizer.zero_grad()
         # self.grad_scaler.scale(ac_loss).backward()
-        # self.grad_scaler.step(self.gnn_optimizer)
         # self.grad_scaler.step(self.ac_optimizer)
         ac_loss.backward()
-        self.gnn_optimizer.step()
         self.ac_optimizer.step()
 
 
@@ -391,7 +341,7 @@ class AdaptiveStrategy(DefaultStrategy):
         if not queue or (current_step - queue[0]["step"]) < self.reward_delay: return
 
         with torch.no_grad(), autocast(enabled=False, device_type="cuda"):
-            all_node_features = self._get_motion_aware_features(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device), current_step)
+            all_node_features = self._get_raw_features(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device), current_step)
             if all_node_features is None or all_node_features.shape[0] == 0: return
             current_scene_encoding = all_node_features.mean(dim=0).detach()
 
@@ -426,45 +376,13 @@ class AdaptiveStrategy(DefaultStrategy):
                 state["replay_buffer"].add(td)
 
     @torch.no_grad()
-    def _get_motion_aware_features(self, params: dict, state: dict, subset_mask: Tensor, step: int) -> Tensor:
-        if state.get("ac_hidden_states") is None or state["ac_hidden_states"].shape[0] != params["means"].shape[0]:
-            state["ac_hidden_states"] = torch.zeros((params["means"].shape[0], self.num_temporal_steps, self.gnn_hidden_dim * 2), device=params["means"].device)
-
-        original_indices = torch.where(subset_mask)[0]
-        if original_indices.numel() == 0: return None
-
-        raw_features = self._get_raw_features(params, state, subset_mask, step)
-        if raw_features is None: return None
-
-        subset_means = params["means"][subset_mask]
-        edge_index = knn_graph(subset_means, k=10, loop=True)
-
-        row, col = edge_index
-        rel_dist = torch.norm(subset_means[row] - subset_means[col], dim=-1) / state["scene_scale"]
-        scales_i, scales_j = torch.exp(params["scales"][subset_mask][row]).mean(dim=-1), torch.exp(params["scales"][subset_mask][col]).mean(dim=-1)
-        scale_diff = torch.abs(scales_i - scales_j)
-        opacities_i, opacities_j = torch.sigmoid(params["opacities"][subset_mask][row].flatten()), torch.sigmoid(params["opacities"][subset_mask][col].flatten())
-        opacity_diff = torch.abs(opacities_i - opacities_j)
-        sh0_i, sh0_j = params["sh0"][subset_mask][row].squeeze(-2), params["sh0"][subset_mask][col].squeeze(-2)
-        color_diff = torch.norm(sh0_i - sh0_j, dim=-1)
-
-        edge_attr = torch.stack([rel_dist, scale_diff, opacity_diff, color_diff], dim=-1)
-        temporal_history = state['ac_hidden_states'][original_indices]
-
-        self.gnn_net.eval()
-        motion_context, updated_history = self.gnn_net(raw_features, edge_index, edge_attr, temporal_history)
-        state['ac_hidden_states'][original_indices] = updated_history
-
-        return motion_context
-
-    @torch.no_grad()
     def _get_raw_features(self, params: dict, state: dict, subset_mask: Tensor, step: int) -> Tensor:
         num_subset = subset_mask.sum().item()
         device = params["means"].device
 
         means3d_subset = params["means"][subset_mask]
 
-        features = torch.zeros(num_subset, self.gnn_input_dim, device=device)
+        features = torch.zeros(num_subset, self.ac_feature_dim, device=device)
 
         opacities_subset = torch.sigmoid(params["opacities"][subset_mask].flatten())
         features[:, 0] = opacities_subset

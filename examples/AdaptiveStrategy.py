@@ -110,10 +110,6 @@ class AdaptiveStrategy(DefaultStrategy):
     writer: Any = field(default=None, repr=False)
 
     def setup_validation_set(self, validation_dataset: torch.utils.data.Dataset, device: torch.device) -> None:
-        """
-        IMPORTANT: This method must be called by the trainer once at initialization.
-        It selects a fixed subset of the validation data to use for stable reward calculation.
-        """
         if not validation_dataset: return
 
         indices = torch.randperm(len(validation_dataset))[:self.num_reward_views].tolist()
@@ -129,41 +125,83 @@ class AdaptiveStrategy(DefaultStrategy):
         if self.verbose:
             print(f"Created a fixed reward validation set with {len(self.reward_validation_set)} views.")
 
+    def _calculate_metrics(self, params: dict, camtoworlds: Tensor, Ks: Tensor, pixels: Tensor, step: int) -> dict:
+        height, width = pixels.shape[1:3]
+        sh_degree_to_use = min(step // 1000, 3)
+        colors = torch.cat([params["sh0"], params["shN"]], 1)  # [N, K, 3]
+        render_colors, _, _ = self.rasterize_fn(
+            camtoworlds=camtoworlds.unsqueeze(0),
+            Ks=Ks.unsqueeze(0),
+            width=width,
+            height=height,
+            sh_degree=sh_degree_to_use,
+            near_plane=0.01,
+            far_plane=1e10,
+            means=params["means"], scales=torch.exp(params["scales"]), quats=params["quats"],
+            opacities=torch.sigmoid(params["opacities"]), colors=colors,
+        )
+        rendered_img_p = render_colors.permute(0, 3, 1, 2)
+        gt_img_p = pixels.permute(0, 3, 1, 2)
+
+        lpips_score = self.lpips_metric(rendered_img_p, gt_img_p)
+        l1_loss_map = F.l1_loss(rendered_img_p, gt_img_p, reduction='none').mean(dim=0)
+        detail_error_map = F.mse_loss(rendered_img_p, gt_img_p, reduction='none').mean(dim=0)
+        detail_error_map = detail_error_map.clamp(0.0, 1.0)
+        detail_error_map = detail_error_map.mean(dim=0, keepdim=True)
+
+        metrics = {
+            "lpips_score": lpips_score.item(),
+            "l1_loss_map": l1_loss_map,
+            "detail_error_map": detail_error_map,
+        }
+
+        return metrics
+
+
+
     @torch.no_grad()
-    def _calculate_avg_lpips(self, params: dict, step: int) -> Tensor:
-        total_lpips = 0.0
+    def _calculate_avg_metrics(self, params: dict, step: int) -> dict:
         sh_degree_to_use = min(step // 1000, 3)
 
-        for data in self.reward_validation_set:
-            camtoworlds = data["camtoworld"]  # [1, 4, 4]
-            Ks = data["K"]  # [1, 3, 3]
-            pixels = data["pixels"]
-            pixels = pixels.unsqueeze(0)
-            # image_id = data["image_id"]
+        camtoworlds = torch.stack([data["camtoworld"] for data in self.reward_validation_set], dim=0)
+        Ks = torch.stack([data["K"] for data in self.reward_validation_set], dim=0)
+        gt_pixels = torch.stack([data["pixels"] for data in self.reward_validation_set], dim=0)
 
-            height, width = pixels.shape[1:3]
+        height, width = gt_pixels.shape[1:3]
+        colors = torch.cat([params["sh0"], params["shN"]], 1)
 
-            colors = torch.cat([params["sh0"], params["shN"]], 1)  # [N, K, 3]
+        render_colors, _, _ = self.rasterize_fn(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            sh_degree=sh_degree_to_use,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode="RGB",
+            means=params["means"],
+            scales=torch.exp(params["scales"]),
+            quats=params["quats"],
+            opacities=torch.sigmoid(params["opacities"]),
+            colors=colors,
+        )
 
-            render_colors, _, _ = self.rasterize_fn(
-                camtoworlds=camtoworlds.unsqueeze(0),
-                Ks=Ks.unsqueeze(0),
-                width=width,
-                height=height,
-                sh_degree=sh_degree_to_use,
-                near_plane=0.01,
-                far_plane=1e10,
-                # image_ids=image_ids,
-                render_mode="RGB",
-                means=params["means"], scales=torch.exp(params["scales"]), quats=params["quats"],
-                opacities=torch.sigmoid(params["opacities"]), colors=colors,
-                # image_ids=image_id,
-            )
-            rendered_img_p = render_colors.permute(0, 3, 1, 2)
-            gt_img_p = pixels.permute(0, 3, 1, 2)
-            total_lpips += self.lpips_metric(rendered_img_p, gt_img_p)
+        rendered_img_p = render_colors.permute(0, 3, 1, 2)
+        gt_img_p = gt_pixels.permute(0, 3, 1, 2)
 
-        return total_lpips / len(self.reward_validation_set)
+        total_lpips = self.lpips_metric(rendered_img_p, gt_img_p)
+        l1_loss_map = F.l1_loss(rendered_img_p, gt_img_p, reduction='none').mean(dim=0)
+        detail_error_map = F.mse_loss(rendered_img_p, gt_img_p, reduction='none').mean(dim=0)
+
+        detail_error_map = detail_error_map.clamp(0.0, 1.0)
+        detail_error_map = detail_error_map.mean(dim=0, keepdim=True)
+
+        return {
+            "lpips_score": total_lpips.mean(),
+            "l1_loss_map": l1_loss_map.mean(),
+            "detail_error_map": detail_error_map.mean(),
+        }
+
 
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
@@ -306,7 +344,7 @@ class AdaptiveStrategy(DefaultStrategy):
             _, values = self.actor_critic(per_gaussian_features)
 
 
-        initial_avg_lpips = self._calculate_avg_lpips(params, step=state["step"])
+        initial_avg_lpips = self._calculate_avg_metrics(params, step=state["step"])["lpips_score"]
         self._queue_per_node_experience(state, info, per_gaussian_features, actions, action_dist.log_prob(actions),
                                         values, uncertainty, initial_avg_lpips)
 

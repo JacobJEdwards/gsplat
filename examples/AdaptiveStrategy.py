@@ -8,7 +8,6 @@ from torch import Tensor, nn, autocast, GradScaler
 from torch.distributions import Categorical
 
 from torch_geometric.nn import knn_graph, TransformerConv
-import piq
 
 from ops import duplicate, split
 from utils import knn_with_ids, create_view_proj_matrix, scatter_mean

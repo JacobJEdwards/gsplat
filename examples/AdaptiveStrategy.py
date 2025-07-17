@@ -354,9 +354,8 @@ class AdaptiveStrategy(DefaultStrategy):
             current_scene_encoding = all_node_features.mean(dim=0).detach()
 
         current_avg_metrics = self._calculate_avg_metrics(params, step=current_step)
-        if self.writer:
-            for name, val in current_avg_metrics.items():
-                self.writer.add_scalar(f"metrics/avg_{name}", val, current_step)
+        for name, val in current_avg_metrics.items():
+            self.writer.add_scalar(f"metrics/avg_{name}", val, current_step)
 
         while queue and (current_step - queue[0]["step"]) >= self.reward_delay:
             exp = queue.popleft()

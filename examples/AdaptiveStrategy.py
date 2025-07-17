@@ -216,7 +216,8 @@ class AdaptiveStrategy(DefaultStrategy):
             actions = action_dist.sample()
             log_probs = action_dist.log_prob(actions)
 
-            xy_view_subset = info["xy_view"][original_indices] # Shape: [num_candidates, 2]
+            means3d_subset = params["means"][original_indices]
+            xy_view_subset = self._project_to_view(means3d_subset, info["camtoworlds"][0], info["Ks"][0])
             h, w = info["l1_loss_map"].shape
             grid = xy_view_subset.clone()
             grid[:, 0] = (grid[:, 0] / (w - 1)) * 2 - 1
@@ -283,6 +284,26 @@ class AdaptiveStrategy(DefaultStrategy):
                 self.writer.add_scalar("reward/immediate_reward_mean", reward.mean().item(), state["step"])
 
         return n_split, n_duplicate
+
+    @torch.no_grad()
+    def _project_to_view(self, means3d: Tensor, camtoworld: Tensor, K: Tensor) -> Tensor:
+        """Projects 3D means to 2D view space coordinates."""
+        view_matrix = torch.linalg.inv(camtoworld) # World to camera
+
+        # Add homogeneous coordinate
+        means3d_h = F.pad(means3d, (0, 1), mode='constant', value=1.0)
+
+        # Transform to camera space
+        p_cam_h = means3d_h @ view_matrix.T
+        p_cam = p_cam_h[:, :3] # [N, 3]
+
+        # Project to image plane
+        p_img_h = p_cam @ K.T
+
+        # Normalize to get pixel coordinates
+        xy_view = p_img_h[:, :2] / p_img_h[:, 2:3].clamp_min(1e-8)
+
+        return xy_view
 
     def _train_models(self, state: dict):
         if len(state["replay_buffer"]) < state["replay_buffer"].batch_size: return

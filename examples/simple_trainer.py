@@ -762,15 +762,8 @@ class Runner:
             #     ssim_error_map = ssim_error_map.squeeze(1)
 
             # loss
-            l1_loss_unreduced = torch.abs(colors - pixels)
-            l1_loss_map = l1_loss_unreduced.mean(dim=-1).detach().squeeze() # [B, H, W, 1]
 
-            with torch.no_grad():
-                grad_render = sobel_filter(colors, device)
-                grad_gt = sobel_filter(pixels, device)
-                detail_loss_map = torch.abs(grad_render - grad_gt).detach()
-
-            l1loss = l1_loss_unreduced.mean()
+            l1loss = F.l1_loss(colors, pixels)  # [1, H, W, 3]
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
@@ -949,8 +942,9 @@ class Runner:
                 info["pixels"] = pixels
                 info["colors"] = colors
                 info["image_ids"] = image_ids
-                info["l1_loss_map"] = l1_loss_map
-                info["detail_error_map"] = detail_loss_map
+                info["ssim"] = ssimloss.detach()
+                info["l1_loss"] = l1loss.detach()
+
                 # info["ssim_error_map"] = ssim_error_map.detach()
 
                 self.cfg.strategy.step_post_backward(

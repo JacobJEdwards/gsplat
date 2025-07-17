@@ -72,7 +72,6 @@ class AdaptiveStrategy(DefaultStrategy):
             "age": None,
             "significance": None,
             "replay_buffer": TensorDictReplayBuffer(
-                # A smaller buffer is fine now as we learn from more direct signals
                 storage=LazyMemmapStorage(max_size=50_000),
                 sampler=RandomSampler(),
                 batch_size=1024,
@@ -156,32 +155,39 @@ class AdaptiveStrategy(DefaultStrategy):
             state.update(state_to_modify)
         return n_prune
 
-    def _calculate_render_loss(self, params: dict, info: dict) -> Tensor:
-        """Helper to calculate the combined rendering loss for reward."""
-        # Unpack camera info needed for rendering
-        view_matrix = info["view_matrix"]
-        proj_matrix = info["proj_matrix"]
-        camera_params = (info["camera_info"]["width"], info["camera_info"]["height"], info["camera_info"]["focal_x"], info["camera_info"]["focal_y"])
-        gt_img = info["pixels"]
+    def _calculate_render_loss(self, params: dict, info: dict, step: int) -> Tensor:
+        sh_degree_to_use = min(step // 1000, 3)
+        colors = torch.cat([params["sh0"], params["shN"]], 1)
+        opacities = torch.sigmoid(params["opacities"])
+        scales = torch.exp(params["scales"])
 
-        # Render the current state
-        rendered_output = self.rasterizer_fn(
-            params=params,
-            view_matrix=view_matrix,
-            proj_matrix=proj_matrix,
-            camera_params=camera_params,
+        camtoworlds = info["camtoworld"]
+        Ks = info["K"]  # [1, 3, 3]
+        pixels = info["pixels"]
+        pixels = pixels.unsqueeze(0)
+        height, width = pixels.shape[1:3]
+
+        render_colors, _, _ = self.rasterizer_fn(
+            camtoworlds=camtoworlds.unsqueeze(0),
+            Ks=Ks.unsqueeze(0),
+            width=width,
+            height=height,
+            sh_degree=sh_degree_to_use,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode="RGB",
+            means=params["means"], scales=scales, quats=params["quats"],
+            opacities=opacities, colors=colors,
         )
-        rendered_img = rendered_output["colors"]
+        rendered_img_p = render_colors.permute(0, 3, 1, 2)
+        gt_img_p = pixels.permute(0, 3, 1, 2)
+        ssim_loss = 1.0 - self.ssim_metric(rendered_img_p, gt_img_p, padding="valid")
+        l1_loss = F.l1_loss(render_colors, pixels)
 
-        # Calculate losses
-        rendered_img_p = rendered_img.permute(0, 3, 1, 2)
-        gt_img_p = gt_img.permute(0, 3, 1, 2)
-        ssim_loss = 1.0 - self.ssim_metric(rendered_img_p, gt_img_p).mean()
-        l1_loss = F.l1_loss(rendered_img, gt_img)
-
-        return self.reward_weight_ssim * ssim_loss + self.reward_weight_l1 * l1_loss
+        return self.reward_weight_ssim * (1.0 - ssim_loss) + self.reward_weight_l1 * l1_loss
 
     def grow_gs(self, params: dict, optimizers: dict, state: dict, info: dict) -> tuple[int, int]:
+        step = state.get("step", 0)
         device = params["means"].device
         initial_gauss_count = params["means"].shape[0]
 
@@ -200,20 +206,19 @@ class AdaptiveStrategy(DefaultStrategy):
 
             original_indices = torch.where(candidate_mask)[0]
 
-            # 1. Get features for candidate nodes
             with autocast(enabled=False, device_type="cuda"):
                 per_gaussian_features = self._get_raw_features(params, state, candidate_mask, state["step"])
 
-            # 2. Get actions from the agent
             action_dist, values = self.actor_critic(per_gaussian_features)
             actions = action_dist.sample()
             log_probs = action_dist.log_prob(actions)
 
-        # 3. Calculate loss *before* densification for reward calculation
-        initial_loss = self._calculate_render_loss(params, info)
+        # initial_loss = self._calculate_render_loss(params, info, step)
+        initial_ssim = state.get("ssim")
+        l1_loss = state.get("l1_loss")
 
-        # 4. Apply actions (split/duplicate)
-        # This part requires gradients for the optimizer state update
+        initial_loss = self.reward_weight_ssim * (1.0 - initial_ssim) + self.reward_weight_l1 * l1_loss
+
         per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity", "significance", "age", "gaussian_contribution"]
         state_to_modify = {k: v for k, v in state.items() if k in per_gaussian_state_keys}
 
@@ -232,14 +237,12 @@ class AdaptiveStrategy(DefaultStrategy):
             duplicate(params, optimizers, state_to_modify, global_duplicate_mask)
 
         if n_split > 0 or n_duplicate > 0:
-            num_new = n_split + n_duplicate # A split adds 1, a duplicate adds 1
+            num_new = n_split + n_duplicate
             state_to_modify["age"][-num_new:] = 0
         state.update(state_to_modify)
 
-        # 5. Calculate loss *after* densification
-        final_loss = self._calculate_render_loss(params, info)
+        final_loss = self._calculate_render_loss(params, info, step)
 
-        # 6. Calculate reward and store experience
         with torch.no_grad():
             loss_improvement_reward = initial_loss.detach() - final_loss.detach()
             gauss_count_penalty = self.gauss_count_penalty_factor * (actions > 0).float() # Penalize non-None actions

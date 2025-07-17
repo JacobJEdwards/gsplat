@@ -1,10 +1,10 @@
-from collections import deque
+from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn, autocast, GradScaler
+from torch import Tensor, nn, autocast
 from torch.distributions import Categorical
 
 from ops import duplicate, split
@@ -78,7 +78,6 @@ class AdaptiveStrategy(DefaultStrategy):
     wm_optimizer: Any = field(default=None, repr=False)
     psnr_metric: Any = field(default=None, repr=False)
     ssim_metric: Any = field(default=None, repr=False)
-    grad_scaler: Any = field(default=None, repr=False)
     knn_fn: Any = field(default=None, repr=False)
     writer: Any = field(default=None, repr=False)
 
@@ -90,14 +89,13 @@ class AdaptiveStrategy(DefaultStrategy):
             "replay_buffer": TensorDictReplayBuffer(
                 storage=LazyMemmapStorage(max_size=150_000), sampler=RandomSampler(), batch_size=2048,
             ),
-            "reward_queue": deque(maxlen=self.max_densification_subset * 5),
+            "reward_queue": defaultdict(deque),
         })
         return state
 
     def _initialize_learning_components(self, device: torch.device) -> None:
         self.actor_critic = PerNodeActorCritic(self.ac_feature_dim, self.ac_hidden_dim, self.ac_action_dim).to(device)
         self.world_model = WorldModel(self.ac_feature_dim, self.wm_hidden_dim).to(device)
-        self.grad_scaler = GradScaler()
         self.knn_fn = knn_with_ids
         ac_params = list(self.actor_critic.parameters())
         self.ac_optimizer = torch.optim.AdamW(ac_params, lr=self.ac_learning_rate)
@@ -125,7 +123,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         state["age"] += 1
 
-        self._process_rewards(params, state, step)
+        self._process_completed_rewards(params, state, step, info)
         self._update_state(params, state, info, packed=packed)
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
@@ -185,19 +183,20 @@ class AdaptiveStrategy(DefaultStrategy):
         if candidate_mask.sum() == 0: return 0, 0
         original_indices = torch.where(candidate_mask)[0]
 
-        view_data = {
-            "camtoworld": info["camtoworlds"][0],
-            "K": info["Ks"][0],
-            "pixels": info["pixels"][0],
-        }
-        initial_metrics = self._calculate_single_view_metrics(params, state["step"], **view_data)
+        rendered_img_p = info["colors"].permute(0, 3, 1, 2)
+        gt_img_p = info["pixels"].permute(0, 3, 1, 2)
+        ssim_val = self.ssim_metric(rendered_img_p, gt_img_p).mean().item()
+        l1_val = F.l1_loss(rendered_img_p, gt_img_p).item()
+        initial_metrics = {"ssim": ssim_val, "l1": l1_val}
+        image_id = info["image_ids"][0].item()
 
-        with autocast(enabled=True, device_type="cuda"):
+
+        with autocast(enabled=False, device_type="cuda"):
             per_gaussian_features = self._get_raw_features(params, state, candidate_mask, state["step"])
             action_dist, values = self.actor_critic(per_gaussian_features)
             actions = action_dist.sample()
 
-        self._queue_per_node_experience(state, per_gaussian_features, actions, action_dist.log_prob(actions), values, initial_metrics, view_data)
+        self._queue_per_node_experience(state, per_gaussian_features, actions, action_dist.log_prob(actions), values, initial_metrics, image_id)
 
         per_gaussian_state_keys = ["grad2d", "count", "radii", "stagnation_count", "prev_grad2d", "prev_opacity",
                                    "significance", "age", "gaussian_contribution"]
@@ -269,12 +268,13 @@ class AdaptiveStrategy(DefaultStrategy):
         ac_loss.backward()
         self.ac_optimizer.step()
 
-        self.writer.add_scalar("agent/ac_loss", ac_loss.item(), state["step"])
-        self.writer.add_scalar("agent/wm_loss", wm_loss.item(), state["step"])
-        self.writer.add_scalar("agent/mean_reward", rewards_raw.mean().item(), state["step"])
+        if self.writer:
+            self.writer.add_scalar("agent/ac_loss", ac_loss.item(), state["step"])
+            self.writer.add_scalar("agent/wm_loss", wm_loss.item(), state["step"])
+            self.writer.add_scalar("agent/mean_reward", rewards_raw.mean().item(), state["step"])
 
     @torch.no_grad()
-    def _queue_per_node_experience(self, state: dict, features: Tensor, actions: Tensor, log_probs: Tensor, values: Tensor, initial_metrics: dict, view_data: dict):
+    def _queue_per_node_experience(self, state: dict, features: Tensor, actions: Tensor, log_probs: Tensor, values: Tensor, initial_metrics: dict, image_id: int):
         scene_encoding = features.mean(dim=0).detach()
         for i in range(features.shape[0]):
             experience = {
@@ -285,25 +285,38 @@ class AdaptiveStrategy(DefaultStrategy):
                 "value": values[i].detach(),
                 "scene_encoding": scene_encoding,
                 "initial_metrics": initial_metrics,
-                "view_data": view_data,
                 "initial_gauss_count": state["age"].shape[0],
             }
-            state["reward_queue"].append(experience)
+            state["reward_queue"][image_id].append(experience)
 
-    def _process_rewards(self, params: dict, state: dict, current_step: int):
-        queue = state["reward_queue"]
-        if not queue or (current_step - queue[0]["step"]) < self.reward_delay: return
+    def _process_completed_rewards(self, params: dict, state: dict, current_step: int, info: dict[str, Any]):
+        image_id = info["image_ids"][0].item()
+        pending_queue = state["reward_queue"].get(image_id)
+
+        if not pending_queue:
+            return
+
+        rendered_img_p = info["colors"].permute(0, 3, 1, 2)
+        gt_img_p = info["pixels"].permute(0, 3, 1, 2)
+        with torch.no_grad():
+            current_ssim = self.ssim_metric(rendered_img_p, gt_img_p).mean().item()
+            current_l1 = F.l1_loss(rendered_img_p, gt_img_p).item()
+        current_metrics = {"ssim": current_ssim, "l1": current_l1}
 
         with torch.no_grad(), autocast(enabled=False, device_type="cuda"):
             all_node_features = self._get_raw_features(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device), current_step)
             if all_node_features is None or all_node_features.shape[0] == 0: return
             current_scene_encoding = all_node_features.mean(dim=0).detach()
 
-        while queue and (current_step - queue[0]["step"]) >= self.reward_delay:
-            exp = queue.popleft()
+        still_pending = deque()
+        while pending_queue:
+            exp = pending_queue.popleft()
+
+            if (current_step - exp["step"]) < self.reward_delay:
+                still_pending.append(exp)
+                continue
 
             initial_metrics = exp["initial_metrics"]
-            current_metrics = self._calculate_single_view_metrics(params, current_step, **exp["view_data"])
 
             delta_ssim = current_metrics["ssim"] - initial_metrics["ssim"]
             delta_l1 = initial_metrics["l1"] - current_metrics["l1"]
@@ -324,9 +337,13 @@ class AdaptiveStrategy(DefaultStrategy):
                 }, batch_size=[])
                 state["replay_buffer"].add(td)
 
-            self.writer.add_scalar("reward/extrinsic", extrinsic_reward, current_step)
-            self.writer.add_scalar("reward/intrinsic", intrinsic_reward.item(), current_step)
-            self.writer.add_scalar("reward/total", reward.item(), current_step)
+            if self.writer:
+                self.writer.add_scalar("reward/extrinsic", extrinsic_reward, current_step)
+                self.writer.add_scalar("reward/intrinsic", intrinsic_reward.item(), current_step)
+                self.writer.add_scalar("reward/total", reward.item(), current_step)
+
+        if still_pending:
+            state["reward_queue"][image_id] = still_pending
 
 
     @torch.no_grad()
@@ -355,37 +372,3 @@ class AdaptiveStrategy(DefaultStrategy):
             features[:, 8] = torch.norm(neighbor_sh0 - sh0_subset, dim=-1).mean(dim=-1)
         features[:, 9] = step / self.refine_stop_iter
         return torch.nan_to_num(features, 0.0)
-
-    @torch.no_grad()
-    def _calculate_single_view_metrics(self, params: dict, step: int, camtoworld: Tensor, K: Tensor, pixels: Tensor) -> dict:
-        sh_degree_to_use = min(step // 1000, 3)
-        colors = torch.cat([params["sh0"], params["shN"]], 1)
-        opacities = torch.sigmoid(params["opacities"])
-        scales = torch.exp(params["scales"])
-
-        height, width = pixels.shape[:2]
-
-        render_colors, _, _ = self.rasterizer_fn(
-            camtoworlds=camtoworld.unsqueeze(0),
-            Ks=K.unsqueeze(0),
-            width=width,
-            height=height,
-            sh_degree=sh_degree_to_use,
-            near_plane=0.01,
-            far_plane=1e10,
-            render_mode="RGB",
-            means=params["means"],
-            scales=scales,
-            quats=params["quats"],
-            opacities=opacities,
-            colors=colors,
-        )
-
-        rendered_img_p = render_colors.permute(0, 3, 1, 2)
-        gt_img_p = pixels.unsqueeze(0).permute(0, 3, 1, 2)
-
-        psnr = self.psnr_metric(rendered_img_p, gt_img_p).mean().item()
-        ssim = self.ssim_metric(rendered_img_p, gt_img_p).mean().item()
-        l1 = F.l1_loss(rendered_img_p, gt_img_p).item()
-
-        return {"psnr": psnr, "ssim": ssim, "l1": l1}

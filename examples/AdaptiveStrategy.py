@@ -145,8 +145,8 @@ class AdaptiveStrategy(DefaultStrategy):
             colors = torch.cat([params["sh0"], params["shN"]], 1)  # [N, K, 3]
 
             render_colors, _, _ = self.rasterize_fn(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
+                camtoworlds=camtoworlds.unsqueeze(0),
+                Ks=Ks.unsqueeze(0),
                 width=width,
                 height=height,
                 sh_degree=sh_degree_to_use,

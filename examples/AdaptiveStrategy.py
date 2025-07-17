@@ -138,6 +138,7 @@ class AdaptiveStrategy(DefaultStrategy):
             camtoworlds = data["camtoworld"]  # [1, 4, 4]
             Ks = data["K"]  # [1, 3, 3]
             pixels = data["pixels"]
+            pixels = pixels.unsqueeze(0)
             # image_id = data["image_id"]
 
             height, width = pixels.shape[1:3]

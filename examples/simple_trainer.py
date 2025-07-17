@@ -669,6 +669,7 @@ class Runner:
         )
         trainloader_iter = iter(trainloader)
 
+
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))

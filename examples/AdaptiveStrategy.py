@@ -417,23 +417,46 @@ class AdaptiveStrategy(DefaultStrategy):
         if not self.reward_validation_set: return {"psnr": 0., "ssim": 0., "l1": 0.}
 
         sh_degree_to_use = min(step // 1000, 3)
-        camtoworlds = torch.stack([data["camtoworld"] for data in self.reward_validation_set], dim=0)
-        Ks = torch.stack([data["K"] for data in self.reward_validation_set], dim=0)
-        gt_pixels = torch.stack([data["pixels"] for data in self.reward_validation_set], dim=0)
-        height, width = gt_pixels.shape[1:3]
         colors = torch.cat([params["sh0"], params["shN"]], 1)
+        opacities = torch.sigmoid(params["opacities"])
+        scales = torch.exp(params["scales"])
 
-        render_colors, _, _ = self.rasterizer_fn(
-            camtoworlds=camtoworlds, Ks=Ks, width=width, height=height, sh_degree=sh_degree_to_use,
-            means=params["means"], scales=torch.exp(params["scales"]), quats=params["quats"],
-            opacities=torch.sigmoid(params["opacities"]), colors=colors,
-        )
+        total_psnr = 0.0
+        total_ssim = 0.0
+        total_l1 = 0.0
 
-        rendered_img_p = render_colors.permute(0, 3, 1, 2)
-        gt_img_p = gt_pixels.permute(0, 3, 1, 2)
+        for data in self.reward_validation_set:
+            camtoworlds = data["camtoworld"]
+            Ks = data["K"]  # [1, 3, 3]
+            pixels = data["pixels"]
+            pixels = pixels.unsqueeze(0)
+            height, width = pixels.shape[1:3]
 
+            render_colors, _, _ = self.rasterizer_fn(
+                camtoworlds=camtoworlds.unsqueeze(0),
+                Ks=Ks.unsqueeze(0),
+                width=width,
+                height=height,
+                sh_degree=sh_degree_to_use,
+                near_plane=0.01,
+                far_plane=1e10,
+                # image_ids=image_ids,
+                render_mode="RGB",
+                means=params["means"], scales=scales, quats=params["quats"],
+                opacities=opacities, colors=colors,
+                # image_ids=image_id,
+            )
+
+            rendered_img_p = render_colors.permute(0, 3, 1, 2)
+            gt_img_p = pixels.permute(0, 3, 1, 2)
+
+            total_psnr += self.psnr_metric(rendered_img_p, gt_img_p).mean().item()
+            total_ssim += self.ssim_metric(rendered_img_p, gt_img_p).mean().item()
+            total_l1 += F.l1_loss(rendered_img_p, gt_img_p).item()
+
+        num_views = len(self.reward_validation_set)
         return {
-            "psnr": self.psnr_metric(rendered_img_p, gt_img_p).mean(),
-            "ssim": self.ssim_metric(rendered_img_p, gt_img_p).mean(),
-            "l1": F.l1_loss(rendered_img_p, gt_img_p),
+            "psnr": total_psnr / num_views,
+            "ssim": total_ssim / num_views,
+            "l1": total_l1 / num_views,
         }

@@ -331,7 +331,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 "step": state["step"], "features": features[i].detach(),
                 "action": actions[i].detach(), "log_prob": log_probs[i].detach(),
                 "value": values[i].detach(), "scene_encoding": scene_encoding,
-                "initial_avg_metrics": {k: v.detach() for k, v in initial_avg_metrics.items()},
+                "initial_avg_metrics": {k: v for k, v in initial_avg_metrics.items()},
                 "initial_gauss_count": state["age"].shape[0]
             }
             state["reward_queue"].append(experience)

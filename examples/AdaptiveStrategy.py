@@ -124,7 +124,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 "camtoworld": data["camtoworld"].to(device),
                 "K": data["K"].to(device),
                 "pixels": data["image"].to(device) / 255.0,
-                "image_id": data["image_id"].to(device),
+                # "image_id": data["image_id"].to(device),
             })
         if self.verbose:
             print(f"Created a fixed reward validation set with {len(self.reward_validation_set)} views.")
@@ -138,7 +138,7 @@ class AdaptiveStrategy(DefaultStrategy):
             camtoworlds = data["camtoworld"]  # [1, 4, 4]
             Ks = data["K"]  # [1, 3, 3]
             pixels = data["pixels"]
-            image_id = data["image_id"]
+            # image_id = data["image_id"]
 
             height, width = pixels.shape[1:3]
 
@@ -156,7 +156,7 @@ class AdaptiveStrategy(DefaultStrategy):
                 render_mode="RGB",
                 means=params["means"], scales=torch.exp(params["scales"]), quats=params["quats"],
                 opacities=torch.sigmoid(params["opacities"]), colors=colors,
-                image_ids=image_id,
+                # image_ids=image_id,
             )
             rendered_img_p = render_colors.permute(0, 3, 1, 2)
             gt_img_p = pixels.permute(0, 3, 1, 2)

@@ -163,8 +163,8 @@ class AdaptiveStrategy(DefaultStrategy):
         opacities = torch.sigmoid(params["opacities"])
         scales = torch.exp(params["scales"])
 
-        camtoworlds = info["camtoworld"]
-        Ks = info["K"]  # [1, 3, 3]
+        camtoworlds = info["camtoworlds"]
+        Ks = info["Ks"]  # [1, 3, 3]
         pixels = info["pixels"]
         pixels = pixels.unsqueeze(0)
         height, width = pixels.shape[1:3]

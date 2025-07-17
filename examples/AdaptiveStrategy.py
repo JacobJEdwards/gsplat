@@ -4,10 +4,8 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn, autocast
+from torch import Tensor, nn, autocast, GradScaler
 from torch.distributions import Categorical
-
-import torchmetrics
 
 from ops import duplicate, split
 from utils import knn_with_ids, create_view_proj_matrix
@@ -110,6 +108,9 @@ class AdaptiveStrategy(DefaultStrategy):
     lpips_metric: Any = field(default=None, repr=False)
     psnr_metric: Any = field(default=None, repr=False)
     ssim_metric: Any = field(default=None, repr=False)
+
+    grad_scaler: Any = field(default=None, repr=False)
+
     writer: Any = field(default=None, repr=False)
 
     def setup_validation_set(self, validation_dataset: torch.utils.data.Dataset, device: torch.device) -> None:
@@ -141,7 +142,6 @@ class AdaptiveStrategy(DefaultStrategy):
             far_plane=1e10,
             means=params["means"], scales=torch.exp(params["scales"]), quats=params["quats"],
             opacities=torch.sigmoid(params["opacities"]), colors=colors,
-            packed=True,
         )
         rendered_img_p = render_colors.permute(0, 3, 1, 2)
         gt_img_p = pixels.permute(0, 3, 1, 2)
@@ -224,6 +224,8 @@ class AdaptiveStrategy(DefaultStrategy):
         self.graph_encoder = GraphEncoder(self.gnn_input_dim, self.gnn_hidden_dim, self.gnn_output_dim).to(device)
         self.actor_critic = PerNodeActorCritic(self.gnn_output_dim, self.ac_hidden_dim, 3).to(device)
         self.world_model = WorldModel(self.gnn_output_dim, self.wm_hidden_dim).to(device)
+
+        self.grad_scaler = GradScaler()
 
         ac_params = list(self.graph_encoder.parameters()) + list(self.actor_critic.parameters())
         self.ac_optimizer = torch.optim.AdamW(ac_params, lr=self.ac_learning_rate)
@@ -331,7 +333,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
         original_indices = torch.where(candidate_mask)[0]
 
-        with autocast(enabled=False, device_type="cuda"):
+        with autocast(enabled=True, device_type="cuda"):
             per_gaussian_features = self._get_features_from_graph(params, state, candidate_mask)
 
             self.actor_critic.train()
@@ -390,15 +392,17 @@ class AdaptiveStrategy(DefaultStrategy):
         old_log_probs = batch.get("log_prob").squeeze(-1)
         old_values = batch.get("value").squeeze(-1)
 
-        with torch.autocast(enabled=False, device_type="cuda"):
+        with torch.autocast(enabled=True, device_type="cuda"):
             next_scene_pred = self.world_model(scene_encodings)
             wm_loss = F.mse_loss(next_scene_pred, next_scene_encodings)
 
         self.wm_optimizer.zero_grad()
-        wm_loss.backward()
-        self.wm_optimizer.step()
+        # wm_loss.backward()
+        self.grad_scaler.backward(wm_loss)
+        # self.wm_optimizer.step()
+        self.grad_scaler.step(self.wm_optimizer)
 
-        with autocast(enabled=False, device_type="cuda"), torch.no_grad():
+        with autocast(enabled=True, device_type="cuda"), torch.no_grad():
             rewards = (rewards_raw - rewards_raw.mean()) / (rewards_raw.std() + 1e-8)
 
             next_values = self.actor_critic(next_scene_encodings)[1]
@@ -407,7 +411,7 @@ class AdaptiveStrategy(DefaultStrategy):
             advantages = (delta - delta.mean()) / (delta.std() + 1e-8)
             returns = advantages + old_values
 
-        with autocast(enabled=False, device_type="cuda"):
+        with autocast(enabled=True, device_type="cuda"):
             new_dist, new_values = self.actor_critic(features)
             new_log_probs = new_dist.log_prob(actions)
             ratio = torch.exp(new_log_probs - old_log_probs)
@@ -420,8 +424,12 @@ class AdaptiveStrategy(DefaultStrategy):
             ac_loss = actor_loss + self.critic_loss_weight * critic_loss + self.entropy_loss_weight * entropy_loss
 
         self.ac_optimizer.zero_grad()
-        ac_loss.backward()
-        self.ac_optimizer.step()
+        # ac_loss.backward()
+        self.grad_scaler.backward(ac_loss)
+        # self.ac_optimizer.step()
+        self.grad_scaler.step(self.ac_optimizer)
+        self.grad_scaler.update()
+
 
         self.writer.add_scalar("agent/ac_loss", ac_loss.item(), state["step"])
         self.writer.add_scalar("agent/actor_loss", actor_loss.item(), state["step"])
@@ -453,7 +461,7 @@ class AdaptiveStrategy(DefaultStrategy):
         queue = state["reward_queue"]
         if not queue or (current_step - queue[0]["step"]) < self.reward_delay: return
 
-        with torch.no_grad(), autocast(enabled=False, device_type="cuda"):
+        with torch.no_grad(), autocast(enabled=True, device_type="cuda"):
             all_node_features = self._get_features_from_graph(params, state, torch.ones(params["means"].shape[0], dtype=torch.bool, device=params["means"].device))
             if all_node_features.shape[0] == 0: return
             current_scene_encoding = all_node_features.mean(dim=0).detach()

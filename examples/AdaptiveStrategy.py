@@ -289,9 +289,6 @@ class AdaptiveStrategy(DefaultStrategy):
             exp = state["reward_queue"].popleft()
 
             detail_error_map = state.get("detail_error_map")
-            if detail_error_map is None:
-                continue
-
             detail_error_map = detail_error_map.squeeze()
             h, w = detail_error_map.shape
             y, x = exp["pixel_y"], exp["pixel_x"]
@@ -305,6 +302,7 @@ class AdaptiveStrategy(DefaultStrategy):
             reward = initial_patch_error - new_patch_error
 
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
+                print("Adding experience to replay buffer.")
                 experience_td = TensorDict({
                     "features": exp["features"],
                     "action": exp["action"],
@@ -315,6 +313,7 @@ class AdaptiveStrategy(DefaultStrategy):
 
     def _train_agent(self, state: dict):
         if len(state["replay_buffer"]) < state["replay_buffer"].batch_size:
+            print("Not enough samples in replay buffer to train agent.")
             return
 
         self.ac_net.train()

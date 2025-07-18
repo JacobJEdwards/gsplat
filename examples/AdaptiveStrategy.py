@@ -16,6 +16,28 @@ from torchrl.data import RandomSampler, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyMemmapStorage
 
 
+# +++ Copied from simple_trainer.py to make the module self-contained
+def sobel_filter(image_batch: Tensor, device: torch.device) -> Tensor:
+    """Computes the Sobel edge magnitude for a batch of images."""
+    if image_batch.dim() == 3:
+        image_batch = image_batch.unsqueeze(0)  # Add batch dimension if missing
+
+    # Ensure image is in [B, C, H, W] format
+    if image_batch.shape[-1] == 3:
+        images_gray = image_batch.mean(dim=-1, keepdim=True).permute(0, 3, 1, 2)
+    else:  # Already in [B, C, H, W]
+        images_gray = image_batch.mean(dim=1, keepdim=True)
+
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
+
+    grad_x = F.conv2d(images_gray, sobel_x, padding=1)
+    grad_y = F.conv2d(images_gray, sobel_y, padding=1)
+
+    gradient_magnitude = torch.hypot(grad_x, grad_y)  # [B, 1, H, W]
+    return gradient_magnitude.squeeze(1)  # [B, H, W]
+
+
 class SimpleActorCritic(nn.Module):
     def __init__(self, feature_dim: int, hidden_dim: int, action_dim: int):
         super().__init__()
@@ -33,6 +55,7 @@ class SimpleActorCritic(nn.Module):
         action_logits = self.actor_head(x)
         value = self.critic_head(x).squeeze(-1)
         return action_logits, value
+
 
 @dataclass
 class AdaptiveStrategy(DefaultStrategy):
@@ -56,6 +79,8 @@ class AdaptiveStrategy(DefaultStrategy):
     ac_net: Any = field(default=None, repr=False)
     ac_optimizer: Any = field(default=None, repr=False)
     writer: Any = field(default=None, repr=False)
+    # +++ Add rasterizer_fn to be injected from the trainer
+    rasterizer_fn: Any = field(default=None, repr=False)
 
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
@@ -71,6 +96,13 @@ class AdaptiveStrategy(DefaultStrategy):
             "l1_loss_map": None,
             "detail_error_map": None,
             "view_proj_matrix": None,
+            # +++ Add state keys for camera info and ground truth
+            "camtoworlds": None,
+            "Ks": None,
+            "pixels": None,
+            "width": None,
+            "height": None,
+            # ---
             "replay_buffer": replay_buffer,
             "reward_queue": reward_queue,
         })
@@ -101,14 +133,13 @@ class AdaptiveStrategy(DefaultStrategy):
             state["age"] = torch.zeros(params["means"].shape[0], dtype=torch.int32, device=params["means"].device)
 
         state["age"] += 1
-        state["detail_error_map"] = info.get("detail_error_map")
-        state["l1_loss_map"] = info.get("l1_loss_map")
-        state["pixels"] = info.get("pixels")
+
+        # +++ Update state with all view-dependent info
+        self._update_view_info(state, info)
         state["gaussian_contribution"] = info.get("gaussian_contribution")
 
-        self._update_quality_map(params, state, info)
-        self._update_state(params, state, info, packed=packed)
-        self._process_rewards(state, step)
+        # +++ Pass current `params` to reward processing
+        self._process_rewards(params, state, step)
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
             if state.get("detail_error_map") is not None and state.get("pixels") is not None:
@@ -122,7 +153,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         if step % self.reset_every == 0 and step > 0:
             reset_opa(params, optimizers, state, self.prune_opa * 2.0)
-
 
     @torch.no_grad()
     def _get_simplified_features(self, params: dict, state: dict, subset_mask: Tensor) -> Tensor:
@@ -178,7 +208,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
         return torch.nan_to_num(features, 0.0)
 
-
     @torch.no_grad()
     def _update_geometry(self, params: dict, optimizers: dict, state: dict, step: int) -> tuple[int, int, int]:
         device = params["means"].device
@@ -187,7 +216,7 @@ class AdaptiveStrategy(DefaultStrategy):
         candidate_mask = normalized_grads > self.grow_grad2d
 
         if candidate_mask.sum() == 0:
-            return 0,0,0
+            return 0, 0, 0
 
         if candidate_mask.sum() > self.max_densification_subset:
             candidate_indices = torch.where(candidate_mask)[0]
@@ -196,7 +225,6 @@ class AdaptiveStrategy(DefaultStrategy):
             candidate_mask[candidate_indices[rand_indices]] = True
 
         original_indices = torch.where(candidate_mask)[0]
-
         features = self._get_simplified_features(params, state, candidate_mask)
 
         self.ac_net.eval()
@@ -224,6 +252,7 @@ class AdaptiveStrategy(DefaultStrategy):
             initial_error_patch = detail_error_map[y_min:y_max, x_min:x_max]
             initial_patch_error = initial_error_patch.mean() if initial_error_patch.numel() > 0 else torch.tensor(0.0, device=device)
 
+            # +++ Store camera parameters and GT image in experience
             experience = {
                 "step": step,
                 "features": features[i].detach(),
@@ -232,8 +261,14 @@ class AdaptiveStrategy(DefaultStrategy):
                 "pixel_x": x,
                 "pixel_y": y,
                 "initial_patch_error": initial_patch_error,
+                "camtoworlds": state["camtoworlds"].detach(),
+                "Ks": state["Ks"].detach(),
+                "pixels": state["pixels"].detach(),
+                "width": state["width"],
+                "height": state["height"],
             }
             state["reward_queue"].append(experience)
+            # ---
 
         state_to_modify = {k: v for k, v in state.items() if k in ["grad2d", "count", "radii", "age"]}
 
@@ -269,7 +304,7 @@ class AdaptiveStrategy(DefaultStrategy):
         if n_split > 0:
             n_split = global_split_mask.sum().item()
             split(params, optimizers, state_to_modify, global_split_mask)
-            state_to_modify["age"][-2*n_split:-n_split] = 0
+            state_to_modify["age"][-2 * n_split:-n_split] = 0
             state_to_modify["age"][-n_split:] = 0
 
         n_duplicate = global_duplicate_mask.sum().item()
@@ -279,30 +314,50 @@ class AdaptiveStrategy(DefaultStrategy):
             state_to_modify["age"][-n_duplicate:] = 0
 
         state.update(state_to_modify)
-
         return n_prune, n_split, n_duplicate
 
-    def _process_rewards(self, state: dict, current_step: int):
+    @torch.no_grad()
+    def _process_rewards(self, params: dict, state: dict, current_step: int):
         r = self.reward_patch_radius
-        print("Processing rewards...")
+        device = params["means"].device
+
         while state["reward_queue"] and (current_step - state["reward_queue"][0]["step"]) >= self.reward_delay:
             exp = state["reward_queue"].popleft()
 
-            detail_error_map = state.get("detail_error_map")
-            detail_error_map = detail_error_map.squeeze()
-            h, w = detail_error_map.shape
+            camtoworlds = exp["camtoworlds"]
+            Ks = exp["Ks"]
+            pixels_gt = exp["pixels"]
+            width, height = exp["width"], exp["height"]
+            colors = torch.cat([params["sh0"], params["shN"]], 1)  # [N, K, 3]
+            renders_after, _, _ = self.rasterizer_fn(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                means=params["means"],
+                quats=params["quats"],
+                scales=torch.exp(params["scales"]),
+                opacities=torch.sigmoid(params["opacities"]),
+                colors=colors,
+            )
+            renders_after = torch.clamp(renders_after, 0.0, 1.0)
+
+            grad_render = sobel_filter(renders_after, device)
+            grad_gt = sobel_filter(pixels_gt, device)
+            new_detail_error_map = torch.abs(grad_render - grad_gt).squeeze()  # [H, W]
+
+            h, w = new_detail_error_map.shape
             y, x = exp["pixel_y"], exp["pixel_x"]
             y_min, y_max = max(0, y - r), min(h, y + r + 1)
             x_min, x_max = max(0, x - r), min(w, x + r + 1)
 
-            new_error_patch = detail_error_map[y_min:y_max, x_min:x_max]
-            new_patch_error = new_error_patch.mean() if new_error_patch.numel() > 0 else torch.tensor(0.0, device=detail_error_map.device)
+            new_error_patch = new_detail_error_map[y_min:y_max, x_min:x_max]
+            new_patch_error = new_error_patch.mean() if new_error_patch.numel() > 0 else torch.tensor(0.0, device=device)
 
             initial_patch_error = exp["initial_patch_error"]
             reward = initial_patch_error - new_patch_error
 
             if len(state["replay_buffer"]) < state["replay_buffer"]._storage.max_size:
-                print("Adding experience to replay buffer.")
                 experience_td = TensorDict({
                     "features": exp["features"],
                     "action": exp["action"],
@@ -313,7 +368,6 @@ class AdaptiveStrategy(DefaultStrategy):
 
     def _train_agent(self, state: dict):
         if len(state["replay_buffer"]) < state["replay_buffer"].batch_size:
-            print("Not enough samples in replay buffer to train agent.")
             return
 
         self.ac_net.train()
@@ -359,21 +413,23 @@ class AdaptiveStrategy(DefaultStrategy):
         self.writer.add_scalar("agent/mean_reward", rewards.mean().item(), state.get("step", -1))
 
     @torch.no_grad()
-    def _update_quality_map(
+    def _update_view_info(
             self,
-            params: dict[str, torch.nn.Parameter],
             state: dict[str, Any],
             info: dict[str, Any],
     ):
-        width, height = info['width'], info['height']
+        state["detail_error_map"] = info.get("detail_error_map")
+        state["l1_loss_map"] = info.get("l1_loss_map")
+        state["pixels"] = info.get("pixels")
+        state["camtoworlds"] = info.get("camtoworlds")
+        state["Ks"] = info.get("Ks")
+        state["width"], state["height"] = info['width'], info['height']
 
         main_camtoworld = info["camtoworlds"][0]
         main_K = info["Ks"][0]
-
         view_proj_matrix, view_matrix, proj_matrix = create_view_proj_matrix(
-            main_camtoworld, main_K, width, height
+            main_camtoworld, main_K, state["width"], state["height"]
         )
-
         state["view_matrix"] = view_matrix
         state["view_proj_matrix"] = view_proj_matrix
         state["proj_matrix"] = proj_matrix

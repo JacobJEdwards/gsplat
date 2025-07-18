@@ -124,6 +124,7 @@ class AdaptiveStrategy(DefaultStrategy):
             return
 
         state["step"] = step
+        super()._update_state(params, state, info)
 
         if self.ac_net is None:
             self._initialize_learning_components(params["means"].device)

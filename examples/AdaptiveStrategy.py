@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from examples.utils import knn_with_ids
+from utils import knn_with_ids
 from gsplat.strategy.ops import (
     duplicate,
     remove,

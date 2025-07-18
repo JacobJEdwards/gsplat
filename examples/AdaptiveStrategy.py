@@ -282,9 +282,9 @@ class AdaptiveStrategy(DefaultStrategy):
 
         return n_prune, n_split, n_duplicate
 
-
     def _process_rewards(self, state: dict, current_step: int):
         r = self.reward_patch_radius
+        print("Processing rewards...")
         while state["reward_queue"] and (current_step - state["reward_queue"][0]["step"]) >= self.reward_delay:
             exp = state["reward_queue"].popleft()
 
@@ -350,8 +350,7 @@ class AdaptiveStrategy(DefaultStrategy):
         torch.nn.utils.clip_grad_norm_(self.ac_net.parameters(), 1.0)
         self.ac_optimizer.step()
 
-        if self.verbose:
-            print(f"Agent trained at step {state.get('step', -1)}: Total Loss = {loss.item():.4f}")
+        print(f"Agent trained at step {state.get('step', -1)}: Total Loss = {loss.item():.4f}")
 
         self.writer.add_scalar("agent/loss", loss.item(), state.get("step", -1))
         self.writer.add_scalar("agent/actor_loss", actor_loss.item(), state.get("step", -1))

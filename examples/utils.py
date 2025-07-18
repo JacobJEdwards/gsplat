@@ -1,8 +1,9 @@
 import random
 
 import numpy as np
+import piq
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
@@ -434,3 +435,11 @@ def project_points(points_3d, view_proj_matrix, width, height):
     screen_coords = torch.stack([screen_x, screen_y], dim=-1)
 
     return screen_coords, valid_mask
+
+class PatchBasedNRQM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.brisque = piq.BRISQUELoss(reduction='none', data_range=1.0)
+
+    def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
+        return self.brisque(image_patches)

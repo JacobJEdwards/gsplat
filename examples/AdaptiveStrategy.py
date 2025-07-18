@@ -116,7 +116,7 @@ def split(
 
 
 @dataclass
-class NRQMStrategy(DefaultStrategy):
+class AdaptiveStrategy(DefaultStrategy):
     """
     An advanced densification strategy that uses NRQM feedback to guide the
     growth and pruning of Gaussians.

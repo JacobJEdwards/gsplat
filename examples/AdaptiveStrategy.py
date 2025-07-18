@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from utils import knn_with_ids
 from gsplat.strategy.ops import duplicate, remove, _update_param_with_optimizer
 from gsplat.strategy.default import DefaultStrategy
 from gsplat.utils import normalized_quat_to_rotmat
@@ -172,7 +173,7 @@ class NRQMStrategy(DefaultStrategy):
     nrqm_model: Any = field(default=None, repr=False)
     knn_fn: Any = field(default=None, repr=False)
 
-    densification_net: DensificationNetwork = field(default_factory=lambda: DensificationNetwork(), repr=False)
+    densification_net: DensificationNetwork = field(default=None, repr=False)
     densification_optimizer: Any = field(default=None, repr=False)
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
@@ -201,6 +202,8 @@ class NRQMStrategy(DefaultStrategy):
             self.densification_net_optimizer = torch.optim.AdamW(
                 self.densification_net.parameters(), lr=1e-4
             )
+
+            self.knn_fn = knn_with_ids
 
     def step_post_backward(
             self,

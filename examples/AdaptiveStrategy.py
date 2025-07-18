@@ -140,6 +140,8 @@ class AdaptiveStrategy(DefaultStrategy):
     densification_net: Any = field(default=None, repr=False)
     densification_optimizer: Any = field(default=None, repr=False)
 
+    writer: Any = field(default=None, repr=False)
+
     start_asc_grad2d: float = 0.0002
     end_asc_grad2d: float = 0.001
 
@@ -597,6 +599,11 @@ class AdaptiveStrategy(DefaultStrategy):
         if self.verbose:
             print(f"Trained Densification Network, Loss: {loss.item():.4f}")
 
+        self.writer.add_scalar("dense/loss", loss.item(), state["step"])
+        self.writer.add_scalar("dense/utility_mean", predicted_utility.mean().item(), state["step"])
+        self.writer.add_scalar("dense/reward_mean", rewards.mean().item(), state["step"])
+        self.writer.add_scalar("dense/reward_std", rewards.std().item(), state["step"])
+
     def _train_pruning_network(self, state):
         if len(state["pruning_replay_buffer"]) < 256:
             return
@@ -617,6 +624,8 @@ class AdaptiveStrategy(DefaultStrategy):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.pruning_net.parameters(), 1.0)
         self.pruning_optimizer.step()
+
+        self.writer.add_scalar("prune/loss", loss.item(), state["step"])
 
     @torch.no_grad()
     def _grow_gs(

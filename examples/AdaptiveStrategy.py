@@ -44,7 +44,7 @@ class AdaptiveStrategy(DefaultStrategy):
     hidden_dim: int = 64
     action_dim: int = 4  # 0: No-op, 1: Prune, 2: Split, 3: Duplicate
     learning_rate: float = 1e-4
-    ppo_clip_epsilon: float = 0.
+    ppo_clip_epsilon: float = 0.2
     entropy_loss_weight: float = 0.1
     critic_loss_weight: float = 0.5
     reward_delay: int = 500

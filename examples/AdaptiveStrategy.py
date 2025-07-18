@@ -60,7 +60,7 @@ class AdaptiveStrategy(DefaultStrategy):
     def initialize_state(self, scene_scale: float = 1.0) -> dict[str, Any]:
         state = super().initialize_state(scene_scale)
         replay_buffer = TensorDictReplayBuffer(
-            storage=LazyMemmapStorage(max_size=60_000),
+            storage=LazyMemmapStorage(max_size=30_000),
             sampler=RandomSampler(),
             batch_size=512
         )

@@ -16,11 +16,9 @@ from torchrl.data import RandomSampler, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyMemmapStorage
 
 
-# +++ Copied from simple_trainer.py to make the module self-contained
 def sobel_filter(image_batch: Tensor, device: torch.device) -> Tensor:
-    """Computes the Sobel edge magnitude for a batch of images."""
     if image_batch.dim() == 3:
-        image_batch = image_batch.unsqueeze(0)  # Add batch dimension if missing
+        image_batch = image_batch.unsqueeze(0)
 
     # Ensure image is in [B, C, H, W] format
     if image_batch.shape[-1] == 3:
@@ -252,7 +250,6 @@ class AdaptiveStrategy(DefaultStrategy):
             initial_error_patch = detail_error_map[y_min:y_max, x_min:x_max]
             initial_patch_error = initial_error_patch.mean() if initial_error_patch.numel() > 0 else torch.tensor(0.0, device=device)
 
-            # +++ Store camera parameters and GT image in experience
             experience = {
                 "step": step,
                 "features": features[i].detach(),

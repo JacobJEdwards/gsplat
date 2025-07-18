@@ -173,7 +173,7 @@ class AdaptiveStrategy(DefaultStrategy):
     nrqm_model: Any = field(default=None, repr=False)
     knn_fn: Any = field(default=None, repr=False)
 
-    densification_net: DensificationNetwork = field(default=None, repr=False)
+    densification_net: Any = field(default=None, repr=False)
     densification_optimizer: Any = field(default=None, repr=False)
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:

@@ -172,6 +172,8 @@ class AdaptiveStrategy(DefaultStrategy):
                 self.densification_net.parameters(), lr=1e-4, weight_decay=1e-5
             )
 
+            self.nrqm_model = PatchBasedNRQM().to(device)
+
     def _initialize_pruning_components(self, device) -> None:
         if self.use_learned_pruning and self.pruning_net is None:
             self.pruning_net = PruningNetwork().to(device)

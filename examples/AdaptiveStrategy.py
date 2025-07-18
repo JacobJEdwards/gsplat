@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from examples.utils import PatchBasedNRQM
 from utils import knn_with_ids
 from gsplat.strategy.ops import duplicate, remove, _update_param_with_optimizer
 from gsplat.strategy.default import DefaultStrategy
@@ -204,6 +205,7 @@ class AdaptiveStrategy(DefaultStrategy):
             )
 
             self.knn_fn = knn_with_ids
+            self.nrqm_model = PatchBasedNRQM().to(device)
 
     def step_post_backward(
             self,

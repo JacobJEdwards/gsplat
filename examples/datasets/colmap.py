@@ -3,13 +3,13 @@ import os
 from typing import Any, Dict, List, Optional
 
 import cv2
-import imageio.v2 as imageio
 import numpy as np
 import torch
 from PIL import Image
 from pycolmap import SceneManager
 from tqdm import tqdm
 from typing_extensions import assert_never
+import imageio.v2 as imageio
 
 from .normalize import (
     align_principal_axes,
@@ -57,18 +57,22 @@ class Parser:
     """COLMAP parser."""
 
     def __init__(
-        self,
-        data_dir: str,
-        factor: int = 1,
-        normalize: bool = False,
-        test_every: int = 8,
+            self,
+            data_dir: str,
+            # factor: int = 1,
+            normalize: bool = False,
+            test_every: int = 8,
     ):
         self.data_dir = data_dir
-        self.factor = factor
+        self.factor = 8
         self.normalize = normalize
         self.test_every = test_every
 
-        colmap_dir = os.path.join(data_dir, "sparse/0/")
+        colmap_dir = os.path.join(data_dir, "colmap/sparse/0/")
+        if not os.path.exists(colmap_dir):
+            colmap_dir = os.path.join(data_dir, "colmap/sparse")
+        if not os.path.exists(colmap_dir):
+            colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
             colmap_dir = os.path.join(data_dir, "sparse")
         assert os.path.exists(
@@ -104,7 +108,7 @@ class Parser:
             cam = manager.cameras[camera_id]
             fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
             K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-            K[:2, :] /= factor
+            K[:2, :] /= self.factor
             Ks_dict[camera_id] = K
 
             # Get distortion parameters.
@@ -128,11 +132,11 @@ class Parser:
                 params = np.array([cam.k1, cam.k2, cam.k3, cam.k4], dtype=np.float32)
                 camtype = "fisheye"
             assert (
-                camtype == "perspective" or camtype == "fisheye"
+                    camtype == "perspective" or camtype == "fisheye"
             ), f"Only perspective and fisheye cameras are supported, got {type_}"
 
             params_dict[camera_id] = params
-            imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
+            imsize_dict[camera_id] = (cam.width // self.factor, cam.height // self.factor)
             mask_dict[camera_id] = None
         print(
             f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
@@ -143,7 +147,7 @@ class Parser:
         if not (type_ == 0 or type_ == 1):
             print("Warning: COLMAP Camera is not PINHOLE. Images have distortion.")
 
-        w2c_mats = np.stack(w2c_mats, axis=0)
+        w2c_mats = np.stack(w2c_mats)
 
         # Convert extrinsics to camera-to-world.
         camtoworlds = np.linalg.inv(w2c_mats)
@@ -176,12 +180,12 @@ class Parser:
             self.bounds = np.load(posefile)[:, -2:]
 
         # Load images.
-        if factor > 1 and not self.extconf["no_factor_suffix"]:
-            image_dir_suffix = f"_{factor}"
-        else:
-            image_dir_suffix = ""
-        colmap_image_dir = os.path.join(data_dir, "images")
-        image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
+        # if factor > 1 and not self.extconf["no_factor_suffix"]:
+        #     image_dir_suffix = f"_{factor}"
+        # else:
+        #     image_dir_suffix = ""
+        colmap_image_dir = os.path.join(data_dir, "images_8_multiexposure")
+        image_dir = os.path.join(data_dir, "images_8_multiexposure")
         for d in [image_dir, colmap_image_dir]:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
@@ -190,11 +194,11 @@ class Parser:
         # so we need to map between the two sorted lists of files.
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
         image_files = sorted(_get_rel_paths(image_dir))
-        if factor > 1 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
-            image_dir = _resize_image_folder(
-                colmap_image_dir, image_dir + "_png", factor=factor
-            )
-            image_files = sorted(_get_rel_paths(image_dir))
+        # if factor > 1 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
+        #     image_dir = _resize_image_folder(
+        #         colmap_image_dir, image_dir + "_png", factor=factor
+        #     )
+        #     image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
@@ -282,7 +286,7 @@ class Parser:
                 continue  # no distortion
             assert camera_id in self.Ks_dict, f"Missing K for camera {camera_id}"
             assert (
-                camera_id in self.params_dict
+                    camera_id in self.params_dict
             ), f"Missing params for camera {camera_id}"
             K = self.Ks_dict[camera_id]
             width, height = self.imsize_dict[camera_id]
@@ -309,11 +313,11 @@ class Parser:
                 y1 = (grid_y - cy) / fy
                 theta = np.sqrt(x1**2 + y1**2)
                 r = (
-                    1.0
-                    + params[0] * theta**2
-                    + params[1] * theta**4
-                    + params[2] * theta**6
-                    + params[3] * theta**8
+                        1.0
+                        + params[0] * theta**2
+                        + params[1] * theta**4
+                        + params[2] * theta**6
+                        + params[3] * theta**8
                 )
                 mapx = (fx * x1 * r + width // 2).astype(np.float32)
                 mapy = (fy * y1 * r + height // 2).astype(np.float32)
@@ -352,11 +356,11 @@ class Dataset:
     """A simple dataset class."""
 
     def __init__(
-        self,
-        parser: Parser,
-        split: str = "train",
-        patch_size: Optional[int] = None,
-        load_depths: bool = False,
+            self,
+            parser: Parser,
+            split: str = "train",
+            patch_size: Optional[int] = None,
+            load_depths: bool = False,
     ):
         self.parser = parser
         self.split = split
@@ -373,7 +377,12 @@ class Dataset:
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
+
+        if self.split == 'val':
+            image = imageio.imread(self.parser.image_paths[index].replace('_multiexposure',''))[..., :3]
+        else:
+            image = imageio.imread(self.parser.image_paths[index])[..., :3]
+
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
@@ -420,11 +429,11 @@ class Dataset:
             depths = points_cam[:, 2]  # (M,)
             # filter out points outside the image
             selector = (
-                (points[:, 0] >= 0)
-                & (points[:, 0] < image.shape[1])
-                & (points[:, 1] >= 0)
-                & (points[:, 1] < image.shape[0])
-                & (depths > 0)
+                    (points[:, 0] >= 0)
+                    & (points[:, 0] < image.shape[1])
+                    & (points[:, 1] >= 0)
+                    & (points[:, 1] < image.shape[0])
+                    & (depths > 0)
             )
             points = points[selector]
             depths = depths[selector]

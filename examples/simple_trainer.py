@@ -52,11 +52,11 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "../../360_v2/garden"
+    data_dir: str = "../../360_v2/bonsai"
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
-    result_dir: str = "results/garden"
+    result_dir: str = "../../result"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)

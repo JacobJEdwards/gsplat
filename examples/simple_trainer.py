@@ -176,7 +176,7 @@ class Config:
     # Dump information to tensorboard every this steps
     tb_every: int = 100
     # Save training images to tensorboard
-    tb_save_image: bool = False
+    tb_save_image: bool = True
 
     lpips_net: Literal["vgg", "alex"] = "alex"
 

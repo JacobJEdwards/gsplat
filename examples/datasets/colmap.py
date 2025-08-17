@@ -184,8 +184,8 @@ class Parser:
         #     image_dir_suffix = f"_{factor}"
         # else:
         #     image_dir_suffix = ""
-        colmap_image_dir = os.path.join(data_dir, "images_8_contrast")
-        image_dir = os.path.join(data_dir, "images_8_contrast")
+        colmap_image_dir = os.path.join(data_dir, "images_8_multiexposure2")
+        image_dir = os.path.join(data_dir, "images_8_multiexposure2")
         for d in [image_dir, colmap_image_dir]:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
@@ -379,7 +379,7 @@ class Dataset:
         index = self.indices[item]
 
         if self.split == 'val':
-            image = imageio.imread(self.parser.image_paths[index].replace('_contrast',''))[..., :3]
+            image = imageio.imread(self.parser.image_paths[index].replace('_multiexposure2',''))[..., :3]
         else:
             image = imageio.imread(self.parser.image_paths[index])[..., :3]
 

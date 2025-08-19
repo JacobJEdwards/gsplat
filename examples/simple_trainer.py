@@ -184,6 +184,8 @@ class Config:
     with_ut: bool = False
     with_eval3d: bool = False
 
+    postfix: str = "_retinex_contrast"
+
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
@@ -335,6 +337,7 @@ class Runner:
             data_dir=cfg.data_dir,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            postfix=cfg.postfix,
         )
         self.trainset = Dataset(
             self.parser,

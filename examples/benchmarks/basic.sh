@@ -2,7 +2,7 @@ SCENE_DIR="../../360_v2"
 RESULT_DIR="../../results/gsplat"
 SCENE_LIST="garden bicycle stump bonsai counter kitchen room" # treehill flowers
 RENDER_TRAJ_PATH="ellipse"
-POSTFIX_LIST = "_retinex_contrast _retinex_multiexposure _retinex_variance"
+POSTFIX_LIST="_retinex_contrast _retinex_multiexposure _retinex_variance"
 
 for POSTFIX in $POSTFIX_LIST;
 do

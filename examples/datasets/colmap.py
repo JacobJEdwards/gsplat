@@ -381,7 +381,7 @@ class Dataset:
         index = self.indices[item]
 
         if self.split == 'val':
-            image = imageio.imread(self.parser.image_paths[index].replace(parser.postfix,''))[..., :3]
+            image = imageio.imread(self.parser.image_paths[index].replace(self.parser.postfix,''))[..., :3]
         else:
             image = imageio.imread(self.parser.image_paths[index])[..., :3]
 

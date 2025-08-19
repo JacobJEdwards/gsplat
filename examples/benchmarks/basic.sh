@@ -2,9 +2,10 @@ SCENE_DIR="../../360_v2"
 RESULT_DIR="../../results/gsplat"
 SCENE_LIST="garden bicycle stump bonsai counter kitchen room" # treehill flowers
 RENDER_TRAJ_PATH="ellipse"
-POSTIFX_LIST = "_retinex_contrast _retinex_multiexposure _retinex_variance"
+POSTFIX_LIST = "_retinex_contrast _retinex_multiexposure _retinex_variance"
 
-for POSTFIX in $POSTIFX_LIST;
+for POSTFIX in $POSTFIX_LIST;
+do
   for SCENE in $SCENE_LIST;
   do
       if [ "$SCENE" = "bonsai" ] || [ "$SCENE" = "counter" ] || [ "$SCENE" = "kitchen" ] || [ "$SCENE" = "room" ]; then

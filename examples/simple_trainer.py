@@ -952,11 +952,18 @@ class Runner:
                     canvas,
                 )
 
+                imageio.imwrite(
+                    f"{self.render_dir}/{stage}_step{step}_{i:04d}_colors.png",
+                    (colors.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                )
+
+
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 metrics["psnr"].append(self.psnr(colors_p, pixels_p))
                 metrics["ssim"].append(self.ssim(colors_p, pixels_p))
                 metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+
                 if cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]

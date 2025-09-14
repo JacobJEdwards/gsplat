@@ -1,26 +1,54 @@
-SCENE_DIR="../../360_v2"
-RESULT_DIR="../../results/gsplat"
-SCENE_LIST="garden bicycle stump bonsai counter kitchen room" # treehill flowers
+SCENE_DIR="/workspace/360_v2"
+RESULT_DIR="/workspace/results/gsplat"
+SCENE_LIST=(
+  "garden"
+  "bicycle"
+  "stump"
+  "bonsai"
+  "counter"
+  "kitchen"
+  "room"
+)
 RENDER_TRAJ_PATH="ellipse"
-POSTFIX_LIST="_contrast_retinexmamba _multiexposure_retinexmamba _variance_retinexmamba"
+POSTFIX_FIRST_PART=(
+  "_contrast"
+  "_multiexposure"
+  "_variance"
+)
+POSTFIX_SECOND_PART=(
+  "_retinexmamba_LOL_v2_synthetic"
+  "_retinexmamba_LOL_v2_real"
+  "_retinexformer_SMID"
+  "_retinexformer_SID"
+  "_retinexformer_SDSD_outdoor"
+  "_retinexformer_SDSD_indoor"
+  "_retinexformer_LOL_v2_synthetic"
+  "_retinexformer_LOL_v2_real"
+  "_retinexformer_LOL_v1"
+  "_retinexformer_FiveK"
+)
+
+POSTFIX_LIST=""
+for FIRST in "${POSTFIX_FIRST_PART[@]}";
+do
+  for SECOND in "${POSTFIX_SECOND_PART[@]}";
+  do
+    POSTFIX_LIST+="${FIRST}${SECOND} "
+  done
+done
 
 for POSTFIX in $POSTFIX_LIST;
 do
-  for SCENE in $SCENE_LIST;
+  for SCENE in "${SCENE_LIST[@]}";
   do
-      if [ "$SCENE" = "bonsai" ] || [ "$SCENE" = "counter" ] || [ "$SCENE" = "kitchen" ] || [ "$SCENE" = "room" ]; then
-          DATA_FACTOR=2
-      else
-          DATA_FACTOR=4
-      fi
-
       echo "Running $SCENE"
+      DATA_DIR="$SCENE_DIR/$SCENE"
 
       # train without eval
-      CUDA_VISIBLE_DEVICES=0 python simple_trainer.py default --disable_viewer --data_factor $DATA_FACTOR \
+      CUDA_VISIBLE_DEVICES=0 python simple_trainer.py default --disable_viewer \
           --render_traj_path $RENDER_TRAJ_PATH \
           --postfix $POSTFIX \
-          --data_dir ../../360_v2/$SCENE/ \
+          --data_dir $DATA_DIR \
           --result_dir $RESULT_DIR/$POSTFIX/$SCENE/
   done
 done

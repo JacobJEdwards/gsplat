@@ -189,6 +189,8 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
+    save_images: bool = False
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -945,18 +947,18 @@ class Runner:
 
             if world_rank == 0:
                 # write images
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                canvas = (canvas * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
-                    canvas,
-                )
+                if cfg.save_images:
+                    canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+                    canvas = (canvas * 255).astype(np.uint8)
+                    imageio.imwrite(
+                        f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
+                        canvas,
+                    )
 
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}_colors.png",
-                    (colors.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-                )
-
+                    imageio.imwrite(
+                        f"{self.render_dir}/{stage}_step{step}_{i:04d}_colors.png",
+                        (colors.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                    )
 
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]

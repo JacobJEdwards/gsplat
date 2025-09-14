@@ -41,7 +41,7 @@ for POSTFIX in $POSTFIX_LIST;
 do
   for SCENE in "${SCENE_LIST[@]}";
   do
-      echo "Running $SCENE"
+      echo "Running $SCENE on $POSTFIX"
       DATA_DIR="$SCENE_DIR/$SCENE"
 
       # train without eval

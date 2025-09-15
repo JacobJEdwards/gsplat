@@ -31,10 +31,10 @@ POSTFIX_FIRST_PART=(
 POSTFIX_LIST=""
 for FIRST in "${POSTFIX_FIRST_PART[@]}";
 do
-  for SECOND in "${POSTFIX_SECOND_PART[@]}";
-  do
-    POSTFIX_LIST+="${FIRST}${SECOND} "
-  done
+#  for SECOND in "${POSTFIX_SECOND_PART[@]}";
+#  do
+    POSTFIX_LIST+="${FIRST} "
+#  done
 done
 
 for POSTFIX in $POSTFIX_LIST;

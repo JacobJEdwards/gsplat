@@ -11,22 +11,22 @@ SCENE_LIST=(
 )
 RENDER_TRAJ_PATH="ellipse"
 POSTFIX_FIRST_PART=(
-  "_contrast"
-  "_multiexposure"
-  "_variance"
+  "_retinex_contrast"
+  "_retinex_multiexposure"
+  "_retinex_variance"
 )
-POSTFIX_SECOND_PART=(
-  "_retinexmamba_LOL_v2_synthetic"
-  "_retinexmamba_LOL_v2_real"
-  "_retinexformer_SMID"
-  "_retinexformer_SID"
-  "_retinexformer_SDSD_outdoor"
-  "_retinexformer_SDSD_indoor"
-  "_retinexformer_LOL_v2_synthetic"
-  "_retinexformer_LOL_v2_real"
-  "_retinexformer_LOL_v1"
-  "_retinexformer_FiveK"
-)
+#POSTFIX_SECOND_PART=(
+#  "_retinexmamba_LOL_v2_synthetic"
+#  "_retinexmamba_LOL_v2_real"
+#  "_retinexformer_SMID"
+#  "_retinexformer_SID"
+#  "_retinexformer_SDSD_outdoor"
+#  "_retinexformer_SDSD_indoor"
+#  "_retinexformer_LOL_v2_synthetic"
+#  "_retinexformer_LOL_v2_real"
+#  "_retinexformer_LOL_v1"
+#  "_retinexformer_FiveK"
+#)
 
 POSTFIX_LIST=""
 for FIRST in "${POSTFIX_FIRST_PART[@]}";

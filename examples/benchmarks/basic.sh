@@ -9,11 +9,18 @@ SCENE_LIST=(
   "kitchen"
   "room"
 )
+  #TODO: luminance contrast
 RENDER_TRAJ_PATH="ellipse"
 POSTFIX_FIRST_PART=(
   "_retinex_contrast"
   "_retinex_multiexposure"
   "_retinex_variance"
+  "_variance"
+  "_multiexposure"
+  "_contrast"
+  "_contrast_retinexformer"
+  "_multiexposure_retinexformer"
+  "_variance_retinexformer"
 )
 #POSTFIX_SECOND_PART=(
 #  "_retinexmamba_LOL_v2_synthetic"

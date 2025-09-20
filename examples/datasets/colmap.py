@@ -68,7 +68,6 @@ class Parser:
         self.factor = 8
         self.normalize = normalize
         self.test_every = test_every
-        self.postfix = postfix
 
         colmap_dir = os.path.join(data_dir, "colmap/sparse/0/")
         if not os.path.exists(colmap_dir):
@@ -186,6 +185,7 @@ class Parser:
         #     image_dir_suffix = f"_{factor}"
         # else:
         #     image_dir_suffix = ""
+        self.postfix = postfix if postfix.startswith("_") else "_" + postfix if postfix != "" else ""
         colmap_image_dir = os.path.join(data_dir, f"images_8{self.postfix}")
         image_dir = os.path.join(data_dir, f"images_8{self.postfix}")
         for d in [image_dir, colmap_image_dir]:
